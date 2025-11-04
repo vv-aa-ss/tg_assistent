@@ -1,6 +1,7 @@
 import aiosqlite
 import os
 from typing import Optional, Tuple, List, Dict, Any
+import logging
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -35,6 +36,8 @@ CREATE TABLE IF NOT EXISTS message_card (
 );
 """
 
+_logger = logging.getLogger("app.db")
+
 
 class Database:
 	def __init__(self, path: str) -> None:
@@ -60,6 +63,7 @@ class Database:
 		cols = [r[1] for r in await cur.fetchall()]
 		if "user_message" not in cols:
 			await self._db.execute("ALTER TABLE cards ADD COLUMN user_message TEXT")
+			_logger.debug("Applied migration: add cards.user_message")
 
 	async def close(self) -> None:
 		if self._db is not None:
@@ -70,6 +74,7 @@ class Database:
 		assert self._db
 		cur = await self._db.execute("INSERT INTO cards(name, details) VALUES(?, ?)", (name, details))
 		await self._db.commit()
+		_logger.debug(f"Card added: id={cur.lastrowid} name={name!r}")
 		return cur.lastrowid
 
 	async def list_cards(self) -> List[Tuple[int, str, str]]:
@@ -81,18 +86,33 @@ class Database:
 		assert self._db
 		await self._db.execute("DELETE FROM cards WHERE id = ?", (card_id,))
 		await self._db.commit()
+		_logger.debug(f"Card deleted: id={card_id}")
 
 	async def get_or_create_user(self, tg_id: Optional[int], username: Optional[str], full_name: Optional[str]) -> int:
 		assert self._db
-		if tg_id is not None:
-			cur = await self._db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
-			row = await cur.fetchone()
-			if row:
-				return row[0]
+		_logger.debug(f"get_or_create_user: tg_id={tg_id} username={username} full_name={full_name}")
+		if tg_id is None:
+			_logger.debug("get_or_create_user skipped: tg_id is None")
+			return -1
+		cur = await self._db.execute("SELECT id, username, full_name FROM users WHERE tg_id = ?", (tg_id,))
+		row = await cur.fetchone()
+		if row:
+			user_id, db_username, db_full_name = row
+			if (username and not db_username) or (full_name and not db_full_name):
+				await self._db.execute(
+					"UPDATE users SET username = COALESCE(?, username), full_name = COALESCE(?, full_name) WHERE id = ?",
+					(username, full_name, user_id),
+				)
+				await self._db.commit()
+				_logger.debug(f"User updated: id={user_id} username={username} full_name={full_name}")
+			else:
+				_logger.debug(f"User exists (no update): id={user_id}")
+			return user_id
 		cur = await self._db.execute(
 			"INSERT INTO users(tg_id, username, full_name) VALUES(?, ?, ?)", (tg_id, username, full_name)
 		)
 		await self._db.commit()
+		_logger.debug(f"User created: id={cur.lastrowid} tg_id={tg_id}")
 		return cur.lastrowid
 
 	async def list_users_with_binding(self) -> List[Dict[str, Any]]:
@@ -119,6 +139,27 @@ class Database:
 			)
 		return result
 
+	async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+		assert self._db
+		query = (
+			"SELECT u.id, u.tg_id, u.username, u.full_name, c.id, c.name "
+			"FROM users u LEFT JOIN user_card uc ON uc.user_id = u.id "
+			"LEFT JOIN cards c ON c.id = uc.card_id "
+			"WHERE u.id = ?"
+		)
+		cur = await self._db.execute(query, (user_id,))
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"user_id": row[0],
+			"tg_id": row[1],
+			"username": row[2],
+			"full_name": row[3],
+			"card_id": row[4],
+			"card_name": row[5],
+		}
+
 	async def bind_user_to_card(self, user_id: int, card_id: int) -> None:
 		assert self._db
 		await self._db.execute(
@@ -126,6 +167,7 @@ class Database:
 			(user_id, card_id),
 		)
 		await self._db.commit()
+		_logger.debug(f"User bound: user_id={user_id} -> card_id={card_id}")
 
 	async def get_card_for_user_tg(self, tg_id: int) -> Optional[Tuple[int, str, str, Optional[str]]]:
 		assert self._db
@@ -147,7 +189,6 @@ class Database:
 
 	async def find_card_by_text(self, text: str) -> Optional[Tuple[int, str, str]]:
 		assert self._db
-		# naive implementation: substring patterns first, regex second (done in Python)
 		cur = await self._db.execute("SELECT id, name, details FROM cards")
 		cards = await cur.fetchall()
 		cur = await self._db.execute("SELECT pattern, is_regex, card_id FROM message_card ORDER BY id DESC")
@@ -179,3 +220,24 @@ class Database:
 		cur = await self._db.execute("SELECT user_message FROM cards WHERE id = ?", (card_id,))
 		row = await cur.fetchone()
 		return row[0] if row else None
+
+	async def get_card_by_id(self, card_id: int) -> Optional[Dict[str, Any]]:
+		assert self._db
+		cur = await self._db.execute("SELECT id, name, details, user_message FROM cards WHERE id = ?", (card_id,))
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"card_id": row[0],
+			"name": row[1],
+			"details": row[2],
+			"user_message": row[3],
+		}
+
+	async def delete_user(self, user_id: int) -> None:
+		assert self._db
+		# Удаление пользователя автоматически удалит связанные записи из user_card
+		# благодаря ON DELETE CASCADE во внешних ключах
+		await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+		await self._db.commit()
+		_logger.debug(f"User deleted: id={user_id}")
