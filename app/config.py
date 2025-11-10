@@ -9,16 +9,41 @@ load_dotenv(override=True)
 class Settings(BaseModel):
 	telegram_bot_token: str
 	admin_ids: List[int]
+	admin_usernames: List[str] = []
 	database_path: str = "./data/bot.db"
 
 	@field_validator("admin_ids", mode="before")
 	@classmethod
 	def parse_admin_ids(cls, v):
 		if isinstance(v, list):
-			return [int(x) for x in v]
+			result = []
+			for x in v:
+				try:
+					result.append(int(x))
+				except (ValueError, TypeError):
+					# Пропускаем нечисловые значения (они должны быть в admin_usernames)
+					pass
+			return result
 		if isinstance(v, str):
 			items = [s.strip() for s in v.split(",") if s.strip()]
-			return [int(x) for x in items]
+			result = []
+			for x in items:
+				try:
+					result.append(int(x))
+				except (ValueError, TypeError):
+					# Пропускаем нечисловые значения (они должны быть в admin_usernames)
+					pass
+			return result
+		return []
+
+	@field_validator("admin_usernames", mode="before")
+	@classmethod
+	def parse_admin_usernames(cls, v):
+		if isinstance(v, list):
+			return [str(x).strip().lstrip("@") for x in v if x]
+		if isinstance(v, str):
+			items = [s.strip().lstrip("@") for s in v.split(",") if s.strip()]
+			return items
 		return []
 
 
@@ -26,5 +51,6 @@ def get_settings() -> Settings:
 	return Settings(
 		telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
 		admin_ids=os.getenv("ADMIN_IDS", ""),
+		admin_usernames=os.getenv("ADMIN_USERNAMES", ""),
 		database_path=os.getenv("DATABASE_PATH", "./data/bot.db"),
 	)

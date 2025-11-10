@@ -5,11 +5,21 @@ from aiogram.fsm.context import FSMContext
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from typing import Any, Awaitable, Callable, Dict
+from datetime import datetime
 import logging
 import re
-from app.db import Database
-from app.keyboards import admin_menu_kb, cards_list_kb, users_list_kb, simple_back_kb, cards_select_kb, user_card_select_kb, user_action_kb, card_action_kb
-from app.di import get_db, get_admin_ids
+from app.keyboards import (
+	admin_menu_kb,
+	cards_list_kb,
+	users_list_kb,
+	simple_back_kb,
+	cards_select_kb,
+	user_card_select_kb,
+	user_action_kb,
+	card_action_kb,
+	user_cards_reply_kb,
+)
+from app.di import get_db, get_admin_ids, get_admin_usernames
 
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
@@ -23,9 +33,13 @@ class AdminOnlyMiddleware(BaseMiddleware):
 		data: Dict[str, Any],
 	) -> Any:
 		admin_ids = get_admin_ids()
+		admin_usernames = get_admin_usernames()
 		from_user = getattr(event, "from_user", None)
-		if from_user and from_user.id not in admin_ids:
-			return
+		if from_user:
+			user_id = getattr(from_user, "id", None)
+			username = getattr(from_user, "username", None)
+			if not is_admin(user_id, username, admin_ids, admin_usernames):
+				return
 		return await handler(event, data)
 
 
@@ -43,11 +57,30 @@ class CardUserMessageStates(StatesGroup):
 
 class ForwardBindStates(StatesGroup):
 	waiting_select_card = State()
+	waiting_select_existing_card = State()
 
 
-def is_admin(user_id: int, admin_ids: list[int]) -> bool:
-	return user_id in admin_ids
+def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
+	"""Проверяет, является ли пользователь администратором по ID или username"""
+	if admin_usernames is None:
+		admin_usernames = []
+	if user_id is not None and user_id in admin_ids:
+		return True
+	if username:
+		username_clean = username.lstrip("@").lower()
+		admin_usernames_clean = [u.lstrip("@").lower() for u in admin_usernames]
+		if username_clean in admin_usernames_clean:
+			return True
+	return False
 
+
+def format_ts(ts: int | None) -> str:
+	if not ts:
+		return "нет данных"
+	try:
+		return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+	except (OSError, OverflowError, ValueError):
+		return "недоступно"
 
 def extract_forward_profile(message: Message) -> tuple[int | None, str | None, str | None]:
 	try:
@@ -75,14 +108,16 @@ def extract_forward_profile(message: Message) -> tuple[int | None, str | None, s
 @admin_router.message(F.text == "/admin")
 async def cmd_admin(message: Message, state: FSMContext):
 	admin_ids = get_admin_ids()
-	if not is_admin(message.from_user.id, admin_ids):
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		logger.debug(f"/admin ignored: user {message.from_user.id} is not admin")
 		return
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
 
 
 @admin_router.callback_query(F.data == "admin:back")
-async def admin_back(cb: CallbackQuery):
+async def admin_back(cb: CallbackQuery, state: FSMContext):
+	await state.clear()
 	await cb.message.edit_text("Админ-панель:", reply_markup=admin_menu_kb())
 	await cb.answer()
 
@@ -237,11 +272,59 @@ async def admin_users(cb: CallbackQuery):
 		else:
 			label = f"ID {r['user_id']}"
 		
-		if r["card_name"]:
-			label += f" → {r['card_name']}"
+		if r["cards"]:
+			card_names = ", ".join(card["card_name"] for card in r["cards"])
+			label += f" → {card_names}"
 		items.append((r["user_id"], label))
 	logger.debug(f"Show users: count={len(items)}")
 	await cb.message.edit_text("Пользователи:", reply_markup=users_list_kb(items))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "admin:stats")
+async def admin_stats(cb: CallbackQuery):
+	db = get_db()
+	stats = await db.get_stats_summary()
+	lines = [
+		"📊 Статистика",
+		f"Всего пользователей: {stats['total_users']}",
+		f"Всего выдач реквизитов: {stats['total_deliveries']}",
+	]
+	top_recent = stats.get("top_recent") or []
+	top_inactive = stats.get("top_inactive") or []
+	if top_recent:
+		lines.append("")
+		lines.append("Топ-3 по активности:")
+		for entry in top_recent:
+			if entry["full_name"]:
+				label = entry["full_name"]
+			elif entry["username"]:
+				label = f"@{entry['username']}"
+			elif entry["tg_id"]:
+				label = f"tg_id: {entry['tg_id']}"
+			else:
+				label = f"ID {entry['user_id']}"
+			last_interaction = format_ts(entry.get("last_interaction_at"))
+			lines.append(f"- {label}\n  Выдач: {entry['delivery_count']}, последнее: {last_interaction}")
+	if top_inactive:
+		lines.append("")
+		lines.append("Топ-5 по давности активности:")
+		for entry in top_inactive:
+			if entry["full_name"]:
+				label = entry["full_name"]
+			elif entry["username"]:
+				label = f"@{entry['username']}"
+			elif entry["tg_id"]:
+				label = f"tg_id: {entry['tg_id']}"
+			else:
+				label = f"ID {entry['user_id']}"
+			last_interaction = format_ts(entry.get("last_interaction_at"))
+			lines.append(f"- {label}\n  Выдач: {entry['delivery_count']}, последнее: {last_interaction}")
+	if not top_recent and not top_inactive:
+		lines.append("")
+		lines.append("Нет данных по пользователям.")
+	text = "\n".join(lines)
+	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:back"))
 	await cb.answer()
 
 
@@ -268,8 +351,10 @@ async def user_view(cb: CallbackQuery):
 	else:
 		text = " ".join(parts)
 	
-	if user["card_name"]:
-		text += f"\n\nТекущая привязка: {user['card_name']}"
+	if user["cards"]:
+		text += "\n\nТекущие привязки:"
+		for card in user["cards"]:
+			text += f"\n• {card['card_name']}"
 	else:
 		text += "\n\nНе привязан к карте"
 	
@@ -308,8 +393,10 @@ async def user_bind(cb: CallbackQuery):
 	else:
 		text = " ".join(parts)
 	
-	if user["card_name"]:
-		text += f"\n\nТекущая привязка: {user['card_name']}"
+	if user["cards"]:
+		text += "\n\nТекущие привязки:"
+		for card in user["cards"]:
+			text += f"\n• {card['card_name']}"
 	else:
 		text += "\n\nНе привязан к карте"
 	
@@ -317,9 +404,13 @@ async def user_bind(cb: CallbackQuery):
 		text += "\n\n⚠️ Нет доступных карт для привязки"
 		await cb.message.edit_text(text, reply_markup=simple_back_kb(f"user:view:{user_id}"))
 	else:
-		text += "\n\nВыберите карту для привязки:"
+		text += "\n\nВыберите карту для изменения привязки:"
+		selected_ids = [card["card_id"] for card in user["cards"]]
 		# Используем специальную клавиатуру для выбора карты с указанием user_id
-		await cb.message.edit_text(text, reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}"))
+		await cb.message.edit_text(
+			text,
+			reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}", selected_ids),
+		)
 	
 	await cb.answer()
 
@@ -365,24 +456,36 @@ async def user_bind_card(cb: CallbackQuery):
 	parts = cb.data.split(":")
 	user_id = int(parts[3])
 	card_id = int(parts[4])
+
+	# Получаем информацию о пользователе до изменения
+	user_before = await db.get_user_by_id(user_id)
+	if not user_before:
+		await cb.answer("Ошибка: пользователь не найден", show_alert=True)
+		return
+	bound_ids_before = {card["card_id"] for card in user_before.get("cards", [])}
 	
-	# Привязываем карту к пользователю
-	await db.bind_user_to_card(user_id, card_id)
-	logger.debug(f"Bound user_id={user_id} to card_id={card_id}")
+	# Получаем информацию о карте и список всех карт
+	rows = await db.list_cards()
+	cards = [(r[0], r[1]) for r in rows]
+	card_name = next((name for cid, name in cards if cid == card_id), None)
+
+	# Привязываем или отвязываем карту
+	if card_id in bound_ids_before:
+		await db.unbind_user_from_card(user_id, card_id)
+		action_text = f"❎ Карта {card_name if card_name else card_id} отвязана"
+		alert_text = "Карта отвязана ❎"
+		logger.debug(f"Unbound user_id={user_id} from card_id={card_id}")
+	else:
+		await db.bind_user_to_card(user_id, card_id)
+		action_text = f"✅ Карта {card_name if card_name else card_id} привязана"
+		alert_text = "Карта привязана ✅"
+		logger.debug(f"Bound user_id={user_id} to card_id={card_id}")
 	
 	# Получаем обновленную информацию о пользователе
 	user = await db.get_user_by_id(user_id)
 	if not user:
 		await cb.answer("Ошибка: пользователь не найден", show_alert=True)
 		return
-	
-	# Получаем информацию о карте
-	rows = await db.list_cards()
-	card_name = None
-	for r in rows:
-		if r[0] == card_id:
-			card_name = r[1]
-			break
 	
 	# Формируем текст подтверждения
 	parts_user = []
@@ -398,10 +501,22 @@ async def user_bind_card(cb: CallbackQuery):
 	else:
 		text = " ".join(parts_user)
 	
-	text += f"\n\n✅ Привязан к карте: {card_name if card_name else 'Неизвестная карта'}"
+	if user["cards"]:
+		text += "\n\nТекущие привязки:"
+		for card in user["cards"]:
+			text += f"\n• {card['card_name']}"
+	else:
+		text += "\n\nНе привязан к карте"
 	
-	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:users"))
-	await cb.answer("Карта привязана ✅")
+	text += f"\n\n{action_text}"
+	
+	selected_ids = [card["card_id"] for card in user.get("cards", [])]
+	text += "\n\nВыберите карту для изменения привязки:"
+	await cb.message.edit_text(
+		text,
+		reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}", selected_ids),
+	)
+	await cb.answer(alert_text)
 
 
 # Handle any message and process forwarding logic for admins
@@ -409,7 +524,8 @@ async def user_bind_card(cb: CallbackQuery):
 async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMContext):
 	db = get_db()
 	admin_ids = get_admin_ids()
-	if not message.from_user or not is_admin(message.from_user.id, admin_ids):
+	admin_usernames = get_admin_usernames()
+	if not message.from_user or not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
 	text = message.text or message.caption or ""
@@ -431,21 +547,37 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	if orig_tg_id is not None:
 		# Ensure user is saved/upserted before any binding/lookup
 		await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
-		card = await db.get_card_for_user_tg(orig_tg_id)
-		if card:
-			logger.debug(f"User {orig_tg_id} is bound to card_id={card[0]}")
-			user_msg = card[3] if len(card) > 3 else None
-			admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
-			if user_msg:
-				await message.answer(admin_text, parse_mode="HTML")
-			else:
-				await message.answer(admin_text)
-			if user_msg:
-				try:
-					await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
-					logger.debug("Sent user_message to user")
-				except Exception as e:
-					logger.exception(f"Failed to send user_message: {e}")
+		await db.touch_user_by_tg(orig_tg_id)
+		cards_for_user = await db.get_cards_for_user_tg(orig_tg_id)
+		if cards_for_user:
+			logger.debug(f"User {orig_tg_id} has {len(cards_for_user)} bound cards")
+			if len(cards_for_user) == 1:
+				card = cards_for_user[0]
+				user_msg = card.get("user_message")
+				admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
+				if user_msg:
+					await message.answer(admin_text, parse_mode="HTML")
+				else:
+					await message.answer(admin_text)
+				await db.log_card_delivery_by_tg(
+					orig_tg_id,
+					card["card_id"],
+					admin_id=message.from_user.id if message.from_user else None,
+				)
+				if user_msg:
+					try:
+						await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
+						logger.debug("Sent user_message to user")
+					except Exception as e:
+						logger.exception(f"Failed to send user_message: {e}")
+				return
+			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
+			await state.set_state(ForwardBindStates.waiting_select_existing_card)
+			await state.update_data(original_tg_id=orig_tg_id)
+			await message.answer(
+				"У пользователя привязано несколько карт. Выберите нужную:",
+				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
+			)
 			return
 		logger.debug("User not bound, offering cards for binding")
 		rows = await db.list_cards()
@@ -492,21 +624,58 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 	orig_tg_id = int(data.get("original_tg_id"))
 	logger.debug(f"Bind forwarded user {orig_tg_id} to card_id={card_id}")
 	user_id = await db.get_or_create_user(orig_tg_id, None, None)
+	await db.touch_user_by_tg(orig_tg_id)
 	await db.bind_user_to_card(user_id, card_id)
-	card_row = await db.get_card_for_user_tg(orig_tg_id)
+	card = await db.get_card_by_id(card_id)
 	await state.clear()
-	if card_row:
-		user_msg = card_row[3] if len(card_row) > 3 else None
+	if card:
+		user_msg = card.get("user_message")
+		admin_text = user_msg or "Сообщение карты отсутствует"
 		if user_msg:
-			admin_text = user_msg
 			await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
 		else:
-			admin_text = "Сообщение карты отсутствует"
 			await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+		await db.log_card_delivery_by_tg(
+			orig_tg_id,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
 		if user_msg:
 			try:
 				await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
 				logger.debug("Sent user_message after binding")
 			except Exception as e:
 				logger.exception(f"Failed to send user_message after binding: {e}")
+	await cb.answer()
+
+
+@admin_router.callback_query(ForwardBindStates.waiting_select_existing_card, F.data.startswith("user:reply:card:"))
+async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	db = get_db()
+	parts = cb.data.split(":")
+	user_tg_id = int(parts[3])
+	card_id = int(parts[4])
+	await db.touch_user_by_tg(user_tg_id)
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	await state.clear()
+	user_msg = card.get("user_message")
+	admin_text = user_msg or "Сообщение карты отсутствует"
+	if user_msg:
+		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+	else:
+		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+	await db.log_card_delivery_by_tg(
+		user_tg_id,
+		card_id,
+		admin_id=cb.from_user.id if cb.from_user else None,
+	)
+	if user_msg:
+		try:
+			await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
+			logger.debug(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
+		except Exception as e:
+			logger.exception(f"Failed to send user_message for existing card: {e}")
 	await cb.answer()

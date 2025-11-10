@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import CommandStart, StateFilter
@@ -16,9 +17,11 @@ from app.di import set_dependencies
 
 
 async def main() -> None:
+	os.makedirs("logs", exist_ok=True)
 	logging.basicConfig(
-		level=logging.DEBUG,
+		level=logging.INFO,
 		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+		handlers=[logging.FileHandler("logs/bot.log", encoding="utf-8")],
 	)
 	logger = logging.getLogger("app.start")
 
@@ -29,7 +32,7 @@ async def main() -> None:
 
 	db = Database(settings.database_path)
 	await db.connect()
-	set_dependencies(db, settings.admin_ids)
+	set_dependencies(db, settings.admin_ids, settings.admin_usernames)
 	logger.debug("Database connected and dependencies set")
 
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -38,10 +41,14 @@ async def main() -> None:
 	@dp.message(CommandStart())
 	async def on_start(message: Message):
 		logger.debug(f"/start from user_id={getattr(message.from_user,'id',None)} username={getattr(message.from_user,'username',None)}")
-		if message.from_user and is_admin(message.from_user.id, settings.admin_ids):
+		if message.from_user and is_admin(
+			message.from_user.id,
+			message.from_user.username,
+			settings.admin_ids,
+			settings.admin_usernames
+		):
 			await message.answer("Добро пожаловать, администратор!", reply_markup=admin_menu_kb())
-		else:
-			await message.answer("Бот активен. Команды доступны администратору.")
+		# non-admins: ignore (no reply)
 
 	# Регистрировать пользователя только когда нет активного состояния и сообщение не переслано
 	@dp.message(~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)), StateFilter(None))
@@ -50,12 +57,13 @@ async def main() -> None:
 		logger_msg = logging.getLogger("app.msg")
 		db_local = get_db()
 		if message.from_user:
-			logger_msg.debug(f"Register/ensure user: {message.from_user.id} @{message.from_user.username}")
+			logger_msg.debug(f"Ensure user: id={message.from_user.id} username={message.from_user.username} full_name={message.from_user.full_name}")
 			await db_local.get_or_create_user(
 				message.from_user.id,
 				message.from_user.username,
 				message.from_user.full_name,
 			)
+			await db_local.touch_user_by_tg(message.from_user.id)
 		# не отвечаем
 
 	dp.include_router(admin_router)

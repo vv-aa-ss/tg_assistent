@@ -1,12 +1,13 @@
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="📇 Карты", callback_data="admin:cards")
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
+	kb.button(text="📊 Статистика", callback_data="admin:stats")
 	kb.adjust(2)
 	return kb.as_markup()
 
@@ -46,10 +47,17 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
-def user_card_select_kb(cards: List[Tuple[int, str]], user_id: int, back_to: str = "admin:users") -> InlineKeyboardMarkup:
+def user_card_select_kb(
+	cards: List[Tuple[int, str]],
+	user_id: int,
+	back_to: str = "admin:users",
+	selected_card_ids: Optional[Iterable[int]] = None,
+) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
+	selected: Set[int] = set(selected_card_ids or [])
 	for cid, name in cards:
-		kb.button(text=f"💳 {name}", callback_data=f"user:bind:card:{user_id}:{cid}")
+		prefix = "✅" if cid in selected else "💳"
+		kb.button(text=f"{prefix} {name}", callback_data=f"user:bind:card:{user_id}:{cid}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
 	return kb.as_markup()
@@ -57,7 +65,7 @@ def user_card_select_kb(cards: List[Tuple[int, str]], user_id: int, back_to: str
 
 def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
-	kb.button(text="🔗 Привязать карту", callback_data=f"user:bind:{user_id}")
+	kb.button(text="Карты", callback_data=f"user:bind:{user_id}")
 	kb.button(text="🗑️ Удалить пользователя", callback_data=f"user:delete:{user_id}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
@@ -68,6 +76,15 @@ def card_action_kb(card_id: int, back_to: str = "admin:cards") -> InlineKeyboard
 	kb = InlineKeyboardBuilder()
 	kb.button(text="✏️ Изменить сообщение", callback_data=f"card:edit:{card_id}")
 	kb.button(text="🗑️ Удалить карту", callback_data=f"card:delete:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def user_cards_reply_kb(cards: List[Tuple[int, str]], user_tg_id: int, back_to: str = "admin:back") -> InlineKeyboardMarkup:
+	kb = InlineKeyboardBuilder()
+	for cid, name in cards:
+		kb.button(text=f"💳 {name}", callback_data=f"user:reply:card:{user_tg_id}:{cid}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
 	return kb.as_markup()

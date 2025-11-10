@@ -1,5 +1,6 @@
 import aiosqlite
 import os
+import time
 from typing import Optional, Tuple, List, Dict, Any
 import logging
 
@@ -16,13 +17,24 @@ CREATE TABLE IF NOT EXISTS users (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	tg_id INTEGER UNIQUE,
 	username TEXT,
-	full_name TEXT
+	full_name TEXT,
+	last_interaction_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS user_card (
 	user_id INTEGER NOT NULL,
 	card_id INTEGER NOT NULL,
-	PRIMARY KEY (user_id),
+	PRIMARY KEY (user_id, card_id),
+	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+	FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS card_delivery_log (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	user_id INTEGER NOT NULL,
+	card_id INTEGER NOT NULL,
+	delivered_at INTEGER NOT NULL,
+	admin_id INTEGER,
 	FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
 	FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
 );
@@ -55,6 +67,9 @@ class Database:
 		await self._db.executescript(SCHEMA_SQL)
 		# migrate: add user_message to cards if missing
 		await self._ensure_cards_user_message()
+		await self._ensure_user_card_multi_bind()
+		await self._ensure_users_last_interaction()
+		await self._ensure_card_delivery_log()
 		await self._db.commit()
 
 	async def _ensure_cards_user_message(self) -> None:
@@ -64,6 +79,66 @@ class Database:
 		if "user_message" not in cols:
 			await self._db.execute("ALTER TABLE cards ADD COLUMN user_message TEXT")
 			_logger.debug("Applied migration: add cards.user_message")
+
+	async def _ensure_user_card_multi_bind(self) -> None:
+		assert self._db
+		cur = await self._db.execute("PRAGMA table_info(user_card)")
+		rows = await cur.fetchall()
+		card_col = next((r for r in rows if r[1] == "card_id"), None)
+		if card_col and card_col[5] == 0:
+			_logger.debug("Applying migration: expand user_card primary key for multi-binding")
+			await self._db.execute(
+				"""
+				CREATE TABLE IF NOT EXISTS user_card_new (
+					user_id INTEGER NOT NULL,
+					card_id INTEGER NOT NULL,
+					PRIMARY KEY (user_id, card_id),
+					FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+					FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"INSERT OR IGNORE INTO user_card_new(user_id, card_id) SELECT user_id, card_id FROM user_card"
+			)
+			await self._db.execute("DROP TABLE user_card")
+			await self._db.execute("ALTER TABLE user_card_new RENAME TO user_card")
+			_logger.debug("Migration completed: user_card now supports multiple cards per user")
+
+	async def _ensure_users_last_interaction(self) -> None:
+		assert self._db
+		cur = await self._db.execute("PRAGMA table_info(users)")
+		cols = [r[1] for r in await cur.fetchall()]
+		if "last_interaction_at" not in cols:
+			await self._db.execute("ALTER TABLE users ADD COLUMN last_interaction_at INTEGER")
+			_logger.debug("Applied migration: add users.last_interaction_at")
+
+	async def _ensure_card_delivery_log(self) -> None:
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='card_delivery_log'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE card_delivery_log (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					user_id INTEGER NOT NULL,
+					card_id INTEGER NOT NULL,
+					delivered_at INTEGER NOT NULL,
+					admin_id INTEGER,
+					FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+					FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_delivery_user ON card_delivery_log(user_id)"
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_delivery_time ON card_delivery_log(delivered_at)"
+			)
+			_logger.debug("Created table card_delivery_log")
 
 	async def close(self) -> None:
 		if self._db is not None:
@@ -109,7 +184,8 @@ class Database:
 				_logger.debug(f"User exists (no update): id={user_id}")
 			return user_id
 		cur = await self._db.execute(
-			"INSERT INTO users(tg_id, username, full_name) VALUES(?, ?, ?)", (tg_id, username, full_name)
+			"INSERT INTO users(tg_id, username, full_name, last_interaction_at) VALUES(?, ?, ?, ?)",
+			(tg_id, username, full_name, int(time.time())),
 		)
 		await self._db.commit()
 		_logger.debug(f"User created: id={cur.lastrowid} tg_id={tg_id}")
@@ -125,27 +201,27 @@ class Database:
 		)
 		cur = await self._db.execute(query)
 		rows = await cur.fetchall()
-		result: List[Dict[str, Any]] = []
+		users: Dict[int, Dict[str, Any]] = {}
 		for r in rows:
-			result.append(
+			user_id = r[0]
+			info = users.setdefault(
+				user_id,
 				{
 					"user_id": r[0],
 					"tg_id": r[1],
 					"username": r[2],
 					"full_name": r[3],
-					"card_id": r[4],
-					"card_name": r[5],
-				}
+					"cards": [],
+				},
 			)
-		return result
+			if r[4] is not None:
+				info["cards"].append({"card_id": r[4], "card_name": r[5]})
+		return list(users.values())
 
 	async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
 		assert self._db
 		query = (
-			"SELECT u.id, u.tg_id, u.username, u.full_name, c.id, c.name "
-			"FROM users u LEFT JOIN user_card uc ON uc.user_id = u.id "
-			"LEFT JOIN cards c ON c.id = uc.card_id "
-			"WHERE u.id = ?"
+			"SELECT id, tg_id, username, full_name FROM users WHERE id = ?"
 		)
 		cur = await self._db.execute(query, (user_id,))
 		row = await cur.fetchone()
@@ -156,18 +232,98 @@ class Database:
 			"tg_id": row[1],
 			"username": row[2],
 			"full_name": row[3],
-			"card_id": row[4],
-			"card_name": row[5],
+			"cards": await self.list_cards_for_user(row[0]),
 		}
 
 	async def bind_user_to_card(self, user_id: int, card_id: int) -> None:
 		assert self._db
 		await self._db.execute(
-			"INSERT INTO user_card(user_id, card_id) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET card_id=excluded.card_id",
+			"INSERT OR IGNORE INTO user_card(user_id, card_id) VALUES(?, ?)",
 			(user_id, card_id),
 		)
 		await self._db.commit()
 		_logger.debug(f"User bound: user_id={user_id} -> card_id={card_id}")
+
+	async def unbind_user_from_card(self, user_id: int, card_id: int) -> None:
+		assert self._db
+		await self._db.execute(
+			"DELETE FROM user_card WHERE user_id = ? AND card_id = ?",
+			(user_id, card_id),
+		)
+		await self._db.commit()
+		_logger.debug(f"User unbound: user_id={user_id} -X-> card_id={card_id}")
+
+	async def touch_user(self, user_id: int, when: Optional[int] = None) -> None:
+		assert self._db
+		timestamp = int(when or time.time())
+		await self._db.execute(
+			"UPDATE users SET last_interaction_at = ? WHERE id = ?",
+			(timestamp, user_id),
+		)
+		await self._db.commit()
+		_logger.debug(f"Touched user_id={user_id} at {timestamp}")
+
+	async def touch_user_by_tg(self, tg_id: int, when: Optional[int] = None) -> None:
+		assert self._db
+		cur = await self._db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+		row = await cur.fetchone()
+		if row:
+			await self.touch_user(row[0], when)
+
+	async def get_user_id_by_tg(self, tg_id: int) -> Optional[int]:
+		assert self._db
+		cur = await self._db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
+		row = await cur.fetchone()
+		return row[0] if row else None
+
+	async def log_card_delivery(
+		self,
+		user_id: int,
+		card_id: int,
+		admin_id: Optional[int] = None,
+		delivered_at: Optional[int] = None,
+	) -> None:
+		assert self._db
+		timestamp = int(delivered_at or time.time())
+		await self._db.execute(
+			"INSERT INTO card_delivery_log(user_id, card_id, delivered_at, admin_id) VALUES(?, ?, ?, ?)",
+			(user_id, card_id, timestamp, admin_id),
+		)
+		await self._db.commit()
+		_logger.debug(f"Logged delivery: user_id={user_id}, card_id={card_id}, admin_id={admin_id}, ts={timestamp}")
+
+	async def log_card_delivery_by_tg(
+		self,
+		tg_id: int,
+		card_id: int,
+		admin_id: Optional[int] = None,
+		delivered_at: Optional[int] = None,
+	) -> None:
+		assert self._db
+		user_id = await self.get_user_id_by_tg(tg_id)
+		if user_id is None:
+			_logger.debug(f"Cannot log delivery: tg_id={tg_id} not found")
+			return
+		await self.log_card_delivery(user_id, card_id, admin_id, delivered_at)
+
+	async def list_cards_for_user(self, user_id: int) -> List[Dict[str, Any]]:
+		assert self._db
+		query = (
+			"SELECT c.id, c.name, c.details, c.user_message "
+			"FROM user_card uc JOIN cards c ON c.id = uc.card_id "
+			"WHERE uc.user_id = ? ORDER BY c.id DESC"
+		)
+		cur = await self._db.execute(query, (user_id,))
+		rows = await cur.fetchall()
+		return [
+			{
+				"card_id": r[0],
+				"card_name": r[1],
+				"details": r[2],
+				"user_message": r[3],
+			}
+			for r in rows
+		]
 
 	async def get_card_for_user_tg(self, tg_id: int) -> Optional[Tuple[int, str, str, Optional[str]]]:
 		assert self._db
@@ -178,6 +334,76 @@ class Database:
 		)
 		cur = await self._db.execute(query, (tg_id,))
 		return await cur.fetchone()
+
+	async def get_cards_for_user_tg(self, tg_id: int) -> List[Dict[str, Any]]:
+		assert self._db
+		query = (
+			"SELECT c.id, c.name, c.details, c.user_message "
+			"FROM users u "
+			"JOIN user_card uc ON uc.user_id = u.id "
+			"JOIN cards c ON c.id = uc.card_id "
+			"WHERE u.tg_id = ? "
+			"ORDER BY c.id DESC"
+		)
+		cur = await self._db.execute(query, (tg_id,))
+		rows = await cur.fetchall()
+		return [
+			{
+				"card_id": r[0],
+				"card_name": r[1],
+				"details": r[2],
+				"user_message": r[3],
+			}
+			for r in rows
+		]
+
+	async def get_stats_summary(self) -> Dict[str, Any]:
+		assert self._db
+		cur_total_users = await self._db.execute("SELECT COUNT(*) FROM users")
+		total_users = (await cur_total_users.fetchone())[0]
+
+		cur_total_deliveries = await self._db.execute("SELECT COUNT(*) FROM card_delivery_log")
+		total_deliveries = (await cur_total_deliveries.fetchone())[0]
+
+		cur_users = await self._db.execute(
+			"""
+			SELECT
+				u.id,
+				u.tg_id,
+				u.username,
+				u.full_name,
+				u.last_interaction_at,
+				COUNT(l.id) AS delivery_count,
+				MAX(l.delivered_at) AS last_delivery_at
+			FROM users u
+			LEFT JOIN card_delivery_log l ON l.user_id = u.id
+			GROUP BY u.id
+			ORDER BY COALESCE(u.last_interaction_at, 0) DESC, u.id DESC
+			"""
+		)
+		rows = await cur_users.fetchall()
+		per_user: List[Dict[str, Any]] = []
+		for row in rows:
+			per_user.append(
+				{
+					"user_id": row[0],
+					"tg_id": row[1],
+					"username": row[2],
+					"full_name": row[3],
+					"last_interaction_at": row[4],
+					"delivery_count": row[5],
+					"last_delivery_at": row[6],
+				}
+			)
+		top_recent = per_user[:3]
+		top_inactive = sorted(per_user, key=lambda x: x["last_interaction_at"] or 0)[:5]
+		return {
+			"total_users": total_users,
+			"total_deliveries": total_deliveries,
+			"per_user": per_user,
+			"top_recent": top_recent,
+			"top_inactive": top_inactive,
+		}
 
 	async def add_message_pattern(self, pattern: str, is_regex: bool, card_id: int) -> int:
 		assert self._db
