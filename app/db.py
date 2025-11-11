@@ -395,7 +395,17 @@ class Database:
 					"last_delivery_at": row[6],
 				}
 			)
-		top_recent = per_user[:3]
+		recent_sorted = sorted(
+			per_user,
+			key=lambda x: (
+				-(x["delivery_count"] or 0),
+				-(x["last_interaction_at"] or 0),
+				-x["user_id"],
+			),
+		)
+		top_recent = [entry for entry in recent_sorted if entry["delivery_count"] > 0][:3]
+		if not top_recent:
+			top_recent = recent_sorted[:3]
 		top_inactive = sorted(per_user, key=lambda x: x["last_interaction_at"] or 0)[:5]
 		return {
 			"total_users": total_users,

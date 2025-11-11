@@ -5,9 +5,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from typing import Any, Awaitable, Callable, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
+from html import escape
 from app.keyboards import (
 	admin_menu_kb,
 	cards_list_kb,
@@ -81,6 +82,44 @@ def format_ts(ts: int | None) -> str:
 		return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 	except (OSError, OverflowError, ValueError):
 		return "недоступно"
+
+
+def format_relative(ts: int | None) -> str:
+	if not ts:
+		return "нет данных"
+	try:
+		dt = datetime.fromtimestamp(ts)
+	except (OSError, OverflowError, ValueError):
+		return "недоступно"
+	now = datetime.now()
+	delta = now - dt
+	if delta.total_seconds() < 0:
+		return dt.strftime("%Y-%m-%d %H:%M")
+	if delta <= timedelta(minutes=1):
+		return "только что"
+	if delta < timedelta(hours=1):
+		minutes = int(delta.total_seconds() // 60)
+		return f"{minutes} мин назад"
+	if delta < timedelta(days=1):
+		hours = int(delta.total_seconds() // 3600)
+		return f"{hours} ч назад"
+	if delta < timedelta(days=7):
+		days = delta.days
+		return f"{days} д назад"
+	return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def render_bar(value: int, max_value: int, width: int = 10) -> str:
+	if max_value <= 0:
+		max_value = 1
+	value = max(0, value)
+	ratio = value / max_value if max_value else 0
+	filled = int(round(ratio * width))
+	if value > 0 and filled == 0:
+		filled = 1
+	filled = min(width, filled)
+	empty = width - filled
+	return "█" * filled + "·" * empty
 
 def extract_forward_profile(message: Message) -> tuple[int | None, str | None, str | None]:
 	try:
@@ -286,15 +325,16 @@ async def admin_stats(cb: CallbackQuery):
 	db = get_db()
 	stats = await db.get_stats_summary()
 	lines = [
-		"📊 Статистика",
-		f"Всего пользователей: {stats['total_users']}",
-		f"Всего выдач реквизитов: {stats['total_deliveries']}",
+		"<b>📊 Статистика</b>",
+		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>",
+		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>",
 	]
 	top_recent = stats.get("top_recent") or []
 	top_inactive = stats.get("top_inactive") or []
 	if top_recent:
 		lines.append("")
-		lines.append("Топ-3 по активности:")
+		lines.append("<b>🔥 Топ-3 по активности</b>")
+		max_delivery = max((entry["delivery_count"] for entry in top_recent), default=1)
 		for entry in top_recent:
 			if entry["full_name"]:
 				label = entry["full_name"]
@@ -304,12 +344,26 @@ async def admin_stats(cb: CallbackQuery):
 				label = f"tg_id: {entry['tg_id']}"
 			else:
 				label = f"ID {entry['user_id']}"
-			last_interaction = format_ts(entry.get("last_interaction_at"))
-			lines.append(f"- {label}\n  Выдач: {entry['delivery_count']}, последнее: {last_interaction}")
+			count = entry["delivery_count"]
+			last_relative = format_relative(entry.get("last_interaction_at"))
+			bar = render_bar(count, max_delivery)
+			lines.append(
+				f"<code>{bar} {count:>3}</code> {escape(label)} <i>({last_relative})</i>"
+			)
 	if top_inactive:
 		lines.append("")
-		lines.append("Топ-5 по давности активности:")
+		lines.append("<b>🕒 Топ-5 по давности активности</b>")
+		now_ts = int(datetime.now().timestamp())
+		inactivity_values = []
 		for entry in top_inactive:
+			ts = entry.get("last_interaction_at")
+			if ts:
+				inactivity_values.append(max(0, now_ts - ts))
+			else:
+				inactivity_values.append(0)
+		max_inactivity = max(inactivity_values or [1])
+		for idx, entry in enumerate(top_inactive):
+			inactivity = inactivity_values[idx] if idx < len(inactivity_values) else 0
 			if entry["full_name"]:
 				label = entry["full_name"]
 			elif entry["username"]:
@@ -318,13 +372,17 @@ async def admin_stats(cb: CallbackQuery):
 				label = f"tg_id: {entry['tg_id']}"
 			else:
 				label = f"ID {entry['user_id']}"
-			last_interaction = format_ts(entry.get("last_interaction_at"))
-			lines.append(f"- {label}\n  Выдач: {entry['delivery_count']}, последнее: {last_interaction}")
+			last_relative = format_relative(entry.get("last_interaction_at"))
+			bar = render_bar(inactivity, max_inactivity)
+			count = entry["delivery_count"]
+			lines.append(
+				f"<code>{bar} {count:>3}</code> {escape(label)} <i>({last_relative})</i>"
+			)
 	if not top_recent and not top_inactive:
 		lines.append("")
 		lines.append("Нет данных по пользователям.")
 	text = "\n".join(lines)
-	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:back"))
+	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 	await cb.answer()
 
 
