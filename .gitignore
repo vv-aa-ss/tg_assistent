@@ -31,3 +31,9 @@ logs/
 *.egg-info/
 dist/
 build/
+
+# Executables
+*.exe
+
+# Generated output
+/output/
