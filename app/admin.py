@@ -430,7 +430,7 @@ async def admin_stats(cb: CallbackQuery):
 			)
 	if top_inactive:
 		lines.append("")
-		lines.append("<b>🕒 Топ-5 по давности активности</b>")
+		lines.append("<b>🕒 Топ-7 по давности активности</b>")
 		now_ts = int(datetime.now().timestamp())
 		inactivity_values = []
 		for entry in top_inactive:

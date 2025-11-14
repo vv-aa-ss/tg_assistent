@@ -597,7 +597,7 @@ class Database:
 		top_recent = [entry for entry in recent_sorted if entry["delivery_count"] > 0][:5]
 		if not top_recent:
 			top_recent = recent_sorted[:5]
-		top_inactive = sorted(per_user, key=lambda x: x["last_interaction_at"] or 0)[:5]
+		top_inactive = sorted(per_user, key=lambda x: x["last_interaction_at"] or 0)[:7]
 		return {
 			"total_users": total_users,
 			"total_deliveries": total_deliveries,
