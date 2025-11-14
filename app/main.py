@@ -19,7 +19,7 @@ from app.di import set_dependencies
 async def main() -> None:
 	os.makedirs("logs", exist_ok=True)
 	logging.basicConfig(
-		level=logging.INFO,
+		level=logging.DEBUG,  # Увеличиваем уровень для детального логирования
 		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 		handlers=[logging.FileHandler("logs/bot.log", encoding="utf-8")],
 	)

@@ -163,12 +163,57 @@ class Database:
 		await self._db.commit()
 		_logger.debug(f"Card deleted: id={card_id}")
 
+	async def create_user_by_name_only(self, full_name: str) -> Optional[int]:
+		"""
+		Создает пользователя только с именем (без tg_id) для случаев с MessageOriginHiddenUser.
+		Когда пользователь напишет боту, его tg_id будет обновлен через get_or_create_user.
+		"""
+		assert self._db
+		_logger.debug(f"create_user_by_name_only: full_name={full_name}")
+		
+		# Проверяем, нет ли уже пользователя с таким именем и NULL tg_id
+		cur = await self._db.execute(
+			"SELECT id FROM users WHERE tg_id IS NULL AND full_name = ?",
+			(full_name,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.debug(f"User with name '{full_name}' and NULL tg_id already exists: id={row[0]}")
+			return row[0]
+		
+		# Создаем нового пользователя с NULL tg_id
+		cur = await self._db.execute(
+			"INSERT INTO users(tg_id, username, full_name, last_interaction_at) VALUES(?, ?, ?, ?)",
+			(None, None, full_name, int(time.time())),
+		)
+		await self._db.commit()
+		_logger.info(f"User created by name only: id={cur.lastrowid} full_name={full_name}")
+		return cur.lastrowid
+
 	async def get_or_create_user(self, tg_id: Optional[int], username: Optional[str], full_name: Optional[str]) -> int:
 		assert self._db
 		_logger.debug(f"get_or_create_user: tg_id={tg_id} username={username} full_name={full_name}")
 		if tg_id is None:
 			_logger.debug("get_or_create_user skipped: tg_id is None")
 			return -1
+		
+		# Проверяем, нет ли пользователя с таким именем и NULL tg_id (созданного ранее для скрытого пользователя)
+		if full_name:
+			cur = await self._db.execute(
+				"SELECT id FROM users WHERE tg_id IS NULL AND full_name = ?",
+				(full_name,)
+			)
+			row = await cur.fetchone()
+			if row:
+				# Обновляем существующего пользователя с NULL tg_id, добавляя реальный tg_id
+				user_id = row[0]
+				_logger.info(f"Updating user with NULL tg_id: id={user_id}, setting tg_id={tg_id}, username={username}")
+				await self._db.execute(
+					"UPDATE users SET tg_id = ?, username = COALESCE(?, username), last_interaction_at = ? WHERE id = ?",
+					(tg_id, username, int(time.time()), user_id),
+				)
+				await self._db.commit()
+				return user_id
 		cur = await self._db.execute("SELECT id, username, full_name FROM users WHERE tg_id = ?", (tg_id,))
 		row = await cur.fetchone()
 		if row:
@@ -216,7 +261,20 @@ class Database:
 			)
 			if r[4] is not None:
 				info["cards"].append({"card_id": r[4], "card_name": r[5]})
-		return list(users.values())
+		users_list = list(users.values())
+		def sort_key(user: Dict[str, Any]) -> tuple:
+			label = ""
+			if user.get("full_name"):
+				label = user["full_name"]
+			elif user.get("username"):
+				label = f"@{user['username']}"
+			elif user.get("tg_id"):
+				label = str(user["tg_id"])
+			if not label:
+				label = f"ID {user['user_id']}"
+			return (label.lower(), user["user_id"])
+		users_list.sort(key=sort_key)
+		return users_list
 
 	async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
 		assert self._db
@@ -275,6 +333,139 @@ class Database:
 		cur = await self._db.execute("SELECT id FROM users WHERE tg_id = ?", (tg_id,))
 		row = await cur.fetchone()
 		return row[0] if row else None
+
+	async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+		"""Находит пользователя по username (без @)"""
+		assert self._db
+		if not username:
+			_logger.debug("get_user_by_username: username пустой")
+			return None
+		# Убираем @ если есть
+		username_clean = username.lstrip("@").lower()
+		_logger.debug(f"get_user_by_username: ищем '{username_clean}' (оригинал: '{username}')")
+		
+		# Ищем по username - пробуем несколько вариантов
+		# Сначала точное совпадение (убираем @ и пробелы)
+		cur = await self._db.execute(
+			"SELECT id, tg_id, username, full_name FROM users WHERE username IS NOT NULL AND LOWER(REPLACE(REPLACE(username, '@', ''), ' ', '')) = ?",
+			(username_clean,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.info(f"✅ get_user_by_username: найдено совпадение - tg_id={row[1]}, username={row[2]}")
+			return {
+				"user_id": row[0],
+				"tg_id": row[1],
+				"username": row[2],
+				"full_name": row[3],
+			}
+		
+		# Пробуем найти все пользователей для отладки
+		cur = await self._db.execute("SELECT tg_id, username FROM users WHERE username IS NOT NULL LIMIT 10")
+		all_users = await cur.fetchall()
+		_logger.warning(f"❌ get_user_by_username: пользователь с username '{username}' (ищем '{username_clean}') не найден. Всего пользователей с username: {len(all_users)}")
+		if all_users:
+			_logger.debug(f"Примеры username в БД: {[u[1] for u in all_users[:5]]}")
+		return None
+
+	async def get_user_by_full_name(self, full_name: str) -> Optional[Dict[str, Any]]:
+		"""Находит пользователя по full_name (для случаев с MessageOriginHiddenUser)"""
+		assert self._db
+		if not full_name:
+			_logger.debug("get_user_by_full_name: full_name пустой")
+			return None
+		
+		full_name_clean = full_name.strip()
+		_logger.debug(f"get_user_by_full_name: ищем '{full_name_clean}'")
+		
+		# Ищем точное совпадение full_name (включая записи с NULL tg_id)
+		cur = await self._db.execute(
+			"SELECT id, tg_id, username, full_name FROM users WHERE full_name = ? ORDER BY CASE WHEN tg_id IS NULL THEN 0 ELSE 1 END",
+			(full_name_clean,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.info(f"✅ get_user_by_full_name: найдено точное совпадение - tg_id={row[1]}, full_name={row[3]}")
+			return {
+				"user_id": row[0],
+				"tg_id": row[1],
+				"username": row[2],
+				"full_name": row[3],
+			}
+		
+		# Если не нашли точное совпадение, пробуем поиск без учета регистра
+		cur = await self._db.execute(
+			"SELECT id, tg_id, username, full_name FROM users WHERE LOWER(full_name) = LOWER(?) ORDER BY CASE WHEN tg_id IS NULL THEN 0 ELSE 1 END",
+			(full_name_clean,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.info(f"✅ get_user_by_full_name: найдено совпадение (без учета регистра) - tg_id={row[1]}, full_name={row[3]}")
+			return {
+				"user_id": row[0],
+				"tg_id": row[1],
+				"username": row[2],
+				"full_name": row[3],
+			}
+		
+		_logger.warning(f"❌ get_user_by_full_name: пользователь с full_name '{full_name}' не найден")
+		return None
+
+	async def find_similar_users_by_name(self, name: str, limit: int = 10) -> List[Dict[str, Any]]:
+		"""
+		Находит похожих пользователей по имени (частичное совпадение).
+		Используется для случаев, когда точного совпадения нет, но может быть полное имя в БД.
+		Например: ищем "Jeka", находим "Jeka Иванов", "Jeka Петров" и т.д.
+		"""
+		assert self._db
+		if not name:
+			return []
+		
+		name_clean = name.strip()
+		_logger.debug(f"find_similar_users_by_name: ищем похожих на '{name_clean}'")
+		
+		# Ищем пользователей, у которых name_clean содержится в full_name
+		# Используем LIKE для частичного совпадения (без учета регистра)
+		search_pattern = f"%{name_clean}%"
+		query = """
+			SELECT id, tg_id, username, full_name 
+			FROM users 
+			WHERE full_name IS NOT NULL 
+				AND LOWER(full_name) LIKE ?
+			ORDER BY 
+				CASE 
+					WHEN LOWER(full_name) = ? THEN 1  -- Точное совпадение (без учета регистра)
+					WHEN LOWER(full_name) LIKE ? THEN 2  -- Начинается с искомого
+					WHEN LOWER(full_name) LIKE ? THEN 3  -- Содержит искомое
+					ELSE 4
+				END,
+				full_name
+			LIMIT ?
+		"""
+		
+		name_lower = name_clean.lower()
+		cur = await self._db.execute(
+			query,
+			(search_pattern.lower(), name_lower, f"{name_lower}%", search_pattern.lower(), limit)
+		)
+		rows = await cur.fetchall()
+		
+		results = [
+			{
+				"user_id": row[0],
+				"tg_id": row[1],
+				"username": row[2],
+				"full_name": row[3],
+			}
+			for row in rows
+		]
+		
+		if results:
+			_logger.info(f"✅ find_similar_users_by_name: найдено {len(results)} похожих пользователей для '{name_clean}'")
+		else:
+			_logger.debug(f"find_similar_users_by_name: похожие пользователи для '{name_clean}' не найдены")
+		
+		return results
 
 	async def log_card_delivery(
 		self,
@@ -403,9 +594,9 @@ class Database:
 				-x["user_id"],
 			),
 		)
-		top_recent = [entry for entry in recent_sorted if entry["delivery_count"] > 0][:3]
+		top_recent = [entry for entry in recent_sorted if entry["delivery_count"] > 0][:5]
 		if not top_recent:
-			top_recent = recent_sorted[:3]
+			top_recent = recent_sorted[:5]
 		top_inactive = sorted(per_user, key=lambda x: x["last_interaction_at"] or 0)[:5]
 		return {
 			"total_users": total_users,

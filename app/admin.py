@@ -4,7 +4,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from typing import Any, Awaitable, Callable, Dict
+from typing import Any, Awaitable, Callable, Dict, List, Tuple
 from datetime import datetime, timedelta
 import logging
 import re
@@ -19,11 +19,14 @@ from app.keyboards import (
 	user_action_kb,
 	card_action_kb,
 	user_cards_reply_kb,
+	similar_users_select_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
+
+USERS_PER_PAGE = 6
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
@@ -122,25 +125,64 @@ def render_bar(value: int, max_value: int, width: int = 10) -> str:
 	return "█" * filled + "·" * empty
 
 def extract_forward_profile(message: Message) -> tuple[int | None, str | None, str | None]:
+	"""
+	Извлекает информацию о пересланном пользователе.
+	Возвращает (tg_id, username, full_name).
+	Примечание: из-за настроек приватности Telegram ID может быть недоступен,
+	но username и full_name могут быть доступны.
+	"""
 	try:
+		# Пытаемся получить через новый API (forward_origin)
 		if getattr(message, "forward_origin", None):
 			origin = message.forward_origin
+			origin_type = type(origin).__name__
+			logger.info(f"🔍 forward_origin найден: {origin_type}")
+			
+			# Проверяем тип origin
+			if origin_type == "MessageOriginHiddenUser":
+				# Пользователь полностью скрыл информацию - есть только имя
+				sender_user_name = getattr(origin, "sender_user_name", None)
+				if sender_user_name:
+					logger.warning(f"⚠️ MessageOriginHiddenUser: ID недоступен, но есть sender_user_name='{sender_user_name}' (полная приватность)")
+					# Возвращаем имя как full_name, username будет None
+					return None, None, sender_user_name
+				else:
+					logger.warning(f"⚠️ MessageOriginHiddenUser: даже sender_user_name недоступен")
+			
+			# Для MessageOriginUser пытаемся получить sender_user
 			user = getattr(origin, "sender_user", None)
-			if user and getattr(user, "id", None):
+			if user:
+				user_id = getattr(user, "id", None)
 				username = getattr(user, "username", None)
 				full_name = " ".join([x for x in [getattr(user, "first_name", None), getattr(user, "last_name", None)] if x]) or None
-				logger.debug(f"forward_origin detected, user_id={user.id}, username={username}")
-				return user.id, username, full_name
+				if user_id:
+					logger.info(f"✅ forward_origin: user_id={user_id}, username={username}, full_name={full_name}")
+					return user_id, username, full_name
+				elif username or full_name:
+					# ID недоступен из-за настроек приватности, но есть другие данные
+					logger.warning(f"⚠️ forward_origin: user_id недоступен (приватность), но есть username={username}, full_name={full_name}")
+					return None, username, full_name
+			else:
+				logger.warning(f"⚠️ forward_origin найден ({origin_type}), но sender_user отсутствует")
+		
+		# Пытаемся получить через старый API (forward_from)
 		ex = getattr(message, "forward_from", None)
 		if ex:
+			user_id = getattr(ex, "id", None)
 			username = getattr(ex, "username", None)
 			full_name = " ".join([x for x in [getattr(ex, "first_name", None), getattr(ex, "last_name", None)] if x]) or None
-			logger.debug(f"forward_from detected, user_id={ex.id}, username={username}")
-			return ex.id, username, full_name
-		logger.debug("No forward info found in message")
+			if user_id:
+				logger.info(f"✅ forward_from: user_id={user_id}, username={username}, full_name={full_name}")
+				return user_id, username, full_name
+			elif username or full_name:
+				# ID недоступен из-за настроек приватности
+				logger.warning(f"⚠️ forward_from: user_id недоступен (приватность), но есть username={username}, full_name={full_name}")
+				return None, username, full_name
+		
+		logger.warning("❌ Нет информации о пересылке в сообщении (возможно, пользователь скрыл данные через настройки приватности или сообщение не переслано)")
 		return None, None, None
 	except Exception as e:
-		logger.exception(f"extract_forward_profile error: {e}")
+		logger.exception(f"❌ extract_forward_profile error: {e}")
 		return None, None, None
 
 
@@ -295,13 +337,11 @@ async def add_card_name(message: Message, state: FSMContext):
 	await message.answer("Карта создана. Отправьте сообщение карты (или 'СБРОС' для очистки).", reply_markup=simple_back_kb("admin:cards"))
 
 
-@admin_router.callback_query(F.data == "admin:users")
-async def admin_users(cb: CallbackQuery):
+async def render_users_page(cb: CallbackQuery, page: int = 0) -> None:
 	db = get_db()
 	rows = await db.list_users_with_binding()
-	items = []
+	items: List[Tuple[int, str]] = []
 	for r in rows:
-		# Используем full_name если есть, иначе username, иначе tg_id
 		if r["full_name"]:
 			label = r["full_name"]
 		elif r["username"]:
@@ -310,13 +350,51 @@ async def admin_users(cb: CallbackQuery):
 			label = f"tg_id: {r['tg_id']}"
 		else:
 			label = f"ID {r['user_id']}"
-		
 		if r["cards"]:
 			card_names = ", ".join(card["card_name"] for card in r["cards"])
 			label += f" → {card_names}"
 		items.append((r["user_id"], label))
-	logger.debug(f"Show users: count={len(items)}")
-	await cb.message.edit_text("Пользователи:", reply_markup=users_list_kb(items))
+	total = len(items)
+	logger.debug(f"Show users: total={total} page={page}")
+	if total == 0:
+		text = "Пользователи не найдены."
+		reply_markup = users_list_kb([], back_to="admin:back")
+	else:
+		total_pages = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
+		page = max(0, min(page, total_pages - 1))
+		start = page * USERS_PER_PAGE
+		end = start + USERS_PER_PAGE
+		page_items = items[start:end]
+		text = f"Пользователи (стр. {page+1}/{total_pages}, всего: {total}):"
+		reply_markup = users_list_kb(
+			page_items,
+			back_to="admin:back",
+			page=page,
+			per_page=USERS_PER_PAGE,
+			total=total,
+		)
+	await cb.message.edit_text(text, reply_markup=reply_markup)
+
+
+@admin_router.callback_query(F.data == "admin:users")
+async def admin_users(cb: CallbackQuery):
+	await render_users_page(cb, page=0)
+	await cb.answer()
+
+
+@admin_router.callback_query((F.data.startswith("admin:users:")) & (F.data != "admin:users:noop"))
+async def admin_users_page(cb: CallbackQuery):
+	part = cb.data.split(":")
+	try:
+		page = int(part[2])
+	except (IndexError, ValueError):
+		page = 0
+	await render_users_page(cb, page=page)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "admin:users:noop")
+async def admin_users_noop(cb: CallbackQuery):
 	await cb.answer()
 
 
@@ -333,7 +411,7 @@ async def admin_stats(cb: CallbackQuery):
 	top_inactive = stats.get("top_inactive") or []
 	if top_recent:
 		lines.append("")
-		lines.append("<b>🔥 Топ-3 по активности</b>")
+		lines.append("<b>🔥 Топ-5 по активности</b>")
 		max_delivery = max((entry["delivery_count"] for entry in top_recent), default=1)
 		for entry in top_recent:
 			if entry["full_name"]:
@@ -587,7 +665,75 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		return
 	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
 	text = message.text or message.caption or ""
-	logger.debug(f"Incoming message from admin {message.from_user.id}, forward_user={orig_tg_id}, has_text={bool(text)}")
+	logger.info(f"📨 Пересылка от админа {message.from_user.id}: tg_id={orig_tg_id}, username={orig_username}, full_name={orig_full_name}, text={text[:50] if text else 'нет'}")
+	
+	# Если ID недоступен, но есть username, пытаемся найти пользователя в БД по username
+	if orig_tg_id is None and orig_username:
+		logger.info(f"⚠️ ID недоступен, но есть username={orig_username}, ищем пользователя в БД")
+		user_by_username = await db.get_user_by_username(orig_username)
+		logger.info(f"🔍 Результат поиска по username '{orig_username}': {user_by_username}")
+		if user_by_username and user_by_username.get("tg_id"):
+			orig_tg_id = user_by_username["tg_id"]
+			logger.info(f"✅ Найден пользователь в БД по username={orig_username}, tg_id={orig_tg_id} (проблема с приватностью обойдена)")
+			# Обновляем данные пользователя (get_or_create_user обновит пустые поля)
+			await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
+		else:
+			logger.warning(f"❌ Пользователь с username={orig_username} не найден в БД")
+	
+	# Если ID и username недоступны, но есть full_name (MessageOriginHiddenUser), ищем по full_name
+	if orig_tg_id is None and not orig_username and orig_full_name:
+		logger.info(f"⚠️ ID и username недоступны, но есть full_name='{orig_full_name}', ищем пользователя в БД по имени")
+		user_by_full_name = await db.get_user_by_full_name(orig_full_name)
+		logger.info(f"🔍 Результат поиска по full_name '{orig_full_name}': {user_by_full_name}")
+		if user_by_full_name:
+			# Запись найдена (может быть с tg_id=None для скрытых пользователей)
+			user_id = user_by_full_name.get("user_id")
+			orig_tg_id = user_by_full_name.get("tg_id")  # Может быть None
+			orig_username = user_by_full_name.get("username")  # Может быть None
+			
+			if orig_tg_id:
+				# Есть реальный tg_id - используем его
+				logger.info(f"✅ Найден пользователь в БД по full_name='{orig_full_name}', tg_id={orig_tg_id} (MessageOriginHiddenUser обойден)")
+				await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
+			else:
+				# Найдена запись с NULL tg_id - это запись, созданная ранее для скрытого пользователя
+				logger.info(f"✅ Найдена запись для скрытого пользователя '{orig_full_name}' (user_id={user_id}, tg_id=None). Проверяем карты...")
+				# Получаем карты для этого пользователя через user_id
+				cards_for_user = await db.list_cards_for_user(user_id)
+				if cards_for_user:
+					# У пользователя уже есть привязанные карты - продолжаем как обычно
+					if len(cards_for_user) == 1:
+						card = cards_for_user[0]
+						user_msg = card.get("user_message")
+						admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
+						if user_msg:
+							await message.answer(admin_text, parse_mode="HTML")
+						else:
+							await message.answer(admin_text)
+						logger.info(f"✅ Отправлено сообщение карты для скрытого пользователя '{orig_full_name}' (user_id={user_id})")
+						return
+					else:
+						# Несколько карт - показываем выбор
+						buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
+						await state.set_state(ForwardBindStates.waiting_select_existing_card)
+						await state.update_data(original_tg_id=None, user_id_for_hidden=user_id, hidden_user_name=orig_full_name)
+						await message.answer(
+							f"✅ Найден пользователь '{orig_full_name}' с привязанными картами.\n\nУ пользователя привязано несколько карт. Выберите нужную:",
+							reply_markup=user_cards_reply_kb(buttons, 0, back_to="admin:back"),  # Используем 0, так как tg_id нет
+						)
+						return
+				else:
+					# Карт нет - показываем выбор карты для привязки
+					logger.info(f"⚠️ У пользователя '{orig_full_name}' нет привязанных карт, предлагаем выбрать")
+					rows = await db.list_cards()
+					cards = [(r[0], r[1]) for r in rows]
+					await state.set_state(ForwardBindStates.waiting_select_card)
+					await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=user_id)
+					await message.answer(f"✅ Пользователь '{orig_full_name}' найден в БД, но не привязан к карте.\n\nВыберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+					return
+		else:
+			logger.warning(f"❌ Пользователь с full_name='{orig_full_name}' не найден в БД")
+	
 	# Try resolve @username from text when no forward info
 	if orig_tg_id is None and text:
 		m = re.search(r"@([A-Za-z0-9_]{5,})", text)
@@ -602,13 +748,21 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				logger.debug(f"Resolved username @{uname} to id={orig_tg_id}")
 			except Exception as e:
 				logger.debug(f"Failed resolve username @{uname}: {e}")
+				# Если не удалось резолвить через API, попробуем найти в БД
+				if not orig_tg_id:
+					user_by_username = await db.get_user_by_username(uname)
+					if user_by_username and user_by_username.get("tg_id"):
+						orig_tg_id = user_by_username["tg_id"]
+						logger.info(f"Найден пользователь в БД по username из текста @{uname}, tg_id={orig_tg_id}")
+	
 	if orig_tg_id is not None:
 		# Ensure user is saved/upserted before any binding/lookup
-		await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
+		user_id = await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
+		logger.info(f"💾 Пользователь сохранен/обновлен: tg_id={orig_tg_id}, user_id={user_id}, username={orig_username}")
 		await db.touch_user_by_tg(orig_tg_id)
 		cards_for_user = await db.get_cards_for_user_tg(orig_tg_id)
+		logger.info(f"🎴 У пользователя {orig_tg_id} найдено карт: {len(cards_for_user)}")
 		if cards_for_user:
-			logger.debug(f"User {orig_tg_id} has {len(cards_for_user)} bound cards")
 			if len(cards_for_user) == 1:
 				card = cards_for_user[0]
 				user_msg = card.get("user_message")
@@ -637,30 +791,80 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
 			)
 			return
-		logger.debug("User not bound, offering cards for binding")
+		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать карту")
 		rows = await db.list_cards()
 		cards = [(r[0], r[1]) for r in rows]
 		await state.set_state(ForwardBindStates.waiting_select_card)
 		await state.update_data(original_tg_id=orig_tg_id)
 		await message.answer("Пользователь не привязан. Выберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
 		return
-	# fallback by text when no origin available
-	if text:
-		card = await db.find_card_by_text(text)
-		logger.debug(f"Pattern search result: {bool(card)}")
-		if card:
-			user_msg = await db.get_card_user_message(card[0])
-			if user_msg:
-				await message.answer(user_msg, parse_mode="HTML")
-			else:
-				await message.answer("Сообщение карты отсутствует")
+	# Если не удалось найти пользователя, но есть username или full_name - возможно пользователь еще не в БД или все скрыто
+	if orig_tg_id is None:
+		# Проверяем, есть ли хотя бы username
+		if orig_username:
+			# Пользователь не найден в БД, но есть username - возможно первый раз
+			logger.warning(f"Не удалось определить ID пользователя, но есть username={orig_username}. Возможные причины: пользователь скрыл данные в настройках приватности Telegram или еще не взаимодействовал с ботом.")
+			rows = await db.list_cards()
+			cards = [(r[0], r[1]) for r in rows]
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			await state.update_data(reply_only=True)
+			warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nВыберите карту для ответа администратору:"
+			await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 			return
-	# as last resort: show cards to reply-only
-	rows = await db.list_cards()
-	cards = [(r[0], r[1]) for r in rows]
-	await state.set_state(ForwardBindStates.waiting_select_card)
-	await state.update_data(reply_only=True)
-	await message.answer("Не удалось определить пользователя. Выберите карту для ответа администратору:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+		# Проверяем, есть ли full_name (MessageOriginHiddenUser)
+		elif orig_full_name:
+			logger.warning(f"Не удалось определить ID пользователя, но есть full_name='{orig_full_name}'. Это MessageOriginHiddenUser - пользователь полностью скрыл информацию. Пытаемся найти похожих пользователей...")
+			
+			# Пытаемся найти похожих пользователей по имени (частичное совпадение)
+			similar_users = await db.find_similar_users_by_name(orig_full_name, limit=5)
+			logger.info(f"🔍 Найдено {len(similar_users)} похожих пользователей для '{orig_full_name}'")
+			
+			if len(similar_users) == 1:
+				# Найден один похожий - используем его автоматически
+				user = similar_users[0]
+				orig_tg_id = user["tg_id"]
+				orig_username = user.get("username")
+				logger.info(f"✅ Автоматически выбран единственный похожий пользователь: tg_id={orig_tg_id}, full_name={user['full_name']}")
+				# Продолжаем обработку с найденным пользователем
+				await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
+				# Не делаем return, продолжаем выполнение кода ниже
+			elif len(similar_users) > 1:
+				# Найдено несколько похожих - предлагаем выбрать
+				await state.set_state(ForwardBindStates.waiting_select_card)
+				await state.update_data(hidden_user_name=orig_full_name, similar_users=[u["tg_id"] for u in similar_users])
+				
+				similar_text = f"🔍 Найдено {len(similar_users)} похожих пользователей для '{orig_full_name}':\n\n"
+				similar_text += "Выберите нужного пользователя:"
+				await message.answer(similar_text, reply_markup=similar_users_select_kb(similar_users, orig_full_name))
+				return
+			else:
+				# Не найдено похожих - сохраняем имя для последующей привязки
+				rows = await db.list_cards()
+				cards = [(r[0], r[1]) for r in rows]
+				await state.set_state(ForwardBindStates.waiting_select_card)
+				# Сохраняем имя скрытого пользователя в state, чтобы при выборе карты создать запись
+				await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
+				warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nВыберите карту для привязки:"
+				await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+				return
+		# fallback by text when no origin available
+		if text:
+			card = await db.find_card_by_text(text)
+			logger.debug(f"Pattern search result: {bool(card)}")
+			if card:
+				user_msg = await db.get_card_user_message(card[0])
+				if user_msg:
+					await message.answer(user_msg, parse_mode="HTML")
+				else:
+					await message.answer("Сообщение карты отсутствует")
+				return
+		# as last resort: show cards to reply-only
+		rows = await db.list_cards()
+		cards = [(r[0], r[1]) for r in rows]
+		await state.set_state(ForwardBindStates.waiting_select_card)
+		await state.update_data(reply_only=True)
+		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите карту для ответа администратору:"
+		await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 
 
 @admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("select:card:"))
@@ -669,6 +873,8 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 	card_id = int(cb.data.split(":")[-1])
 	data = await state.get_data()
 	reply_only = bool(data.get("reply_only", False))
+	hidden_user_name = data.get("hidden_user_name")  # Имя скрытого пользователя
+	
 	if reply_only:
 		# reply to admin only without binding
 		user_msg = await db.get_card_user_message(card_id)
@@ -679,7 +885,46 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 			await cb.message.edit_text("Сообщение карты отсутствует", reply_markup=admin_menu_kb())
 		await cb.answer()
 		return
-	orig_tg_id = int(data.get("original_tg_id"))
+	
+	orig_tg_id = data.get("original_tg_id")
+	existing_user_id = data.get("existing_user_id")  # ID существующего пользователя с NULL tg_id
+	
+	# Если есть имя скрытого пользователя, но нет ID
+	if hidden_user_name and not orig_tg_id:
+		if existing_user_id:
+			# Пользователь уже существует - просто привязываем карту
+			user_id = existing_user_id
+			logger.info(f"💾 Привязываю карту {card_id} к существующему пользователю '{hidden_user_name}' (user_id={user_id})")
+		else:
+			# Создаем нового пользователя с NULL tg_id
+			logger.info(f"💾 Создаю запись для скрытого пользователя '{hidden_user_name}' с card_id={card_id}")
+			user_id = await db.create_user_by_name_only(hidden_user_name)
+		
+		if user_id:
+			await db.bind_user_to_card(user_id, card_id)
+			logger.info(f"✅ Привязана карта {card_id} к пользователю '{hidden_user_name}' (user_id={user_id})")
+			
+			card = await db.get_card_by_id(card_id)
+			await state.clear()
+			admin_text = f"✅ Запись создана для пользователя '{hidden_user_name}'.\n\n"
+			if card:
+				user_msg = card.get("user_message")
+				if user_msg:
+					admin_text += f"Сообщение карты:\n{user_msg}"
+				else:
+					admin_text += "Сообщение карты отсутствует"
+			else:
+				admin_text += "Карта не найдена"
+			
+			await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+			await cb.answer(f"✅ Записано для '{hidden_user_name}'")
+			return
+	
+	if not orig_tg_id:
+		await cb.answer("Ошибка: не удалось определить пользователя", show_alert=True)
+		return
+	
+	orig_tg_id = int(orig_tg_id)
 	logger.debug(f"Bind forwarded user {orig_tg_id} to card_id={card_id}")
 	user_id = await db.get_or_create_user(orig_tg_id, None, None)
 	await db.touch_user_by_tg(orig_tg_id)
@@ -707,13 +952,118 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 	await cb.answer()
 
 
+@admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("hidden:select:"))
+async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора пользователя из списка похожих (для MessageOriginHiddenUser)"""
+	db = get_db()
+	# Формат: hidden:select:{tg_id}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка формата", show_alert=True)
+		return
+	
+	tg_id = int(parts[2])
+	data = await state.get_data()
+	hidden_name = data.get("hidden_user_name", "Неизвестный")
+	
+	logger.info(f"✅ Выбран пользователь из похожих: tg_id={tg_id}, hidden_name='{hidden_name}'")
+	
+	# Получаем данные пользователя
+	user_id = await db.get_user_id_by_tg(tg_id)
+	if not user_id:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Ошибка получения данных пользователя", show_alert=True)
+		return
+	
+	# Обновляем состояние с найденным tg_id
+	await state.update_data(original_tg_id=tg_id, reply_only=False)
+	
+	# Проверяем, привязан ли пользователь к картам
+	cards_for_user = await db.get_cards_for_user_tg(tg_id)
+	
+	if cards_for_user:
+		if len(cards_for_user) == 1:
+			# Одна карта - используем её
+			card = cards_for_user[0]
+			user_msg = card.get("user_message")
+			admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
+			
+			await state.clear()
+			if user_msg:
+				await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+			else:
+				await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+			
+			await db.log_card_delivery_by_tg(tg_id, card["card_id"], admin_id=cb.from_user.id if cb.from_user else None)
+			
+			if user_msg:
+				try:
+					await bot.send_message(chat_id=tg_id, text=user_msg, parse_mode="HTML")
+					logger.info(f"Отправлено сообщение карты пользователю {tg_id}")
+				except Exception as e:
+					logger.exception(f"Ошибка отправки сообщения пользователю {tg_id}: {e}")
+		else:
+			# Несколько карт - выбираем
+			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
+			await state.set_state(ForwardBindStates.waiting_select_existing_card)
+			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nУ пользователя привязано несколько карт. Выберите нужную:"
+			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back"))
+	else:
+		# Не привязан - выбираем карту для привязки
+		rows = await db.list_cards()
+		cards = [(r[0], r[1]) for r in rows]
+		text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nПользователь не привязан. Выберите карту для привязки:"
+		await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	
+	await cb.answer()
+
+
+@admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data == "hidden:no_match")
+async def hidden_user_no_match(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик когда пользователь не найден в списке похожих"""
+	data = await state.get_data()
+	hidden_name = data.get("hidden_user_name", "Неизвестный")
+	
+	logger.info(f"❌ Пользователь '{hidden_name}' не найден в списке похожих")
+	
+	# Показываем список карт для ответа администратору
+	db = get_db()
+	rows = await db.list_cards()
+	cards = [(r[0], r[1]) for r in rows]
+	await state.update_data(reply_only=True)
+	
+	text = f"⚠️ Пользователь '{hidden_name}' не найден в базе данных.\n\nДля работы с этим пользователем попросите его написать боту хотя бы один раз.\n\nВыберите карту для ответа администратору:"
+	await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	await cb.answer()
+
+
 @admin_router.callback_query(ForwardBindStates.waiting_select_existing_card, F.data.startswith("user:reply:card:"))
 async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	db = get_db()
 	parts = cb.data.split(":")
-	user_tg_id = int(parts[3])
+	user_tg_id_val = parts[3]
 	card_id = int(parts[4])
-	await db.touch_user_by_tg(user_tg_id)
+	
+	data = await state.get_data()
+	user_id_for_hidden = data.get("user_id_for_hidden")
+	hidden_user_name = data.get("hidden_user_name")
+	
+	# Обрабатываем случай, когда tg_id = 0 (для скрытых пользователей)
+	user_tg_id = int(user_tg_id_val) if user_tg_id_val != "0" else None
+	
+	if user_tg_id:
+		# Обычный пользователь с tg_id
+		await db.touch_user_by_tg(user_tg_id)
+	else:
+		# Скрытый пользователь - обновляем last_interaction_at через user_id
+		if user_id_for_hidden:
+			await db.touch_user(user_id_for_hidden)
+			logger.info(f"Обновлен last_interaction_at для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden})")
+	
 	card = await db.get_card_by_id(card_id)
 	if not card:
 		await cb.answer("Карта не найдена", show_alert=True)
@@ -725,15 +1075,27 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
 	else:
 		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
-	await db.log_card_delivery_by_tg(
-		user_tg_id,
-		card_id,
-		admin_id=cb.from_user.id if cb.from_user else None,
-	)
-	if user_msg:
-		try:
-			await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
-			logger.debug(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
-		except Exception as e:
-			logger.exception(f"Failed to send user_message for existing card: {e}")
+	
+	# Логируем доставку
+	if user_tg_id:
+		await db.log_card_delivery_by_tg(
+			user_tg_id,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
+		if user_msg:
+			try:
+				await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
+				logger.info(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
+			except Exception as e:
+				logger.exception(f"Failed to send user_message for existing card: {e}")
+	elif user_id_for_hidden:
+		# Логируем для скрытого пользователя через user_id
+		await db.log_card_delivery(
+			user_id_for_hidden,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
+		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id}). Сообщение не отправлено (нет tg_id)")
+	
 	await cb.answer()
