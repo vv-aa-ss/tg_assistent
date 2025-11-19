@@ -137,3 +137,99 @@ def similar_users_select_kb(similar_users: List[Dict], hidden_name: str, back_to
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
 	return kb.as_markup()
+
+
+def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, card_data: Dict | None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру с тремя кнопками для множественных пересылок.
+	Всегда показывает три кнопки: криптовалюта, наличные, карта.
+	Первые три кнопки в ряд, под ними кнопка "Подтвердить".
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Кнопка 1: Криптовалюта
+	if crypto_data:
+		display = crypto_data.get("display", "Криптовалюта")
+		kb.button(text=f"₿ {display}", callback_data="multi:select:crypto")
+	else:
+		kb.button(text="₿ Не указано", callback_data="multi:select:crypto")
+	
+	# Кнопка 2: Наличные
+	if cash_data:
+		display = cash_data.get("display", "Наличные")
+		kb.button(text=f"💵 {display}", callback_data="multi:select:cash")
+	else:
+		kb.button(text="💵 Не указано", callback_data="multi:select:cash")
+	
+	# Кнопка 3: Карта
+	if card_data:
+		display = card_data.get("display", "Карта")
+		kb.button(text=f"💳 {display}", callback_data="multi:select:card")
+	else:
+		kb.button(text="💳 Не указано", callback_data="multi:select:card")
+	
+	# Кнопка "Подтвердить"
+	kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	# Первые три кнопки в ряд, затем "Подтвердить" и "Назад" по одной
+	kb.adjust(3, 1, 1)
+	return kb.as_markup()
+
+
+def crypto_edit_kb(current_currency: str, amount: float) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для редактирования криптовалюты.
+	Первый ряд: две кнопки с другими типами монет (если текущая BTC - LTC и XMR, и т.д.)
+	Второй ряд: кнопка "Количество"
+	Третий ряд: кнопка "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Определяем какие кнопки показать в первом ряду
+	all_currencies = ["BTC", "LTC", "XMR"]
+	other_currencies = [c for c in all_currencies if c != current_currency]
+	
+	# Добавляем кнопки с другими типами монет
+	for currency in other_currencies[:2]:  # Берем первые две
+		kb.button(text=currency, callback_data=f"crypto:change_type:{currency}")
+	
+	# Кнопка "Количество"
+	kb.button(text="Количество", callback_data="crypto:change_amount")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data="crypto:back")
+	
+	# Первый ряд - две кнопки типов, второй ряд - количество, третий - назад
+	kb.adjust(2, 1, 1)
+	return kb.as_markup()
+
+
+def cash_edit_kb(current_currency: str, amount: int) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для редактирования наличных.
+	Первый ряд: две кнопки с валютами (BYN и RUB)
+	Второй ряд: кнопка "Изменить"
+	Третий ряд: кнопка "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Определяем какие кнопки показать в первом ряду
+	all_currencies = ["BYN", "RUB"]
+	other_currencies = [c for c in all_currencies if c != current_currency]
+	
+	# Добавляем кнопки с валютами
+	for currency in other_currencies:
+		kb.button(text=currency, callback_data=f"cash:change_currency:{currency}")
+	
+	# Кнопка "Изменить"
+	kb.button(text="Изменить", callback_data="cash:change_amount")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data="cash:back")
+	
+	# Первый ряд - две кнопки валют, второй ряд - изменить, третий - назад
+	kb.adjust(2, 1, 1)
+	return kb.as_markup()

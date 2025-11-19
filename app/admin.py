@@ -2,6 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, TelegramObject
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.filters import StateFilter
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from typing import Any, Awaitable, Callable, Dict, List, Tuple
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 import logging
 import re
 from html import escape
+import asyncio
 from app.keyboards import (
 	admin_menu_kb,
 	cards_list_kb,
@@ -27,6 +29,11 @@ admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
 
 USERS_PER_PAGE = 6
+
+# Блокировка для синхронизации обработки множественных пересылок
+# Ключ: (user_id, session_key), значение: asyncio.Lock
+_multi_forward_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()  # Блокировка для доступа к словарю блокировок
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
@@ -62,6 +69,9 @@ class CardUserMessageStates(StatesGroup):
 class ForwardBindStates(StatesGroup):
 	waiting_select_card = State()
 	waiting_select_existing_card = State()
+	collecting_multi_forward = State()
+	editing_crypto_amount = State()  # Состояние для редактирования количества криптовалюты
+	editing_cash_amount = State()  # Состояние для редактирования количества наличных
 
 
 def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
@@ -110,6 +120,108 @@ def format_relative(ts: int | None) -> str:
 		days = delta.days
 		return f"{days} д назад"
 	return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def detect_crypto_type(amount: float) -> str:
+	"""
+	Определяет тип криптовалюты по сумме.
+	BTC: очень маленькие суммы (< 0.01)
+	LTC/XMR: средние суммы (0.1 - 10)
+	"""
+	if amount < 0.01:
+		return "BTC"
+	elif 0.1 <= amount <= 10:
+		return "LTC"  # Можно изменить на XMR если нужно
+	else:
+		return "BTC"  # По умолчанию
+
+
+def detect_cash_type(amount: int) -> str:
+	"""
+	Определяет тип наличных по сумме.
+	BYN: до 1000
+	RUB: 1000 и больше
+	"""
+	if amount < 1000:
+		return "BYN"
+	else:
+		return "RUB"
+
+
+def parse_forwarded_message(text: str) -> dict:
+	"""
+	Парсит пересланное сообщение и определяет его тип.
+	Возвращает dict с полями: type, value, currency, card_name, user_name, display
+	"""
+	if not text:
+		return {"type": "unknown"}
+	
+	text = text.strip()
+	
+	# Проверяем на криптовалюту (число с точкой)
+	crypto_match = re.match(r'^(\d+\.\d+)$', text)
+	if crypto_match:
+		amount = float(crypto_match.group(1))
+		currency = detect_crypto_type(amount)
+		return {
+			"type": "crypto",
+			"value": amount,
+			"currency": currency,
+			"display": f"{amount} {currency}"
+		}
+	
+	# Проверяем на наличные (целое число, возможно с текстом "без долга")
+	# Также может быть несколько чисел через пробел (2200 7008 6988 1390) - берем первое
+	cash_match = re.match(r'^(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?$', text, re.IGNORECASE)
+	if cash_match:
+		amount = int(cash_match.group(1))
+		currency = detect_cash_type(amount)
+		return {
+			"type": "cash",
+			"value": amount,
+			"currency": currency,
+			"display": f"{amount} {currency}"
+		}
+	
+	# Упрощенная проверка на карту: ищем только "ТИНЕК" или "СБЕР"
+	# Карты у нас только эти две
+	card_name = None
+	if "ТИНЕК" in text.upper() or "ТИНЬКОФ" in text.upper():
+		card_name = "ТИНЕК"
+	elif "СБЕР" in text.upper() or "СБЕРБАНК" in text.upper():
+		card_name = "СБЕР"
+	
+	if card_name:
+		# Пытаемся найти имя в скобках
+		name_match = re.search(r'\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)', text)
+		user_name = name_match.group(1) if name_match else None
+		display = f"{card_name} ({user_name})" if user_name else card_name
+		return {
+			"type": "card",
+			"card_name": card_name,
+			"user_name": user_name,
+			"display": display
+		}
+	
+	# Проверяем просто на название карты (только заглавные буквы, короткое слово)
+	if re.match(r'^[А-ЯЁA-Z]{2,10}$', text.strip()):
+		return {
+			"type": "card",
+			"card_name": text.strip(),
+			"user_name": None,
+			"display": text.strip()
+		}
+	
+	# Проверяем на имя пользователя в скобках (Артем В.)
+	name_match = re.match(r'^\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)$', text.strip())
+	if name_match:
+		return {
+			"type": "user_name",
+			"user_name": name_match.group(1),
+			"display": name_match.group(1)
+		}
+	
+	return {"type": "unknown", "text": text}
 
 
 def render_bar(value: int, max_value: int, width: int = 10) -> str:
@@ -655,7 +767,164 @@ async def user_bind_card(cb: CallbackQuery):
 	await cb.answer(alert_text)
 
 
+# Обработчик ввода количества криптовалюты - должен быть ПЕРЕД handle_forwarded_from_admin
+@admin_router.message(ForwardBindStates.editing_crypto_amount)
+async def crypto_change_amount_process(message: Message, state: FSMContext):
+	"""Обработка ввода нового количества криптовалюты"""
+	logger.info(f"📝 Получен ввод количества криптовалюты: {message.text}, состояние: {await state.get_state()}")
+	try:
+		amount = float(message.text.replace(",", "."))
+		if amount <= 0:
+			await message.answer("❌ Количество должно быть больше нуля. Попробуйте еще раз:")
+			return
+		
+		logger.info(f"✅ Парсинг количества успешен: {amount}")
+		data = await state.get_data()
+		messages_list = data.get("multi_forward_messages", [])
+		logger.debug(f"📋 Найдено сообщений: {len(messages_list)}")
+		
+		# Находим сообщение с криптовалютой и обновляем количество
+		crypto_data = None
+		for msg in messages_list:
+			if msg["parsed"].get("type") == "crypto":
+				currency = msg["parsed"].get("currency", "BTC")
+				msg["parsed"]["value"] = amount
+				msg["parsed"]["display"] = f"{amount} {currency}"
+				crypto_data = msg["parsed"]
+				logger.info(f"✅ Обновлена криптовалюта: {crypto_data.get('display')}")
+				break
+		
+		if not crypto_data:
+			logger.warning("⚠️ Криптовалюта не найдена в сообщениях")
+			await message.answer("❌ Ошибка: криптовалюта не найдена. Попробуйте еще раз.")
+			return
+		
+		# Обновляем данные в state
+		await state.update_data(multi_forward_messages=messages_list)
+		await state.set_state(ForwardBindStates.waiting_select_card)
+		logger.info(f"✅ Состояние обновлено на: {await state.get_state()}")
+		
+		# Обновляем кнопки в основном сообщении
+		from app.keyboards import multi_forward_select_kb
+		
+		cash_data = None
+		card_data = None
+		
+		for msg in messages_list:
+			parsed_msg = msg["parsed"]
+			msg_type = parsed_msg.get("type")
+			
+			if msg_type == "cash" and not cash_data:
+				cash_data = parsed_msg
+			elif msg_type == "card" and not card_data:
+				card_data = parsed_msg
+		
+		# Обновляем сообщение с кнопками
+		buttons_message_id = data.get("multi_forward_buttons_msg_id")
+		if buttons_message_id:
+			try:
+				await message.bot.edit_message_text(
+					chat_id=message.chat.id,
+					message_id=buttons_message_id,
+					text="Выберите тип данных:",
+					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+				)
+			except Exception as e:
+				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+		
+		# Возвращаемся к основному меню с тремя кнопками
+		await message.answer(
+			"✅ Количество обновлено\n\nВыберите тип данных:",
+			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+		)
+		
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число, например: 0.000499")
+	except Exception as e:
+		logger.exception(f"Ошибка обработки количества криптовалюты: {e}")
+		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
+
+
+@admin_router.message(ForwardBindStates.editing_cash_amount)
+async def cash_change_amount_process(message: Message, state: FSMContext):
+	"""Обработка ввода нового количества наличных"""
+	logger.info(f"📝 Получен ввод количества наличных: {message.text}, состояние: {await state.get_state()}")
+	try:
+		amount = int(float(message.text.replace(",", ".")))
+		if amount <= 0:
+			await message.answer("❌ Количество должно быть больше нуля. Попробуйте еще раз:")
+			return
+		
+		logger.info(f"✅ Парсинг количества успешен: {amount}")
+		data = await state.get_data()
+		messages_list = data.get("multi_forward_messages", [])
+		logger.debug(f"📋 Найдено сообщений: {len(messages_list)}")
+		
+		# Находим сообщение с наличными и обновляем количество
+		cash_data = None
+		for msg in messages_list:
+			if msg["parsed"].get("type") == "cash":
+				currency = msg["parsed"].get("currency", "RUB")
+				msg["parsed"]["value"] = amount
+				msg["parsed"]["display"] = f"{amount} {currency}"
+				cash_data = msg["parsed"]
+				logger.info(f"✅ Обновлены наличные: {cash_data.get('display')}")
+				break
+		
+		if not cash_data:
+			logger.warning("⚠️ Наличные не найдены в сообщениях")
+			await message.answer("❌ Ошибка: наличные не найдены. Попробуйте еще раз.")
+			return
+		
+		# Обновляем данные в state
+		await state.update_data(multi_forward_messages=messages_list)
+		await state.set_state(ForwardBindStates.waiting_select_card)
+		logger.info(f"✅ Состояние обновлено на: {await state.get_state()}")
+		
+		# Обновляем кнопки в основном сообщении
+		from app.keyboards import multi_forward_select_kb
+		
+		crypto_data = None
+		card_data = None
+		
+		for msg in messages_list:
+			parsed_msg = msg["parsed"]
+			msg_type = parsed_msg.get("type")
+			
+			if msg_type == "crypto" and not crypto_data:
+				crypto_data = parsed_msg
+			elif msg_type == "card" and not card_data:
+				card_data = parsed_msg
+		
+		# Обновляем сообщение с кнопками
+		buttons_message_id = data.get("multi_forward_buttons_msg_id")
+		if buttons_message_id:
+			try:
+				await message.bot.edit_message_text(
+					chat_id=message.chat.id,
+					message_id=buttons_message_id,
+					text="Выберите тип данных:",
+					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+				)
+			except Exception as e:
+				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+		
+		# Возвращаемся к основному меню с тремя кнопками
+		await message.answer(
+			"✅ Количество обновлено\n\nВыберите тип данных:",
+			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+		)
+		
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число, например: 5020")
+	except Exception as e:
+		logger.exception(f"Ошибка обработки количества наличных: {e}")
+		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
+
+
 # Handle any message and process forwarding logic for admins
+# Важно: этот обработчик должен быть ПОСЛЕ обработчика editing_crypto_amount
+# чтобы не перехватывать сообщения в состоянии редактирования
 @admin_router.message()
 async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMContext):
 	db = get_db()
@@ -663,9 +932,220 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	admin_usernames = get_admin_usernames()
 	if not message.from_user or not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
+	
+	# Проверяем, есть ли активное состояние сбора множественных пересылок
+	current_state = await state.get_state()
+	logger.debug(f"📨 handle_forwarded_from_admin: состояние={current_state}, текст={message.text[:50] if message.text else 'None'}")
+	
+	data = await state.get_data()
+	multi_forward_ready = data.get("multi_forward_ready", False)
+	
+	# Если мы в состоянии сбора или в состоянии ожидания выбора, но еще собираем сообщения
+	if current_state == ForwardBindStates.collecting_multi_forward or (current_state == ForwardBindStates.waiting_select_card and multi_forward_ready):
+		# Собираем множественные пересылки
+		messages_list = data.get("multi_forward_messages", [])
+		buttons_message_id = data.get("multi_forward_buttons_msg_id")  # ID сообщения с кнопками
+		session_key = data.get("multi_forward_session_key")  # Уникальный ключ сеанса
+		
+		text = message.text or message.caption or ""
+		parsed = parse_forwarded_message(text)
+		logger.debug(f"📝 Парсинг сообщения: text='{text[:100]}', parsed={parsed}")
+		
+		# Создаем уникальный ключ сеанса на основе первого сообщения, если его еще нет
+		if not session_key and messages_list:
+			first_msg_id = messages_list[0].get("message_id")
+			session_key = f"multi_{message.from_user.id}_{first_msg_id}"
+		elif not session_key:
+			# Если это первое сообщение в сеансе, создаем ключ
+			session_key = f"multi_{message.from_user.id}_{message.message_id}"
+		
+		# Получаем блокировку для этого сеанса
+		lock_key = (message.from_user.id, session_key)
+		async with _locks_lock:
+			if lock_key not in _multi_forward_locks:
+				_multi_forward_locks[lock_key] = asyncio.Lock()
+			lock = _multi_forward_locks[lock_key]
+		
+		# Используем блокировку для синхронизации обработки
+		async with lock:
+			# Перечитываем состояние внутри блокировки
+			data = await state.get_data()
+			messages_list = data.get("multi_forward_messages", [])
+			buttons_message_id = data.get("multi_forward_buttons_msg_id")
+			
+			# Добавляем новое сообщение
+			messages_list.append({
+				"text": text,
+				"parsed": parsed,
+				"message_id": message.message_id
+			})
+			
+			await state.update_data(
+				multi_forward_messages=messages_list,
+				multi_forward_session_key=session_key
+			)
+			
+			# Объединяем имена пользователей с картами
+			user_name = None
+			for msg in messages_list:
+				if msg["parsed"].get("type") == "user_name":
+					user_name = msg["parsed"].get("user_name")
+					break
+			
+			# Если нашли имя, добавляем его к картам
+			if user_name:
+				for msg in messages_list:
+					if msg["parsed"].get("type") == "card" and not msg["parsed"].get("user_name"):
+						# Сохраняем исходные данные
+						original_card_name = msg["parsed"].get("card_name")
+						original_display = msg["parsed"].get("display", "")
+						
+						# Добавляем имя пользователя
+						msg["parsed"]["user_name"] = user_name
+						
+						# Формируем display: всегда используем card_name, если он есть
+						card_name = msg["parsed"].get("card_name")
+						if card_name and card_name.strip():
+							# card_name есть - используем его
+							msg["parsed"]["display"] = f"{card_name} ({user_name})"
+						elif original_display and original_display.strip() and " (" not in original_display and " - " not in original_display:
+							# card_name нет, но есть display без имени - используем display как card_name
+							msg["parsed"]["display"] = f"{original_display} ({user_name})"
+							# Также обновляем card_name, если он был пустым
+							if not card_name:
+								msg["parsed"]["card_name"] = original_display
+						else:
+							# Ничего не нашли - используем только имя
+							msg["parsed"]["display"] = f"- {user_name}"
+						
+						logger.info(f"🔗 Объединено имя с картой: original_card_name={original_card_name}, card_name={msg['parsed'].get('card_name')}, user_name={user_name}, original_display={original_display}, final_display={msg['parsed'].get('display')}")
+			
+			# Извлекаем данные из всех сообщений ПОСЛЕ объединения имени с картой
+			# Это важно, чтобы card_data содержал обновленный display
+			crypto_data = None
+			cash_data = None
+			card_data = None
+			
+			for msg in messages_list:
+				parsed_msg = msg["parsed"]
+				msg_type = parsed_msg.get("type")
+				
+				if msg_type == "crypto" and not crypto_data:
+					crypto_data = parsed_msg
+				elif msg_type == "cash" and not cash_data:
+					cash_data = parsed_msg
+				elif msg_type == "card" and not card_data:
+					# Используем обновленный parsed_msg (после объединения имени)
+					card_data = parsed_msg.copy()  # Делаем копию, чтобы не изменять оригинал
+					logger.debug(f"📋 Извлечена карта: card_name={card_data.get('card_name')}, user_name={card_data.get('user_name')}, display={card_data.get('display')}")
+			
+			# Показываем три кнопки только после второго сообщения
+			# Если это второе сообщение или больше, показываем/обновляем кнопки
+			if len(messages_list) >= 2:
+				from app.keyboards import multi_forward_select_kb
+				
+				# Перечитываем buttons_message_id внутри блокировки (может быть обновлен другим обработчиком)
+				current_data = await state.get_data()
+				buttons_message_id = current_data.get("multi_forward_buttons_msg_id")
+				
+				# Проверяем, есть ли уже сообщение с кнопками (внутри блокировки)
+				# Если есть - редактируем, если нет - создаем
+				if buttons_message_id:
+					try:
+						await bot.edit_message_text(
+							chat_id=message.chat.id,
+							message_id=buttons_message_id,
+							text="📋 Проверка данных:",
+							reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+						)
+						# Сообщение успешно отредактировано
+						await state.set_state(ForwardBindStates.collecting_multi_forward)
+						await state.update_data(
+							multi_forward_ready=True,
+							multi_forward_buttons_msg_id=buttons_message_id,
+							multi_forward_messages=messages_list,
+							multi_forward_session_key=session_key
+						)
+						return
+					except Exception as e:
+						# Не удалось отредактировать - возможно сообщение было удалено
+						logger.warning(f"Не удалось отредактировать сообщение с кнопками (ID: {buttons_message_id}): {e}")
+						# Пытаемся удалить старое сообщение
+						try:
+							await bot.delete_message(chat_id=message.chat.id, message_id=buttons_message_id)
+						except:
+							pass
+						# Сбрасываем buttons_message_id, чтобы создать новое
+						buttons_message_id = None
+				
+				# Создаем новое сообщение с кнопками только если его нет
+				# Еще раз проверяем состояние перед созданием (на случай, если другой обработчик уже создал)
+				if not buttons_message_id:
+					final_check = await state.get_data()
+					final_buttons_id = final_check.get("multi_forward_buttons_msg_id")
+					
+					if final_buttons_id:
+						# Другой обработчик уже создал сообщение - редактируем его
+						try:
+							await bot.edit_message_text(
+								chat_id=message.chat.id,
+								message_id=final_buttons_id,
+								text="📋 Проверка данных:",
+								reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+							)
+							await state.set_state(ForwardBindStates.collecting_multi_forward)
+							await state.update_data(
+								multi_forward_ready=True,
+								multi_forward_buttons_msg_id=final_buttons_id,
+								multi_forward_messages=messages_list,
+								multi_forward_session_key=session_key
+							)
+							return
+						except Exception as e:
+							logger.warning(f"Не удалось отредактировать сообщение после финальной проверки: {e}")
+					
+					# Создаем новое сообщение
+					first_message_id = messages_list[0].get("message_id") if messages_list else None
+					
+					sent_message = await message.answer(
+						"📋 Проверка данных:",
+						reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data),
+						reply_to_message_id=first_message_id if first_message_id else None
+					)
+					
+					await state.set_state(ForwardBindStates.collecting_multi_forward)
+					await state.update_data(
+						multi_forward_ready=True,
+						multi_forward_buttons_msg_id=sent_message.message_id,
+						multi_forward_messages=messages_list,
+						multi_forward_session_key=session_key
+					)
+		return
+	
 	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
 	text = message.text or message.caption or ""
 	logger.info(f"📨 Пересылка от админа {message.from_user.id}: tg_id={orig_tg_id}, username={orig_username}, full_name={orig_full_name}, text={text[:50] if text else 'нет'}")
+	
+	# Проверяем, является ли это множественной пересылкой (несколько сообщений подряд)
+	# Если сообщение короткое и похоже на один из типов, начинаем сбор
+	parsed = parse_forwarded_message(text)
+	if parsed.get("type") in ["crypto", "cash", "card", "user_name"] or re.search(r'[🏦💳🆘]', text):
+		# Это может быть множественная пересылка - начинаем сбор
+		logger.info(f"🔍 Обнаружена возможная множественная пересылка: {parsed}")
+		# Создаем уникальный ключ сеанса для этого множественного пересылки
+		session_key = f"multi_{message.from_user.id}_{message.message_id}"
+		
+		await state.set_state(ForwardBindStates.collecting_multi_forward)
+		await state.update_data(
+			multi_forward_messages=[{
+				"text": text,
+				"parsed": parsed,
+				"message_id": message.message_id
+			}],
+			multi_forward_session_key=session_key
+		)
+		# Ждем следующее сообщение
+		return
 	
 	# Если ID недоступен, но есть username, пытаемся найти пользователя в БД по username
 	if orig_tg_id is None and orig_username:
@@ -846,25 +1326,619 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
 				warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nВыберите карту для привязки:"
 				await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
-				return
-		# fallback by text when no origin available
-		if text:
-			card = await db.find_card_by_text(text)
-			logger.debug(f"Pattern search result: {bool(card)}")
-			if card:
-				user_msg = await db.get_card_user_message(card[0])
-				if user_msg:
-					await message.answer(user_msg, parse_mode="HTML")
-				else:
-					await message.answer("Сообщение карты отсутствует")
-				return
-		# as last resort: show cards to reply-only
+		return
+	# fallback by text when no origin available
+	if text:
+		card = await db.find_card_by_text(text)
+		logger.debug(f"Pattern search result: {bool(card)}")
+		if card:
+			user_msg = await db.get_card_user_message(card[0])
+			if user_msg:
+				await message.answer(user_msg, parse_mode="HTML")
+			else:
+				await message.answer("Сообщение карты отсутствует")
+			return
+	# as last resort: show cards to reply-only
+	rows = await db.list_cards()
+	cards = [(r[0], r[1]) for r in rows]
+	await state.set_state(ForwardBindStates.waiting_select_card)
+	await state.update_data(reply_only=True)
+	warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите карту для ответа администратору:"
+	await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+
+
+@admin_router.callback_query(
+	F.data.startswith("multi:select:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора из множественных пересылок"""
+	db = get_db()
+	# Формат: multi:select:{type} - type может быть crypto, cash, card
+	parts = cb.data.split(":")
+	selected_type = parts[2]  # crypto, cash или card
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	current_state = await state.get_state()
+	logger.info(f"🔘 Нажата кнопка multi:select:{selected_type}, состояние: {current_state}, сообщений: {len(messages_list)}")
+	
+	# Извлекаем данные из всех сообщений
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	logger.debug(f"📊 Извлечено: crypto={bool(crypto_data)}, cash={bool(cash_data)}, card={bool(card_data)}")
+	
+	# Обрабатываем выбор в зависимости от типа
+	if selected_type == "crypto":
+		if not crypto_data:
+			logger.warning("⚠️ Криптовалюта не найдена в сообщениях")
+			await cb.answer("Криптовалюта не указана", show_alert=True)
+			return
+		
+		# Показываем клавиатуру для редактирования криптовалюты
+		from app.keyboards import crypto_edit_kb
+		
+		current_currency = crypto_data.get("currency", "BTC")
+		amount = crypto_data.get("value", 0.0)
+		display = crypto_data.get("display", "Криптовалюта")
+		
+		logger.info(f"📝 Открываем редактирование криптовалюты: {display}, currency={current_currency}, amount={amount}")
+		
+		try:
+			await cb.message.edit_text(
+				f"📝 Редактирование: {display}\n\nВыберите тип монеты или измените количество:",
+				reply_markup=crypto_edit_kb(current_currency, amount)
+			)
+			await cb.answer()
+		except Exception as e:
+			logger.exception(f"❌ Ошибка при редактировании сообщения: {e}")
+			await cb.answer("Ошибка при открытии редактирования", show_alert=True)
+		return
+	
+	elif selected_type == "cash":
+		if not cash_data:
+			await cb.answer("Наличные не указаны", show_alert=True)
+			return
+		
+		# Показываем клавиатуру для редактирования наличных
+		from app.keyboards import cash_edit_kb
+		
+		current_currency = cash_data.get("currency", "RUB")
+		amount = cash_data.get("value", 0)
+		display = cash_data.get("display", "Наличные")
+		
+		logger.info(f"📝 Открываем редактирование наличных: {display}, currency={current_currency}, amount={amount}")
+		
+		try:
+			await cb.message.edit_text(
+				f"📝 Редактирование: {display}\n\nВыберите валюту или измените количество:",
+				reply_markup=cash_edit_kb(current_currency, amount)
+			)
+			await cb.answer()
+		except Exception as e:
+			logger.exception(f"❌ Ошибка при редактировании сообщения: {e}")
+			await cb.answer("Ошибка при открытии редактирования", show_alert=True)
+		return
+	
+	elif selected_type == "card":
+		# Показываем список карт для выбора
 		rows = await db.list_cards()
 		cards = [(r[0], r[1]) for r in rows]
-		await state.set_state(ForwardBindStates.waiting_select_card)
-		await state.update_data(reply_only=True)
-		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите карту для ответа администратору:"
-		await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+		logger.debug(f"Показываем список карт для выбора: count={len(cards)}")
+		
+		if not cards:
+			await cb.answer("Список карт пуст", show_alert=True)
+			return
+		
+		text = "Выберите карту:"
+		# Создаем клавиатуру с кнопками для выбора карты
+		from aiogram.utils.keyboard import InlineKeyboardBuilder
+		
+		kb = InlineKeyboardBuilder()
+		for card_id, card_name in cards:
+			kb.button(text=card_name, callback_data=f"multi:select_card:{card_id}")
+		kb.button(text="⬅️ Назад", callback_data="multi:back_to_main")
+		kb.adjust(1)
+		
+		await cb.message.edit_text(text, reply_markup=kb.as_markup())
+		await cb.answer()
+		return
+	
+	else:
+		await cb.answer("Неизвестный тип", show_alert=True)
+		return
+
+
+@admin_router.callback_query(
+	F.data == "multi:confirm",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def multi_forward_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик подтверждения множественных пересылок - обрабатывает все три типа данных"""
+	logger.info(f"🔘 Нажата кнопка Подтвердить, состояние: {await state.get_state()}")
+	db = get_db()
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	logger.debug(f"📋 Найдено сообщений: {len(messages_list)}")
+	
+	# Извлекаем данные из всех сообщений
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	if not crypto_data and not cash_data and not card_data:
+		await cb.answer("Нет данных для обработки", show_alert=True)
+		return
+	
+	# Если есть карта, обрабатываем её отдельно (отправляем сообщение пользователю)
+	if card_data:
+		card_name = card_data.get("card_name")
+		user_name = card_data.get("user_name")
+		
+		if card_name:
+			# Ищем карту в БД
+			rows = await db.list_cards()
+			card = None
+			for row in rows:
+				if card_name.upper() in row[1].upper() or row[1].upper() in card_name.upper():
+					card = await db.get_card_by_id(row[0])
+					break
+			
+			if card:
+				# Если есть имя пользователя, пытаемся найти его
+				orig_tg_id = None
+				if user_name:
+					user_by_name = await db.get_user_by_full_name(user_name)
+					if user_by_name:
+						orig_tg_id = user_by_name.get("tg_id")
+				
+				user_msg = card.get("user_message")
+				
+				# Если нашли пользователя, логируем и отправляем сообщение
+				if orig_tg_id:
+					await db.log_card_delivery_by_tg(
+						orig_tg_id,
+						card["card_id"],
+						admin_id=cb.from_user.id if cb.from_user else None,
+					)
+					if user_msg:
+						try:
+							await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
+							logger.info(f"Отправлено сообщение карты пользователю {orig_tg_id}")
+						except Exception as e:
+							logger.exception(f"Ошибка отправки сообщения пользователю {orig_tg_id}: {e}")
+	
+	# Записываем данные в Google Sheet
+	from app.config import get_settings
+	from app.google_sheets import write_to_google_sheet
+	
+	settings = get_settings()
+	result_parts = []
+	
+	if settings.google_sheet_id and settings.google_credentials_path:
+		try:
+			result = await write_to_google_sheet(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				crypto_data,
+				cash_data,
+				card_data
+			)
+			
+			if result.get("success"):
+				# Формируем сообщение в нужном формате
+				result_parts.append("✅ Обработано:")
+				result_parts.append("")  # Пустая строка
+
+				
+				# USD сумма (если есть)
+				usd_amount = result.get("usd_amount")
+				if usd_amount is not None:
+					result_parts.append(f"💵 {usd_amount} USD")
+				
+				# RUB сумма (если есть)
+				if cash_data and cash_data.get("currency") == "RUB":
+					rub_amount = cash_data.get("value", 0)
+					result_parts.append(f"💵 {rub_amount} RUB")
+				
+				# Карта (если есть)
+				if card_data:
+					card_display = card_data.get("display", "Карта")
+					result_parts.append(f"💳 {card_display}")
+			else:
+				result_parts.append("✅ Обработано:")
+				result_parts.append("")
+				result_parts.append("⚠️ Ошибка записи в Google Sheet")
+		except Exception as e:
+			logger.exception(f"Ошибка при записи в Google Sheet: {e}")
+			result_parts.append("✅ Обработано:")
+			result_parts.append("")
+			result_parts.append("⚠️ Ошибка записи в Google Sheet")
+	else:
+		logger.warning("Google Sheets не настроен (отсутствует GOOGLE_SHEET_ID или GOOGLE_CREDENTIALS_PATH)")
+		result_parts.append("✅ Обработано:")
+		result_parts.append("")
+		result_parts.append("⚠️ Google Sheets не настроен")
+	
+	result_text = "\n".join(result_parts)
+	await cb.message.edit_text(result_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
+	await state.clear()
+	await cb.answer("✅ Обработано")
+
+
+@admin_router.callback_query(
+	F.data.startswith("crypto:change_type:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def crypto_change_type(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик изменения типа криптовалюты"""
+	# Формат: crypto:change_type:{currency}
+	parts = cb.data.split(":")
+	new_currency = parts[2]  # BTC, LTC или XMR
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Находим сообщение с криптовалютой и обновляем тип
+	for msg in messages_list:
+		if msg["parsed"].get("type") == "crypto":
+			msg["parsed"]["currency"] = new_currency
+			amount = msg["parsed"].get("value", 0.0)
+			msg["parsed"]["display"] = f"{amount} {new_currency}"
+			break
+	
+	# Обновляем данные в state
+	await state.update_data(multi_forward_messages=messages_list)
+	
+	# Обновляем кнопки в основном сообщении
+	from app.keyboards import multi_forward_select_kb
+	
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	# Обновляем сообщение с кнопками
+	buttons_message_id = data.get("multi_forward_buttons_msg_id")
+	if buttons_message_id:
+		try:
+			await cb.bot.edit_message_text(
+				chat_id=cb.message.chat.id,
+				message_id=buttons_message_id,
+				text="Выберите тип данных:",
+				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+	
+	# Возвращаемся к основному меню с тремя кнопками
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer(f"✅ Изменено на {new_currency}")
+
+
+@admin_router.callback_query(
+	F.data == "crypto:change_amount",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def crypto_change_amount_start(cb: CallbackQuery, state: FSMContext):
+	"""Начало редактирования количества криптовалюты"""
+	logger.info(f"🔘 Нажата кнопка изменения количества, текущее состояние: {await state.get_state()}")
+	await state.set_state(ForwardBindStates.editing_crypto_amount)
+	logger.info(f"✅ Состояние установлено на: {await state.get_state()}")
+	await cb.message.edit_text(
+		"📝 Введите новое количество криптовалюты:\n\nНапример: 0.000499",
+		reply_markup=None
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data == "crypto:back",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def crypto_edit_back(cb: CallbackQuery, state: FSMContext):
+	"""Возврат к основному меню множественных пересылок"""
+	from app.keyboards import multi_forward_select_kb
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Извлекаем данные из всех сообщений
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data.startswith("cash:change_currency:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def cash_change_currency(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик изменения валюты наличных"""
+	# Формат: cash:change_currency:{currency}
+	parts = cb.data.split(":")
+	new_currency = parts[2]  # BYN или RUB
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Находим сообщение с наличными и обновляем валюту
+	for msg in messages_list:
+		if msg["parsed"].get("type") == "cash":
+			msg["parsed"]["currency"] = new_currency
+			amount = msg["parsed"].get("value", 0)
+			msg["parsed"]["display"] = f"{amount} {new_currency}"
+			break
+	
+	# Обновляем данные в state
+	await state.update_data(multi_forward_messages=messages_list)
+	
+	# Обновляем кнопки в основном сообщении
+	from app.keyboards import multi_forward_select_kb
+	
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	# Обновляем сообщение с кнопками
+	buttons_message_id = data.get("multi_forward_buttons_msg_id")
+	if buttons_message_id:
+		try:
+			await cb.bot.edit_message_text(
+				chat_id=cb.message.chat.id,
+				message_id=buttons_message_id,
+				text="Выберите тип данных:",
+				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+	
+	# Возвращаемся к основному меню с тремя кнопками
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer(f"✅ Изменено на {new_currency}")
+
+
+@admin_router.callback_query(
+	F.data == "cash:change_amount",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def cash_change_amount_start(cb: CallbackQuery, state: FSMContext):
+	"""Начало редактирования количества наличных"""
+	logger.info(f"🔘 Нажата кнопка изменения количества наличных, текущее состояние: {await state.get_state()}")
+	await state.set_state(ForwardBindStates.editing_cash_amount)
+	logger.info(f"✅ Состояние установлено на: {await state.get_state()}")
+	await cb.message.edit_text(
+		"📝 Введите новое количество наличных:\n\nНапример: 5020",
+		reply_markup=None
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data == "cash:back",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def cash_edit_back(cb: CallbackQuery, state: FSMContext):
+	"""Возврат к основному меню множественных пересылок"""
+	from app.keyboards import multi_forward_select_kb
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Извлекаем данные из всех сообщений
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data.startswith("multi:select_card:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def multi_select_card(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора карты в множественных пересылках"""
+	db = get_db()
+	# Формат: multi:select_card:{card_id}
+	card_id = int(cb.data.split(":")[-1])
+	
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	card_name = card["name"]
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Находим сообщение с картой и обновляем его
+	card_data = None
+	for msg in messages_list:
+		if msg["parsed"].get("type") == "card":
+			# Обновляем данные карты
+			user_name = msg["parsed"].get("user_name")  # Сохраняем имя пользователя, если было
+			msg["parsed"]["card_name"] = card_name
+			msg["parsed"]["display"] = f"{card_name} ({user_name})" if user_name else card_name
+			card_data = msg["parsed"]
+			break
+	
+	# Если карта не найдена в сообщениях, создаем новую запись
+	if not card_data:
+		# Ищем имя пользователя в других сообщениях
+		user_name = None
+		for msg in messages_list:
+			if msg["parsed"].get("type") == "user_name":
+				user_name = msg["parsed"].get("user_name")
+				break
+		
+		card_data = {
+			"type": "card",
+			"card_name": card_name,
+			"user_name": user_name,
+			"display": f"{card_name} ({user_name})" if user_name else card_name
+		}
+		# Добавляем в список сообщений
+		messages_list.append({
+			"message_id": cb.message.message_id,
+			"parsed": card_data
+		})
+	
+	# Обновляем данные в state
+	await state.update_data(multi_forward_messages=messages_list)
+	
+	# Обновляем кнопки в основном сообщении
+	from app.keyboards import multi_forward_select_kb
+	
+	crypto_data = None
+	cash_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+	
+	# Обновляем сообщение с кнопками
+	buttons_message_id = data.get("multi_forward_buttons_msg_id")
+	if buttons_message_id:
+		try:
+			await cb.bot.edit_message_text(
+				chat_id=cb.message.chat.id,
+				message_id=buttons_message_id,
+				text="Выберите тип данных:",
+				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+	
+	# Возвращаемся к основному меню с тремя кнопками
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer(f"✅ Выбрана карта: {card_name}")
+
+
+@admin_router.callback_query(
+	F.data == "multi:back_to_main",
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def multi_back_to_main(cb: CallbackQuery, state: FSMContext):
+	"""Возврат к основному меню множественных пересылок"""
+	from app.keyboards import multi_forward_select_kb
+	
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Извлекаем данные из всех сообщений
+	crypto_data = None
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "crypto" and not crypto_data:
+			crypto_data = parsed_msg
+		elif msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	await cb.message.edit_text(
+		"Выберите тип данных:",
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+	)
+	await cb.answer()
 
 
 @admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("select:card:"))
@@ -1079,16 +2153,16 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 	# Логируем доставку
 	if user_tg_id:
 		await db.log_card_delivery_by_tg(
-			user_tg_id,
-			card_id,
-			admin_id=cb.from_user.id if cb.from_user else None,
-		)
-		if user_msg:
-			try:
-				await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
-				logger.info(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
-			except Exception as e:
-				logger.exception(f"Failed to send user_message for existing card: {e}")
+		user_tg_id,
+		card_id,
+		admin_id=cb.from_user.id if cb.from_user else None,
+	)
+	if user_msg:
+		try:
+			await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
+			logger.info(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
+		except Exception as e:
+			logger.exception(f"Failed to send user_message for existing card: {e}")
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(

@@ -11,6 +11,8 @@ class Settings(BaseModel):
 	admin_ids: List[int]
 	admin_usernames: List[str] = []
 	database_path: str = "./data/bot.db"
+	google_sheet_id: str = ""
+	google_credentials_path: str = ""
 
 	@field_validator("admin_ids", mode="before")
 	@classmethod
@@ -53,4 +55,6 @@ def get_settings() -> Settings:
 		admin_ids=os.getenv("ADMIN_IDS", ""),
 		admin_usernames=os.getenv("ADMIN_USERNAMES", ""),
 		database_path=os.getenv("DATABASE_PATH", "./data/bot.db"),
+		google_sheet_id=os.getenv("GOOGLE_SHEET_ID", ""),
+		google_credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", ""),
 	)
