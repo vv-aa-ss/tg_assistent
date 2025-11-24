@@ -139,11 +139,12 @@ def similar_users_select_kb(similar_users: List[Dict], hidden_name: str, back_to
 	return kb.as_markup()
 
 
-def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, card_data: Dict | None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
+def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, card_data: Dict | None, selected_xmr: int | None = None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру с тремя кнопками для множественных пересылок.
 	Всегда показывает три кнопки: криптовалюта, наличные, карта.
-	Первые три кнопки в ряд, под ними кнопка "Подтвердить".
+	Если криптовалюта XMR, показывает кнопки XMR-1, XMR-2, XMR-3 под первой строкой.
+	Первые три кнопки в ряд, затем кнопки XMR (если есть), затем "Подтвердить" и "Назад".
 	"""
 	kb = InlineKeyboardBuilder()
 	
@@ -168,14 +169,48 @@ def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, ca
 	else:
 		kb.button(text="💳 Не указано", callback_data="multi:select:card")
 	
+	# Если криптовалюта XMR, добавляем кнопки XMR-1, XMR-2, XMR-3
+	if crypto_data and crypto_data.get("currency") == "XMR":
+		# Кнопки XMR с галочкой на выбранной
+		for xmr_num in [1, 2, 3]:
+			if selected_xmr == xmr_num:
+				kb.button(text=f"✅ XMR-{xmr_num}", callback_data=f"multi:select:xmr:{xmr_num}")
+			else:
+				kb.button(text=f"XMR-{xmr_num}", callback_data=f"multi:select:xmr:{xmr_num}")
+	
 	# Кнопка "Подтвердить"
 	kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
 	
 	# Кнопка "Назад"
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
-	# Первые три кнопки в ряд, затем "Подтвердить" и "Назад" по одной
-	kb.adjust(3, 1, 1)
+	# Первые три кнопки в ряд
+	# Если есть XMR, то три кнопки XMR в ряд
+	# Затем "Подтвердить" и "Назад" по одной
+	if crypto_data and crypto_data.get("currency") == "XMR":
+		kb.adjust(3, 3, 1, 1)  # 3 кнопки, 3 кнопки XMR, Подтвердить, Назад
+	else:
+		kb.adjust(3, 1, 1)  # 3 кнопки, Подтвердить, Назад
+	return kb.as_markup()
+
+
+def xmr_select_kb(back_to: str = "multi:back_to_main") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора XMR-1, XMR-2, XMR-3.
+	Три кнопки в ряд, под ними кнопка "Назад".
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Три кнопки XMR в ряд
+	kb.button(text="XMR-1", callback_data="multi:select:xmr:1")
+	kb.button(text="XMR-2", callback_data="multi:select:xmr:2")
+	kb.button(text="XMR-3", callback_data="multi:select:xmr:3")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	# Три кнопки в ряд, затем "Назад"
+	kb.adjust(3, 1)
 	return kb.as_markup()
 
 
