@@ -46,10 +46,19 @@ class AdminOnlyMiddleware(BaseMiddleware):
 		admin_ids = get_admin_ids()
 		admin_usernames = get_admin_usernames()
 		from_user = getattr(event, "from_user", None)
+		
+		# Логируем ВСЕ сообщения, которые проходят через middleware
+		if isinstance(event, Message):
+			text = event.text or event.caption or ""
+			is_forward = bool(getattr(event, "forward_origin", None) or getattr(event, "forward_from", None))
+			logger.info(f"🔵 MIDDLEWARE: message_id={event.message_id}, is_forward={is_forward}, text='{text[:100]}', from_user={from_user.id if from_user else None}")
+		
 		if from_user:
 			user_id = getattr(from_user, "id", None)
 			username = getattr(from_user, "username", None)
 			if not is_admin(user_id, username, admin_ids, admin_usernames):
+				if isinstance(event, Message):
+					logger.info(f"🔵 MIDDLEWARE: Сообщение {event.message_id} от не-админа, блокируем")
 				return
 		return await handler(event, data)
 
@@ -152,6 +161,8 @@ def parse_forwarded_message(text: str) -> dict:
 	"""
 	Парсит пересланное сообщение и определяет его тип.
 	Возвращает dict с полями: type, value, currency, card_name, user_name, display
+	
+	Обрабатывает многострочные сообщения и различные форматы форматирования.
 	"""
 	logger.debug(f"🔍 parse_forwarded_message: входной текст='{text}'")
 	
@@ -159,12 +170,69 @@ def parse_forwarded_message(text: str) -> dict:
 		logger.debug(f"❌ parse_forwarded_message: текст пустой")
 		return {"type": "unknown"}
 	
-	text = text.strip()
-	logger.debug(f"🔍 parse_forwarded_message: после strip='{text}'")
+	# Нормализуем текст: заменяем множественные пробелы и переносы строк на одинарные пробелы
+	# Это позволяет надежно парсить многострочные сообщения
+	normalized_text = re.sub(r'\s+', ' ', text.strip())
+	logger.debug(f"🔍 parse_forwarded_message: после нормализации='{normalized_text}'")
 	
-	# Проверяем на криптовалюту (число с точкой)
-	crypto_match = re.match(r'^(\d+\.\d+)$', text)
-	logger.debug(f"🔍 parse_forwarded_message: crypto_match={bool(crypto_match)}, паттерн='^(\d+\.\d+)$'")
+	# ПРИОРИТЕТ 1: Проверяем на карту (если есть ключевые слова карты)
+	# Это должно быть первым, так как сообщения с картами могут содержать числа и другие данные
+	card_name = None
+	text_upper = normalized_text.upper()
+	
+	# Проверяем на ключевые слова карт (более надежная проверка)
+	if "ТИНЕК" in text_upper or "ТИНЬКОФ" in text_upper or "ТИНЬКОФФ" in text_upper:
+		card_name = "ТИНЕК"
+	elif "СБЕР" in text_upper or "СБЕРБАНК" in text_upper:
+		card_name = "СБЕР"
+	
+	# ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Если в тексте есть 4 числа подряд (номер карты) И имя в скобках,
+	# то это скорее всего карта, даже если нет ключевого слова
+	if not card_name:
+		# Ищем паттерн: 4 числа через пробел (номер карты) + имя в скобках
+		card_number_pattern = r'\d{4}\s+\d{4}\s+\d{4}\s+\d{4}'
+		name_in_brackets = r'\([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?\)'
+		
+		if re.search(card_number_pattern, normalized_text) and re.search(name_in_brackets, normalized_text):
+			# Это похоже на карту с номером и именем, но без названия карты
+			# Пытаемся найти название карты в тексте (заглавные буквы, короткое слово)
+			card_name_match = re.search(r'\b([А-ЯЁA-Z]{2,10})\b', normalized_text)
+			if card_name_match:
+				card_name = card_name_match.group(1)
+			else:
+				# Если название не найдено, используем "КАРТА" как заглушку
+				card_name = "КАРТА"
+	
+	if card_name:
+		# Пытаемся найти имя в скобках (работает даже с переносами строк благодаря нормализации)
+		# Ищем паттерн: (Имя И.)
+		name_match = re.search(r'\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)', normalized_text)
+		user_name = name_match.group(1) if name_match else None
+		
+		# Пытаемся извлечь номер карты (4 числа через пробел)
+		card_number_match = re.search(r'(\d{4}\s+\d{4}\s+\d{4}\s+\d{4})', normalized_text)
+		card_number = card_number_match.group(1) if card_number_match else None
+		
+		# Формируем display: если есть имя - показываем карту и имя, иначе только карту
+		if user_name:
+			display = f"{card_name} ({user_name})"
+		else:
+			display = card_name
+		
+		result = {
+			"type": "card",
+			"card_name": card_name,
+			"user_name": user_name,
+			"card_number": card_number,  # Сохраняем номер карты для возможного использования
+			"display": display
+		}
+		logger.info(f"✅ parse_forwarded_message: определена карта: {result}")
+		return result
+	
+	# ПРИОРИТЕТ 2: Проверяем на криптовалюту (число с точкой)
+	# Ищем число с точкой в начале строки или как отдельное слово
+	crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
+	logger.debug(f"🔍 parse_forwarded_message: crypto_match={bool(crypto_match)}, паттерн='(?:^|\\s)(\\d+\\.\\d+)(?:\\s|$)'")
 	if crypto_match:
 		amount = float(crypto_match.group(1))
 		currency = detect_crypto_type(amount)
@@ -177,61 +245,56 @@ def parse_forwarded_message(text: str) -> dict:
 		logger.info(f"✅ parse_forwarded_message: определена криптовалюта: {result}")
 		return result
 	
-	# Проверяем на наличные (целое число, возможно с текстом "без долга")
-	# Также может быть несколько чисел через пробел (2200 7008 6988 1390) - берем первое
-	cash_match = re.match(r'^(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?$', text, re.IGNORECASE)
-	logger.debug(f"🔍 parse_forwarded_message: cash_match={bool(cash_match)}, паттерн='^(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?$'")
-	if cash_match:
-		amount = int(cash_match.group(1))
-		currency = detect_cash_type(amount)
+	# ПРИОРИТЕТ 3: Проверяем на наличные (целое число)
+	# Ищем первое целое число в тексте (может быть несколько чисел через пробел)
+	# Также проверяем наличие текста "без долга"
+	# ВАЖНО: НЕ определяем как наличные, если это похоже на номер карты (4 числа через пробел)
+	# или если есть имя в скобках (это скорее всего карта)
+	card_number_pattern = r'\d{4}\s+\d{4}\s+\d{4}\s+\d{4}'
+	name_in_brackets = r'\([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?\)'
+	is_likely_card = bool(re.search(card_number_pattern, normalized_text) or re.search(name_in_brackets, normalized_text))
+	
+	if not is_likely_card:
+		cash_match = re.search(r'(?:^|\s)(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?(?:\s|$)', normalized_text, re.IGNORECASE)
+		logger.debug(f"🔍 parse_forwarded_message: cash_match={bool(cash_match)}, паттерн='(?:^|\\s)(\\d+)(?:\\s+\\d+)*(?:\\s+без\\s+долга)?(?:\\s|$)'")
+		if cash_match:
+			amount = int(cash_match.group(1))
+			currency = detect_cash_type(amount)
+			result = {
+				"type": "cash",
+				"value": amount,
+				"currency": currency,
+				"display": f"{amount} {currency}"
+			}
+			logger.info(f"✅ parse_forwarded_message: определены наличные: {result}")
+			return result
+	else:
+		logger.debug(f"🔍 parse_forwarded_message: пропускаем проверку наличных, т.к. это похоже на карту")
+	
+	# ПРИОРИТЕТ 4: Проверяем просто на название карты (только заглавные буквы, короткое слово)
+	if re.match(r'^[А-ЯЁA-Z]{2,10}$', normalized_text):
 		result = {
-			"type": "cash",
-			"value": amount,
-			"currency": currency,
-			"display": f"{amount} {currency}"
+			"type": "card",
+			"card_name": normalized_text,
+			"user_name": None,
+			"display": normalized_text
 		}
-		logger.info(f"✅ parse_forwarded_message: определены наличные: {result}")
+		logger.info(f"✅ parse_forwarded_message: определена карта (только название): {result}")
 		return result
 	
-	# Упрощенная проверка на карту: ищем только "ТИНЕК" или "СБЕР"
-	# Карты у нас только эти две
-	card_name = None
-	if "ТИНЕК" in text.upper() or "ТИНЬКОФ" in text.upper():
-		card_name = "ТИНЕК"
-	elif "СБЕР" in text.upper() or "СБЕРБАНК" in text.upper():
-		card_name = "СБЕР"
-	
-	if card_name:
-		# Пытаемся найти имя в скобках
-		name_match = re.search(r'\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)', text)
-		user_name = name_match.group(1) if name_match else None
-		display = f"{card_name} ({user_name})" if user_name else card_name
-		return {
-			"type": "card",
-			"card_name": card_name,
-			"user_name": user_name,
-			"display": display
-		}
-	
-	# Проверяем просто на название карты (только заглавные буквы, короткое слово)
-	if re.match(r'^[А-ЯЁA-Z]{2,10}$', text.strip()):
-		return {
-			"type": "card",
-			"card_name": text.strip(),
-			"user_name": None,
-			"display": text.strip()
-		}
-	
-	# Проверяем на имя пользователя в скобках (Артем В.)
-	name_match = re.match(r'^\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)$', text.strip())
+	# ПРИОРИТЕТ 5: Проверяем на имя пользователя в скобках (Артем В.)
+	name_match = re.match(r'^\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)$', normalized_text)
 	if name_match:
-		return {
+		result = {
 			"type": "user_name",
 			"user_name": name_match.group(1),
 			"display": name_match.group(1)
 		}
+		logger.info(f"✅ parse_forwarded_message: определено имя пользователя: {result}")
+		return result
 	
-	return {"type": "unknown", "text": text}
+	logger.warning(f"⚠️ parse_forwarded_message: не удалось определить тип сообщения, текст='{normalized_text}'")
+	return {"type": "unknown", "text": normalized_text}
 
 
 def render_bar(value: int, max_value: int, width: int = 10) -> str:
@@ -316,7 +379,7 @@ async def format_multi_forward_message_text(crypto_data: Dict[str, Any] | None) 
 		crypto_data: Данные о криптовалюте (currency, value)
 	
 	Returns:
-		Текст сообщения с суммой в USD, если есть BTC или LTC
+		Текст сообщения с суммой в USD, если есть BTC, LTC или XMR
 	"""
 	text = "📋 Проверка данных:"
 	
@@ -339,7 +402,13 @@ async def format_multi_forward_message_text(crypto_data: Dict[str, Any] | None) 
 				usd_amount = crypto_amount * price
 				usd_amount_rounded = int(round(usd_amount))
 				text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
-				
+		elif crypto_currency == "XMR":
+			from app.google_sheets import get_xmr_price_usd
+			price = await get_xmr_price_usd()
+			if price:
+				usd_amount = crypto_amount * price
+				usd_amount_rounded = int(round(usd_amount))
+				text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
 	
 	return text
 
@@ -876,18 +945,20 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 		buttons_message_id = data.get("multi_forward_buttons_msg_id")
 		if buttons_message_id:
 			try:
+				message_text = await format_multi_forward_message_text(crypto_data)
 				await message.bot.edit_message_text(
 					chat_id=message.chat.id,
 					message_id=buttons_message_id,
-					text="Выберите тип данных:",
+					text=message_text,
 					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 				)
 			except Exception as e:
 				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 		
 		# Возвращаемся к основному меню с тремя кнопками
+		message_text = await format_multi_forward_message_text(crypto_data)
 		await message.answer(
-			"✅ Количество обновлено\n\nВыберите тип данных:",
+			f"✅ Количество обновлено\n\n{message_text}",
 			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 		)
 		
@@ -960,18 +1031,20 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 		buttons_message_id = data.get("multi_forward_buttons_msg_id")
 		if buttons_message_id:
 			try:
+				message_text = await format_multi_forward_message_text(crypto_data)
 				await message.bot.edit_message_text(
 					chat_id=message.chat.id,
 					message_id=buttons_message_id,
-					text="Выберите тип данных:",
+					text=message_text,
 					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 				)
 			except Exception as e:
 				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 		
 		# Возвращаемся к основному меню с тремя кнопками
+		message_text = await format_multi_forward_message_text(crypto_data)
 		await message.answer(
-			"✅ Количество обновлено\n\nВыберите тип данных:",
+			f"✅ Количество обновлено\n\n{message_text}",
 			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 		)
 		
@@ -991,18 +1064,33 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	text = message.text or message.caption or ""
 	is_forward = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from", None))
 	current_state_before_check = await state.get_state()
+	
+	# ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ для отладки третьего сообщения
 	logger.info(f"🔔🔔🔔 ВХОДЯЩЕЕ СООБЩЕНИЕ (ДО ПРОВЕРКИ): message_id={message.message_id}, is_forward={is_forward}, text='{text[:200]}', from_user={message.from_user.id if message.from_user else None}, state={current_state_before_check}")
+	logger.info(f"📋 ДЕТАЛИ СООБЩЕНИЯ: message_id={message.message_id}, chat_id={message.chat.id if message.chat else None}, date={message.date if hasattr(message, 'date') else None}")
+	logger.info(f"📋 ПОЛНЫЙ ТЕКСТ: '{text}'")
+	logger.info(f"📋 СОСТОЯНИЕ FSM: {current_state_before_check}")
 	
-	# ВАЖНО: Если это пересылка и мы в состоянии collecting_multi_forward, обрабатываем сразу
-	if is_forward and current_state_before_check == ForwardBindStates.collecting_multi_forward:
-		logger.info(f"🚨🚨🚨 ТРЕТЬЕ СООБЩЕНИЕ ОБНАРУЖЕНО! message_id={message.message_id}, text='{text[:200]}'")
+	# Получаем данные состояния для отладки
+	try:
+		state_data = await state.get_data()
+		logger.info(f"📋 ДАННЫЕ СОСТОЯНИЯ: multi_forward_messages={len(state_data.get('multi_forward_messages', []))}, multi_forward_ready={state_data.get('multi_forward_ready', False)}, buttons_msg_id={state_data.get('multi_forward_buttons_msg_id', None)}")
+		if state_data.get('multi_forward_messages'):
+			logger.info(f"📋 СУЩЕСТВУЮЩИЕ СООБЩЕНИЯ: {[msg.get('message_id') for msg in state_data.get('multi_forward_messages', [])]}")
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка получения данных состояния: {e}")
 	
+	# Проверяем админа ПЕРЕД обработкой, чтобы третье сообщение тоже обрабатывалось
 	db = get_db()
 	admin_ids = get_admin_ids()
 	admin_usernames = get_admin_usernames()
 	if not message.from_user or not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		logger.info(f"❌ Сообщение {message.message_id} от не-админа или нет from_user, пропускаем")
 		return
+	
+	# ВАЖНО: Если это пересылка и мы в состоянии collecting_multi_forward, это может быть второе или третье сообщение
+	if is_forward and current_state_before_check == ForwardBindStates.collecting_multi_forward:
+		logger.info(f"🔔 Сообщение в состоянии collecting_multi_forward: message_id={message.message_id}, text='{text[:200]}'")
 	
 	# Проверяем, есть ли активное состояние сбора множественных пересылок
 	current_state = await state.get_state()
@@ -1013,9 +1101,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	
 	logger.info(f"🔍 Проверка множественной пересылки: состояние={current_state}, multi_forward_ready={multi_forward_ready}, текст='{(message.text or message.caption or '')[:50]}'")
 	
-	# Если мы в состоянии сбора или в состоянии ожидания выбора, но еще собираем сообщения
-	if current_state == ForwardBindStates.collecting_multi_forward or (current_state == ForwardBindStates.waiting_select_card and multi_forward_ready):
-		logger.info(f"🚨🚨🚨 ПОПАЛИ В БЛОК ОБРАБОТКИ МНОЖЕСТВЕННОЙ ПЕРЕСЫЛКИ! message_id={message.message_id}, state={current_state}, multi_forward_ready={multi_forward_ready}")
+	# УПРОЩЕННАЯ ЛОГИКА: Если мы в состоянии сбора множественных пересылок, просто добавляем сообщение
+	# Собираем до 3 сообщений, затем парсим все сразу
+	if current_state == ForwardBindStates.collecting_multi_forward:
+		logger.info(f"🚨🚨🚨 ПОПАЛИ В БЛОК ОБРАБОТКИ МНОЖЕСТВЕННОЙ ПЕРЕСЫЛКИ! message_id={message.message_id}, state={current_state}")
 		# Собираем множественные пересылки
 		messages_list = data.get("multi_forward_messages", [])
 		buttons_message_id = data.get("multi_forward_buttons_msg_id")  # ID сообщения с кнопками
@@ -1026,12 +1115,28 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		parsed = parse_forwarded_message(text)
 		logger.info(f"📝 Результат парсинга: parsed={parsed}, message_id={message.message_id}")
 		
-		# Если тип не определен, но это может быть криптовалюта (число с точкой в тексте)
-		# или наличные (целое число), пытаемся определить заново
-		if parsed.get("type") == "unknown":
-			logger.warning(f"⚠️ Тип не определен, пытаемся переопределить: text='{text[:200]}'")
+		# ВАЖНО: Для криптовалюты проверяем даже если parsed уже определен
+		# parse_forwarded_message может не распознать "0.8" правильно
+		normalized_text = re.sub(r'\s+', ' ', text.strip())
+		
+		# ПРИОРИТЕТ: Если текст - это просто число с точкой (например "0.8"), это точно криптовалюта
+		# Проверяем это ПЕРВЫМ, до проверки других типов
+		if re.match(r'^\d+\.\d+$', normalized_text):
+			amount = float(normalized_text)
+			currency = detect_crypto_type(amount)
+			parsed = {
+				"type": "crypto",
+				"value": amount,
+				"currency": currency,
+				"display": f"{amount} {currency}"
+			}
+			logger.info(f"✅ Текст является числом с точкой - переопределено как криптовалюта: {parsed}")
+		# Если тип не определен ИЛИ это может быть криптовалюта (число с точкой), пытаемся определить заново
+		elif parsed.get("type") == "unknown" or (parsed.get("type") != "crypto" and re.search(r'^\d+\.\d+$', normalized_text)):
+			logger.warning(f"⚠️ Тип не определен или требует переопределения: parsed={parsed}, text='{text[:200]}'")
+			
 			# Проверяем, есть ли в тексте число с точкой (криптовалюта)
-			crypto_match = re.search(r'(\d+\.\d+)', text)
+			crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
 			logger.debug(f"🔍 Поиск криптовалюты в тексте: crypto_match={crypto_match}")
 			if crypto_match:
 				amount = float(crypto_match.group(1))
@@ -1045,33 +1150,35 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				logger.info(f"✅ Переопределено как криптовалюта: {parsed}")
 			# Проверяем, есть ли в тексте целое число (наличные)
 			else:
-				first_digit_match = re.search(r'^\d+', text.strip())
-				logger.debug(f"🔍 Поиск наличных в тексте: first_digit_match={first_digit_match}")
-				if first_digit_match:
-					cash_match = re.match(r'^(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?$', text.strip(), re.IGNORECASE)
-					logger.debug(f"🔍 Проверка паттерна наличных: cash_match={cash_match}")
-					if cash_match:
-						amount = int(cash_match.group(1))
-						currency = detect_cash_type(amount)
-						parsed = {
-							"type": "cash",
-							"value": amount,
-							"currency": currency,
-							"display": f"{amount} {currency}"
-						}
-						logger.info(f"✅ Переопределено как наличные: {parsed}")
-					else:
-						logger.warning(f"⚠️ Найдено число, но не соответствует паттерну наличных")
+				cash_match = re.search(r'(?:^|\s)(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?(?:\s|$)', normalized_text, re.IGNORECASE)
+				logger.debug(f"🔍 Поиск наличных в тексте: cash_match={cash_match}")
+				if cash_match:
+					amount = int(cash_match.group(1))
+					currency = detect_cash_type(amount)
+					parsed = {
+						"type": "cash",
+						"value": amount,
+						"currency": currency,
+						"display": f"{amount} {currency}"
+					}
+					logger.info(f"✅ Переопределено как наличные: {parsed}")
 				else:
-					logger.warning(f"⚠️ Не найдено число в начале текста")
+					logger.warning(f"⚠️ Не найдено число в тексте")
 		
 		# Создаем уникальный ключ сеанса на основе первого сообщения, если его еще нет
+		# Определяем первое сообщение по дате (самое раннее)
+		# Это важно, т.к. при пересылке из избранного порядок может быть другим
 		if not session_key and messages_list:
-			first_msg_id = messages_list[0].get("message_id")
+			# Сортируем сообщения по дате, чтобы найти самое первое
+			sorted_messages = sorted(messages_list, key=lambda x: x.get("date", 0))
+			first_msg = sorted_messages[0] if sorted_messages else messages_list[0]
+			first_msg_id = first_msg.get("message_id")
 			session_key = f"multi_{message.from_user.id}_{first_msg_id}"
+			logger.info(f"🔑 Создан session_key на основе первого сообщения по дате: message_id={first_msg_id}, date={first_msg.get('date')}")
 		elif not session_key:
 			# Если это первое сообщение в сеансе, создаем ключ
 			session_key = f"multi_{message.from_user.id}_{message.message_id}"
+			logger.info(f"🔑 Создан session_key для первого сообщения: message_id={message.message_id}")
 		
 		# Получаем блокировку для этого сеанса
 		lock_key = (message.from_user.id, session_key)
@@ -1093,11 +1200,37 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				logger.warning(f"⚠️ Сообщение {message.message_id} уже добавлено в список, пропускаем")
 				return
 			
-			# Добавляем новое сообщение
+			# ОГРАНИЧЕНИЕ: Максимум 3 сообщения в списке (криптовалюта, наличные, карта)
+			# Удаляем дубликаты по типу ПЕРЕД добавлением нового сообщения
+			# Это предотвращает добавление дубликатов при повторной пересылке тех же сообщений
+			seen_types = set()
+			unique_messages = []
+			for msg in messages_list:
+				msg_type = msg.get("parsed", {}).get("type")
+				if msg_type not in seen_types:
+					seen_types.add(msg_type)
+					unique_messages.append(msg)
+				else:
+					logger.warning(f"⚠️ Удален дубликат сообщения: message_id={msg.get('message_id')}, type={msg_type}")
+			messages_list = unique_messages
+			
+			# Проверяем, есть ли уже сообщение с таким же типом
+			parsed_type = parsed.get("type")
+			if parsed_type in seen_types:
+				logger.warning(f"⚠️ Сообщение {message.message_id} с типом {parsed_type} уже есть в списке, пропускаем")
+				return
+			
+			# ОГРАНИЧЕНИЕ: Максимум 3 сообщения
+			if len(messages_list) >= 3:
+				logger.warning(f"⚠️ Уже есть 3 сообщения в списке, пропускаем новое сообщение {message.message_id}")
+				return
+			
+			# Добавляем новое сообщение с сохранением даты для правильного определения порядка
 			messages_list.append({
 				"text": text,
 				"parsed": parsed,
-				"message_id": message.message_id
+				"message_id": message.message_id,
+				"date": message.date.timestamp() if hasattr(message.date, 'timestamp') else (message.date if message.date else 0)
 			})
 			logger.info(f"✅ Добавлено сообщение в список. Всего сообщений: {len(messages_list)}")
 			
@@ -1172,8 +1305,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			
 			logger.info(f"📊 ИТОГОВЫЕ ДАННЫЕ: crypto={bool(crypto_data)} ({crypto_data if crypto_data else 'None'}), cash={bool(cash_data)} ({cash_data if cash_data else 'None'}), card={bool(card_data)} ({card_data if card_data else 'None'})")
 			
-			# Показываем три кнопки только после второго сообщения
+			# ВАЖНО: Обновляем кнопки только после обработки всех сообщений
 			# Если это второе сообщение или больше, показываем/обновляем кнопки
+			# Но обновляем кнопки ТОЛЬКО если это второе сообщение (len == 2)
+			# Если это третье сообщение (len == 3), кнопки уже должны быть созданы, просто обновляем их
 			if len(messages_list) >= 2:
 				from app.keyboards import multi_forward_select_kb
 				
@@ -1182,8 +1317,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				buttons_message_id = current_data.get("multi_forward_buttons_msg_id")
 				selected_xmr = current_data.get("selected_xmr_number")
 				
-				# Проверяем, есть ли уже сообщение с кнопками (внутри блокировки)
-				# Если есть - редактируем, если нет - создаем
+				# ВАЖНО: Обновляем кнопки с актуальными данными из всех сообщений
+				# Это гарантирует, что криптовалюта будет отображена даже если она пришла третьим сообщением
 				if buttons_message_id:
 					try:
 						message_text = await format_multi_forward_message_text(crypto_data)
@@ -1201,7 +1336,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 							multi_forward_messages=messages_list,
 							multi_forward_session_key=session_key
 						)
-						return
+						logger.info(f"✅ Сообщение с кнопками обновлено с актуальными данными. Всего сообщений: {len(messages_list)}, crypto={bool(crypto_data)}")
 					except Exception as e:
 						# Не удалось отредактировать - возможно сообщение было удалено
 						logger.warning(f"Не удалось отредактировать сообщение с кнопками (ID: {buttons_message_id}): {e}")
@@ -1237,54 +1372,66 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 								multi_forward_messages=messages_list,
 								multi_forward_session_key=session_key
 							)
-							return
+							logger.info(f"✅ Сообщение с кнопками обновлено после финальной проверки. Всего сообщений: {len(messages_list)}, crypto={bool(crypto_data)}")
 						except Exception as e:
 							logger.warning(f"Не удалось отредактировать сообщение после финальной проверки: {e}")
-					
-					# Создаем новое сообщение
-					first_message_id = messages_list[0].get("message_id") if messages_list else None
-					message_text = await format_multi_forward_message_text(crypto_data)
-					initial_selected_xmr = final_check.get("selected_xmr_number")
-					
-					sent_message = await message.answer(
-						message_text,
-						reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=initial_selected_xmr),
-						reply_to_message_id=first_message_id if first_message_id else None
-					)
-					
-					await state.set_state(ForwardBindStates.collecting_multi_forward)
-					await state.update_data(
-						multi_forward_ready=True,
-						multi_forward_buttons_msg_id=sent_message.message_id,
-						multi_forward_messages=messages_list,
-						multi_forward_session_key=session_key
-					)
-		# НЕ выходим из функции - продолжаем собирать сообщения
-		# Сообщение обработано, но продолжаем слушать следующие сообщения
+					else:
+						# Создаем новое сообщение только если его еще нет
+						# Определяем первое сообщение по дате (самое раннее)
+						# Это важно, т.к. при пересылке из избранного порядок может быть другим
+						sorted_messages = sorted(messages_list, key=lambda x: x.get("date", 0))
+						first_msg = sorted_messages[0] if sorted_messages else (messages_list[0] if messages_list else None)
+						first_message_id = first_msg.get("message_id") if first_msg else None
+						logger.info(f"📌 Определено первое сообщение для reply_to_message_id: message_id={first_message_id}, date={first_msg.get('date') if first_msg else None}")
+						
+						message_text = await format_multi_forward_message_text(crypto_data)
+						initial_selected_xmr = final_check.get("selected_xmr_number")
+						
+						sent_message = await message.answer(
+							message_text,
+							reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=initial_selected_xmr),
+							reply_to_message_id=first_message_id if first_message_id else None
+						)
+						
+						await state.set_state(ForwardBindStates.collecting_multi_forward)
+						await state.update_data(
+							multi_forward_ready=True,
+							multi_forward_buttons_msg_id=sent_message.message_id,
+							multi_forward_messages=messages_list,
+							multi_forward_session_key=session_key
+						)
+						logger.info(f"✅ Создано новое сообщение с кнопками. Всего сообщений: {len(messages_list)}, crypto={bool(crypto_data)}")
+		# ВАЖНО: Делаем return после обработки сообщения в блоке множественной пересылки
+		# Третье сообщение будет обработано в отдельном вызове этой функции в финальном блоке
+		logger.info(f"✅ Сообщение обработано в блоке множественной пересылки, выходим. Следующее сообщение обработается в отдельном вызове.")
 		return
 	
 	# Обработка обычной пересылки (не множественной)
-	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
-	text = message.text or message.caption or ""
-	logger.info(f"📨 Пересылка от админа {message.from_user.id}: tg_id={orig_tg_id}, username={orig_username}, full_name={orig_full_name}, text={text[:50] if text else 'нет'}")
+	# ВАЖНО: Если мы дошли сюда, значит сообщение не обработано в блоке выше
+	# Это может быть третье сообщение, которое не попало в блок collecting_multi_forward
+	# Проверяем состояние еще раз
+	current_state_final = await state.get_state()
+	text_final = message.text or message.caption or ""
+	is_forward_final = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from", None))
+	logger.info(f"🔄 ФИНАЛЬНАЯ ПРОВЕРКА СОСТОЯНИЯ: current_state_final={current_state_final}, message_id={message.message_id}, is_forward={is_forward_final}, text='{text_final[:200]}'")
 	
-	# ВАЖНО: Сначала парсим сообщение, чтобы parsed была доступна везде
-	parsed = parse_forwarded_message(text)
-	
-	# ВАЖНО: Сначала проверяем состояние - если мы в collecting_multi_forward, 
-	# обрабатываем сообщение как часть множественной пересылки
-	current_state_recheck = await state.get_state()
-	logger.info(f"🔄 ПРОВЕРКА СОСТОЯНИЯ для третьего сообщения: current_state_recheck={current_state_recheck}, message_id={message.message_id}, text='{text[:100]}'")
-	
-	if current_state_recheck == ForwardBindStates.collecting_multi_forward:
-		logger.info(f"🚨🚨🚨 ПОПАЛИ В БЛОК ОБРАБОТКИ ТРЕТЬЕГО СООБЩЕНИЯ! message_id={message.message_id}, text='{text[:200]}'")
-		# parsed уже определен выше, используем его
-		logger.info(f"🔄 Продолжаем сбор множественных пересылок: состояние={current_state_recheck}, parsed={parsed}")
-		# Получаем существующий список сообщений (получаем data заново)
-		data_recheck = await state.get_data()
-		existing_messages = data_recheck.get("multi_forward_messages", [])
+	# ВАЖНО: Проверяем, является ли это пересылкой в состоянии collecting_multi_forward
+	# Это может быть третье сообщение, которое не попало в основной блок
+	# НО: если это пересылка и состояние collecting_multi_forward, то оно ДОЛЖНО было попасть в основной блок
+	# Если не попало, значит что-то не так с логикой
+	if current_state_final == ForwardBindStates.collecting_multi_forward and is_forward_final:
+		logger.warning(f"⚠️⚠️⚠️ ВНИМАНИЕ: Сообщение {message.message_id} в состоянии collecting_multi_forward, но не попало в основной блок! Это может быть третье сообщение.")
+		# Это сообщение в состоянии collecting_multi_forward, которое не попало в блок выше - обрабатываем его здесь
+		# Это может быть второе, третье или последующее сообщение
+		logger.info(f"🚨🚨🚨 СООБЩЕНИЕ В СОСТОЯНИИ collecting_multi_forward ОБНАРУЖЕНО В ФИНАЛЬНОМ БЛОКЕ! message_id={message.message_id}, text='{text[:200]}'")
+		text = message.text or message.caption or ""
+		parsed = parse_forwarded_message(text)
+		logger.info(f"🔄 Продолжаем сбор множественных пересылок: состояние={current_state_final}, parsed={parsed}")
+		# Получаем существующий список сообщений
+		data_final = await state.get_data()
+		existing_messages = data_final.get("multi_forward_messages", [])
 		logger.info(f"🔄 Существующий список сообщений: {len(existing_messages)} сообщений")
-		session_key = data_recheck.get("multi_forward_session_key")
+		session_key = data_final.get("multi_forward_session_key")
 		
 		# Проверяем, не добавлено ли уже это сообщение
 		message_already_added = any(msg.get("message_id") == message.message_id for msg in existing_messages)
@@ -1292,12 +1439,35 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			logger.warning(f"⚠️ Сообщение {message.message_id} уже добавлено в список, пропускаем")
 			return
 		
+		# ОГРАНИЧЕНИЕ: Максимум 3 сообщения в списке (криптовалюта, наличные, карта)
+		# Удаляем дубликаты по типу ПЕРЕД добавлением нового сообщения
+		seen_types = set()
+		unique_messages = []
+		for msg in existing_messages:
+			msg_type = msg.get("parsed", {}).get("type")
+			if msg_type not in seen_types:
+				seen_types.add(msg_type)
+				unique_messages.append(msg)
+			else:
+				logger.warning(f"⚠️ Удален дубликат сообщения: message_id={msg.get('message_id')}, type={msg_type}")
+		existing_messages = unique_messages
+		
+		# Проверяем, есть ли уже сообщение с таким же типом
+		parsed_type = parsed.get("type")
+		if parsed_type in seen_types:
+			logger.warning(f"⚠️ Сообщение {message.message_id} с типом {parsed_type} уже есть в списке, пропускаем")
+			return
+		
+		# ОГРАНИЧЕНИЕ: Максимум 3 сообщения
+		if len(existing_messages) >= 3:
+			logger.warning(f"⚠️ Уже есть 3 сообщения в списке, пропускаем новое сообщение {message.message_id}")
+			return
+		
 		# Если тип не определен или это криптовалюта, пытаемся переопределить
-		# ВАЖНО: проверяем даже если parsed уже определен, так как parse_forwarded_message может не распознать "0.8"
-		if parsed.get("type") == "unknown" or (parsed.get("type") != "crypto" and re.search(r'^\d+\.\d+$', text.strip())):
+		normalized_text = re.sub(r'\s+', ' ', text.strip())
+		if parsed.get("type") == "unknown" or (parsed.get("type") != "crypto" and re.search(r'^\d+\.\d+$', normalized_text)):
 			logger.warning(f"⚠️ Тип не определен или требует переопределения: parsed={parsed}, text='{text[:200]}'")
-			# Проверяем, есть ли в тексте число с точкой (криптовалюта)
-			crypto_match = re.search(r'(\d+\.\d+)', text)
+			crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
 			if crypto_match:
 				amount = float(crypto_match.group(1))
 				currency = detect_crypto_type(amount)
@@ -1308,8 +1478,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 					"display": f"{amount} {currency}"
 				}
 				logger.info(f"✅ Переопределено как криптовалюта: {parsed}")
-			elif re.search(r'^\d+', text.strip()):
-				cash_match = re.match(r'^(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?$', text.strip(), re.IGNORECASE)
+			else:
+				cash_match = re.search(r'(?:^|\s)(\d+)(?:\s+\d+)*(?:\s+без\s+долга)?(?:\s|$)', normalized_text, re.IGNORECASE)
 				if cash_match:
 					amount = int(cash_match.group(1))
 					currency = detect_cash_type(amount)
@@ -1320,15 +1490,13 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						"display": f"{amount} {currency}"
 					}
 					logger.info(f"✅ Переопределено как наличные: {parsed}")
-		# Также проверяем, если parsed уже определен как crypto
-		elif parsed.get("type") == "crypto" and parsed.get("value"):
-			logger.info(f"✅ Криптовалюта уже определена: {parsed}")
 		
-		# Добавляем сообщение в существующий список
+		# Добавляем сообщение в существующий список с сохранением даты
 		existing_messages.append({
 			"text": text,
 			"parsed": parsed,
-			"message_id": message.message_id
+			"message_id": message.message_id,
+			"date": message.date.timestamp() if hasattr(message.date, 'timestamp') else (message.date if message.date else 0)
 		})
 		logger.info(f"✅ Добавлено сообщение в существующий список. Всего сообщений: {len(existing_messages)}")
 		
@@ -1355,12 +1523,12 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				card_data = parsed_msg.copy()
 		
 		# Обновляем сообщение с кнопками
-		buttons_message_id = data_recheck.get("multi_forward_buttons_msg_id")
+		buttons_message_id = data_final.get("multi_forward_buttons_msg_id")
 		if buttons_message_id:
 			try:
 				from app.keyboards import multi_forward_select_kb
 				message_text = await format_multi_forward_message_text(crypto_data)
-				selected_xmr = data_recheck.get("selected_xmr_number")
+				selected_xmr = data_final.get("selected_xmr_number")
 				await bot.edit_message_text(
 					chat_id=message.chat.id,
 					message_id=buttons_message_id,
@@ -1373,6 +1541,14 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		
 		return
 	
+	# Обычная обработка пересылки
+	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
+	text = message.text or message.caption or ""
+	logger.info(f"📨 Пересылка от админа {message.from_user.id}: tg_id={orig_tg_id}, username={orig_username}, full_name={orig_full_name}, text={text[:50] if text else 'нет'}")
+	
+	# ВАЖНО: Сначала парсим сообщение, чтобы parsed была доступна везде
+	parsed = parse_forwarded_message(text)
+	
 	if parsed.get("type") in ["crypto", "cash", "card", "user_name"] or re.search(r'[🏦💳🆘]', text):
 		# Это может быть множественная пересылка - начинаем сбор
 		logger.info(f"🔍 Обнаружена возможная множественная пересылка: {parsed}")
@@ -1384,7 +1560,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			multi_forward_messages=[{
 				"text": text,
 				"parsed": parsed,
-				"message_id": message.message_id
+				"message_id": message.message_id,
+				"date": message.date.timestamp() if hasattr(message.date, 'timestamp') else (message.date if message.date else 0)
 			}],
 			multi_forward_session_key=session_key
 		)
@@ -1628,8 +1805,19 @@ async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	# Обрабатываем выбор в зависимости от типа
 	if selected_type == "crypto":
 		if not crypto_data:
-			logger.warning("⚠️ Криптовалюта не найдена в сообщениях")
-			await cb.answer("Криптовалюта не указана", show_alert=True)
+			# Криптовалюта не распознана - показываем клавиатуру выбора валюты
+			logger.info("⚠️ Криптовалюта не найдена в сообщениях, показываем выбор валюты")
+			from app.keyboards import crypto_select_kb
+			
+			try:
+				await cb.message.edit_text(
+					"📝 Криптовалюта не распознана.\n\nВыберите тип монеты:",
+					reply_markup=crypto_select_kb(back_to="multi:back_to_main")
+				)
+				await cb.answer()
+			except Exception as e:
+				logger.exception(f"❌ Ошибка при открытии выбора валюты: {e}")
+				await cb.answer("Ошибка при открытии выбора валюты", show_alert=True)
 			return
 		
 		# Показываем клавиатуру для редактирования криптовалюты
@@ -1977,6 +2165,164 @@ async def crypto_change_type(cb: CallbackQuery, state: FSMContext):
 
 
 @admin_router.callback_query(
+	F.data.startswith("crypto:select:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора валюты, если криптовалюта не распознана"""
+	# Формат: crypto:select:{currency} или crypto:select:amount
+	parts = cb.data.split(":")
+	
+	if len(parts) < 3:
+		await cb.answer("Ошибка обработки выбора", show_alert=True)
+		return
+	
+	action = parts[2]  # BTC, LTC, XMR или amount
+	
+	if action == "amount":
+		# Переход к вводу количества
+		logger.info(f"🔘 Нажата кнопка 'Количество', текущее состояние: {await state.get_state()}")
+		
+		# Получаем данные из state
+		data = await state.get_data()
+		messages_list = data.get("multi_forward_messages", [])
+		
+		# Проверяем, есть ли уже криптовалюта
+		crypto_msg = None
+		for msg in messages_list:
+			if msg["parsed"].get("type") == "crypto":
+				crypto_msg = msg
+				break
+		
+		# Если криптовалюты нет, создаем с валютой по умолчанию (BTC)
+		if not crypto_msg:
+			# Ищем сообщение с числом (возможно, это было третье сообщение "0.8")
+			crypto_amount = 0.0
+			for msg in messages_list:
+				text = msg.get("text", "")
+				normalized_text = re.sub(r'\s+', ' ', text.strip())
+				crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
+				if crypto_match:
+					crypto_amount = float(crypto_match.group(1))
+					break
+			
+			# Создаем новое сообщение с криптовалютой (валюта по умолчанию - BTC)
+			crypto_msg = {
+				"text": f"{crypto_amount}",
+				"parsed": {
+					"type": "crypto",
+					"value": crypto_amount,
+					"currency": "BTC",  # Валюта по умолчанию
+					"display": f"{crypto_amount} BTC"
+				},
+				"message_id": None  # Это виртуальное сообщение
+			}
+			messages_list.append(crypto_msg)
+			await state.update_data(multi_forward_messages=messages_list)
+		
+		await state.set_state(ForwardBindStates.editing_crypto_amount)
+		logger.info(f"✅ Состояние установлено на: {await state.get_state()}")
+		await cb.message.edit_text(
+			"📝 Введите количество криптовалюты:\n\nНапример: 0.8",
+			reply_markup=None
+		)
+		await cb.answer()
+		return
+	
+	# Выбор валюты (BTC, LTC, XMR)
+	currency = action
+	if currency not in ["BTC", "LTC", "XMR"]:
+		await cb.answer("Неверная валюта", show_alert=True)
+		return
+	
+	logger.info(f"🔘 Выбрана валюта: {currency}")
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	messages_list = data.get("multi_forward_messages", [])
+	
+	# Ищем сообщение с криптовалютой или создаем новое
+	crypto_msg = None
+	for msg in messages_list:
+		if msg["parsed"].get("type") == "crypto":
+			crypto_msg = msg
+			break
+	
+	if crypto_msg:
+		# Обновляем существующее сообщение с криптовалютой
+		crypto_msg["parsed"]["currency"] = currency
+		amount = crypto_msg["parsed"].get("value", 0.0)
+		crypto_msg["parsed"]["display"] = f"{amount} {currency}"
+	else:
+		# Создаем новое сообщение с криптовалютой
+		# Ищем сообщение с числом (возможно, это было третье сообщение "0.8")
+		crypto_amount = 0.0
+		for msg in messages_list:
+			text = msg.get("text", "")
+			normalized_text = re.sub(r'\s+', ' ', text.strip())
+			crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
+			if crypto_match:
+				crypto_amount = float(crypto_match.group(1))
+				break
+		
+		# Добавляем новое сообщение с криптовалютой
+		crypto_msg = {
+			"text": f"{crypto_amount}",
+			"parsed": {
+				"type": "crypto",
+				"value": crypto_amount,
+				"currency": currency,
+				"display": f"{crypto_amount} {currency}"
+			},
+			"message_id": None  # Это виртуальное сообщение
+		}
+		messages_list.append(crypto_msg)
+	
+	# Обновляем данные в state
+	await state.update_data(multi_forward_messages=messages_list)
+	
+	# Извлекаем данные для обновления клавиатуры
+	crypto_data = crypto_msg["parsed"]
+	cash_data = None
+	card_data = None
+	
+	for msg in messages_list:
+		parsed_msg = msg["parsed"]
+		msg_type = parsed_msg.get("type")
+		
+		if msg_type == "cash" and not cash_data:
+			cash_data = parsed_msg
+		elif msg_type == "card" and not card_data:
+			card_data = parsed_msg
+	
+	# Обновляем сообщение с кнопками
+	from app.keyboards import multi_forward_select_kb
+	
+	buttons_message_id = data.get("multi_forward_buttons_msg_id")
+	if buttons_message_id:
+		try:
+			message_text = await format_multi_forward_message_text(crypto_data)
+			selected_xmr = data.get("selected_xmr_number")
+			await cb.bot.edit_message_text(
+				chat_id=cb.message.chat.id,
+				message_id=buttons_message_id,
+				text=message_text,
+				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=selected_xmr)
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
+	
+	# Возвращаемся к основному меню
+	message_text = await format_multi_forward_message_text(crypto_data)
+	selected_xmr = data.get("selected_xmr_number")
+	await cb.message.edit_text(
+		message_text,
+		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=selected_xmr)
+	)
+	await cb.answer(f"✅ Выбрана валюта: {currency}")
+
+
+@admin_router.callback_query(
 	F.data == "crypto:change_amount",
 	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
 )
@@ -2019,8 +2365,9 @@ async def crypto_edit_back(cb: CallbackQuery, state: FSMContext):
 		elif msg_type == "card" and not card_data:
 			card_data = parsed_msg
 	
+	message_text = await format_multi_forward_message_text(crypto_data)
 	await cb.message.edit_text(
-		"Выберите тип данных:",
+		message_text,
 		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 	)
 	await cb.answer()
@@ -2072,18 +2419,20 @@ async def cash_change_currency(cb: CallbackQuery, state: FSMContext):
 	buttons_message_id = data.get("multi_forward_buttons_msg_id")
 	if buttons_message_id:
 		try:
+			message_text = await format_multi_forward_message_text(crypto_data)
 			await cb.bot.edit_message_text(
 				chat_id=cb.message.chat.id,
 				message_id=buttons_message_id,
-				text="Выберите тип данных:",
+				text=message_text,
 				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 			)
 		except Exception as e:
 			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 	
 	# Возвращаемся к основному меню с тремя кнопками
+	message_text = await format_multi_forward_message_text(crypto_data)
 	await cb.message.edit_text(
-		"Выберите тип данных:",
+		message_text,
 		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 	)
 	await cb.answer(f"✅ Изменено на {new_currency}")
@@ -2132,8 +2481,9 @@ async def cash_edit_back(cb: CallbackQuery, state: FSMContext):
 		elif msg_type == "card" and not card_data:
 			card_data = parsed_msg
 	
+	message_text = await format_multi_forward_message_text(crypto_data)
 	await cb.message.edit_text(
-		"Выберите тип данных:",
+		message_text,
 		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 	)
 	await cb.answer()

@@ -268,3 +268,28 @@ def cash_edit_kb(current_currency: str, amount: int) -> InlineKeyboardMarkup:
 	# Первый ряд - две кнопки валют, второй ряд - изменить, третий - назад
 	kb.adjust(2, 1, 1)
 	return kb.as_markup()
+
+
+def crypto_select_kb(back_to: str = "multi:back_to_main") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора криптовалюты, если она не распознана.
+	Первый ряд: три кнопки в ряд (BTC, LTC, XMR)
+	Второй ряд: кнопка "Количество"
+	Третий ряд: кнопка "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Три кнопки валют в ряд
+	kb.button(text="BTC", callback_data="crypto:select:BTC")
+	kb.button(text="LTC", callback_data="crypto:select:LTC")
+	kb.button(text="XMR", callback_data="crypto:select:XMR")
+	
+	# Кнопка "Количество"
+	kb.button(text="Количество", callback_data="crypto:select:amount")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	# Первый ряд - три кнопки валют, второй ряд - количество, третий - назад
+	kb.adjust(3, 1, 1)
+	return kb.as_markup()
