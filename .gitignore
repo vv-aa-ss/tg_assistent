@@ -37,3 +37,8 @@ build/
 
 # Generated output
 /output/
+
+# Secrets and credentials
+proud-plane.json
+*credentials*.json
+*secret*.json
