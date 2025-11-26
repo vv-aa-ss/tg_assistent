@@ -18,10 +18,14 @@ from app.keyboards import (
 	simple_back_kb,
 	cards_select_kb,
 	user_card_select_kb,
+	crypto_list_kb,
+	crypto_delete_kb,
 	user_action_kb,
 	card_action_kb,
 	user_cards_reply_kb,
 	similar_users_select_kb,
+	card_groups_list_kb,
+	card_groups_select_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -80,12 +84,27 @@ class CardUserMessageStates(StatesGroup):
 	waiting_message = State()
 
 
+class CardColumnBindStates(StatesGroup):
+	selecting_card = State()
+	waiting_column = State()
+
+
 class ForwardBindStates(StatesGroup):
 	waiting_select_card = State()
 	waiting_select_existing_card = State()
 	collecting_multi_forward = State()
 	editing_crypto_amount = State()  # Состояние для редактирования количества криптовалюты
 	editing_cash_amount = State()  # Состояние для редактирования количества наличных
+
+
+class CryptoColumnEditStates(StatesGroup):
+	waiting_column = State()
+	waiting_crypto_name = State()
+	waiting_crypto_column = State()
+
+
+class CardGroupStates(StatesGroup):
+	waiting_group_name = State()
 
 
 def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
@@ -269,7 +288,7 @@ def parse_forwarded_message(text: str) -> dict:
 				"type": "cash",
 				"value": amount,
 				"currency": currency,
-				"display": f"{amount} {currency}"
+				"display": f"{amount}"
 			}
 			logger.info(f"✅ parse_forwarded_message: определены наличные: {result}")
 			return result
@@ -467,6 +486,217 @@ async def admin_cards(cb: CallbackQuery):
 	await cb.answer()
 
 
+@admin_router.callback_query(F.data == "admin:crypto")
+async def admin_crypto(cb: CallbackQuery):
+	"""Показывает список криптовалют с их адресами столбцов"""
+	db = get_db()
+	crypto_columns = await db.list_crypto_columns()
+	logger.debug(f"Show crypto columns: count={len(crypto_columns)}")
+	
+	if not crypto_columns:
+		text = "Список криптовалют пуст."
+	else:
+		text = "Список криптовалют и их адресов столбцов:\n\n"
+		for crypto in crypto_columns:
+			crypto_type = crypto.get("crypto_type", "")
+			column = crypto.get("column", "")
+			text += f"{crypto_type} → {column}\n"
+	
+	await cb.message.edit_text(text, reply_markup=crypto_list_kb(crypto_columns))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "crypto:new")
+async def crypto_new(cb: CallbackQuery, state: FSMContext):
+	"""Начинает создание новой криптовалюты"""
+	await state.set_state(CryptoColumnEditStates.waiting_crypto_name)
+	await cb.message.edit_text(
+		"Введите название криптовалюты:\n\nНапример: BTC, LTC, XMR-1, USDT",
+		reply_markup=simple_back_kb("admin:crypto")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CryptoColumnEditStates.waiting_crypto_name)
+async def crypto_name_input(message: Message, state: FSMContext):
+	"""Обрабатывает ввод названия криптовалюты"""
+	crypto_name = message.text.strip().upper()
+	
+	if not crypto_name:
+		await message.answer("❌ Название криптовалюты не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Сохраняем название в state
+	await state.update_data(crypto_type=crypto_name)
+	await state.set_state(CryptoColumnEditStates.waiting_crypto_column)
+	
+	await message.answer(
+		"✅ Название сохранено.\n\n"
+		"Теперь введите адрес столбца (только латинские буквы):\n"
+		"Например: A, B, C, D, E, AS, AY",
+		reply_markup=simple_back_kb("admin:crypto")
+	)
+
+
+@admin_router.message(CryptoColumnEditStates.waiting_crypto_column)
+async def crypto_column_input(message: Message, state: FSMContext):
+	"""Обрабатывает ввод адреса столбца для новой криптовалюты"""
+	db = get_db()
+	column_input = message.text.strip().upper()
+	
+	if not column_input:
+		await message.answer("❌ Адрес столбца не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Проверка на русские символы
+	import re
+	if re.search(r'[А-ЯЁа-яё]', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы. Русские символы не допускаются. Попробуйте еще раз:")
+		return
+	
+	# Проверка на допустимые символы (только латинские буквы)
+	if not re.match(r'^[A-Z]+$', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы (A-Z). Попробуйте еще раз:")
+		return
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	crypto_type = data.get("crypto_type")
+	
+	if not crypto_type:
+		await message.answer("❌ Ошибка: название криптовалюты не найдено. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем криптовалюту
+	try:
+		await db.set_crypto_column(crypto_type, column_input)
+		
+		await message.answer(
+			f"✅ Криптовалюта успешно добавлена!\n\n"
+			f"Название: {crypto_type}\n"
+			f"Адрес столбца: {column_input}",
+			reply_markup=simple_back_kb("admin:crypto")
+		)
+		await state.clear()
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении криптовалюты: {e}")
+		if "UNIQUE constraint failed" in str(e):
+			await message.answer("❌ Криптовалюта с таким названием уже существует. Попробуйте другое название:")
+		else:
+			await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(F.data == "crypto:delete_list")
+async def crypto_delete_list(cb: CallbackQuery):
+	"""Показывает список криптовалют для удаления"""
+	db = get_db()
+	crypto_columns = await db.list_crypto_columns()
+	
+	if not crypto_columns:
+		await cb.answer("Нет криптовалют для удаления", show_alert=True)
+		return
+	
+	text = "Выберите криптовалюту для удаления:"
+	await cb.message.edit_text(text, reply_markup=crypto_delete_kb(crypto_columns))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("crypto:delete:"))
+async def crypto_delete(cb: CallbackQuery):
+	"""Удаляет криптовалюту из базы данных"""
+	db = get_db()
+	crypto_type = cb.data.split(":")[-1]
+	
+	try:
+		await db.delete_crypto_column(crypto_type)
+		await cb.answer(f"✅ Криптовалюта '{crypto_type}' удалена", show_alert=True)
+		
+		# Обновляем список
+		crypto_columns = await db.list_crypto_columns()
+		if not crypto_columns:
+			text = "Список криптовалют пуст."
+		else:
+			text = "Список криптовалют и их адресов столбцов:\n\n"
+			for crypto in crypto_columns:
+				crypto_type_item = crypto.get("crypto_type", "")
+				column = crypto.get("column", "")
+				text += f"{crypto_type_item} → {column}\n"
+		
+		await cb.message.edit_text(text, reply_markup=crypto_list_kb(crypto_columns))
+	except Exception as e:
+		logger.exception(f"Ошибка при удалении криптовалюты: {e}")
+		await cb.answer("❌ Произошла ошибка при удалении", show_alert=True)
+
+
+@admin_router.callback_query(F.data.startswith("crypto:edit:"))
+async def crypto_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование адреса столбца для криптовалюты"""
+	db = get_db()
+	crypto_type = cb.data.split(":")[-1]
+	
+	# Получаем текущий адрес столбца
+	current_column = await db.get_crypto_column(crypto_type)
+	
+	# Сохраняем тип криптовалюты в state
+	await state.update_data(crypto_type=crypto_type)
+	await state.set_state(CryptoColumnEditStates.waiting_column)
+	
+	current_text = f" (текущий: {current_column})" if current_column else ""
+	await cb.message.edit_text(
+		f"Редактирование адреса столбца для {crypto_type}{current_text}\n\n"
+		"Введите новый адрес столбца (только латинские буквы):\n"
+		"Например: A, B, C, D, E, AS, AY",
+		reply_markup=simple_back_kb("admin:crypto")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CryptoColumnEditStates.waiting_column)
+async def crypto_column_waiting_column(message: Message, state: FSMContext):
+	"""Обрабатывает ввод адреса столбца для криптовалюты"""
+	db = get_db()
+	column_input = message.text.strip().upper()  # Приводим к верхнему регистру
+	
+	if not column_input:
+		await message.answer("❌ Адрес столбца не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Проверка на русские символы
+	if re.search(r'[А-ЯЁа-яё]', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы. Русские символы не допускаются. Попробуйте еще раз:")
+		return
+	
+	# Проверка на допустимые символы (только латинские буквы)
+	if not re.match(r'^[A-Z]+$', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы (A-Z). Попробуйте еще раз:")
+		return
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	crypto_type = data.get("crypto_type")
+	
+	if not crypto_type:
+		await message.answer("❌ Ошибка: тип криптовалюты не найден. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем адрес столбца
+	try:
+		await db.set_crypto_column(crypto_type, column_input)
+		
+		await message.answer(
+			f"✅ Адрес столбца успешно обновлен!\n\n"
+			f"Криптовалюта: {crypto_type}\n"
+			f"Адрес столбца: {column_input}",
+			reply_markup=simple_back_kb("admin:crypto")
+		)
+		await state.clear()
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении адреса столбца криптовалюты: {e}")
+		await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
 @admin_router.callback_query(F.data.startswith("card:view:"))
 async def card_view(cb: CallbackQuery):
 	db = get_db()
@@ -478,6 +708,24 @@ async def card_view(cb: CallbackQuery):
 	
 	# Формируем информацию о карте
 	text = f"💳 {card['name']}"
+	
+	# Получаем привязанные ячейки для этой карты
+	card_columns = await db.list_card_columns(card_id=card_id)
+	if card_columns:
+		# Формируем список ячеек
+		columns_text = ", ".join([col['column'] for col in card_columns])
+		text += f"\n\nЯчейка: {columns_text}"
+	else:
+		text += "\n\nЯчейка: не привязана"
+	
+	# Получаем информацию о группе
+	if card.get("group_id"):
+		group = await db.get_card_group(card["group_id"])
+		if group:
+			text += f"\n\nГруппа: {group['name']}"
+	else:
+		text += "\n\nГруппа: не привязана"
+	
 	if card['user_message']:
 		text += f"\n\nТекущее сообщение:\n{card['user_message']}"
 	else:
@@ -487,6 +735,134 @@ async def card_view(cb: CallbackQuery):
 	
 	await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, "admin:cards"), parse_mode="HTML")
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("card:groups:"))
+async def card_groups(cb: CallbackQuery):
+	"""Показывает список групп для привязки карты"""
+	db = get_db()
+	card_id = int(cb.data.split(":")[-1])
+	
+	# Получаем все группы
+	groups = await db.list_card_groups()
+	
+	text = "Выберите группу для карты:"
+	if not groups:
+		text = "Групп пока нет. Создайте новую группу:"
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=card_groups_list_kb(groups, card_id)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("card:new_group:"))
+async def card_new_group(cb: CallbackQuery, state: FSMContext):
+	"""Начинает создание новой группы"""
+	card_id = int(cb.data.split(":")[-1])
+	
+	# Сохраняем ID карты в state
+	await state.update_data(card_id=card_id)
+	await state.set_state(CardGroupStates.waiting_group_name)
+	
+	await cb.message.edit_text(
+		"Введите название новой группы:",
+		reply_markup=simple_back_kb(f"card:groups:{card_id}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CardGroupStates.waiting_group_name)
+async def card_group_name_input(message: Message, state: FSMContext):
+	"""Обрабатывает ввод названия группы"""
+	db = get_db()
+	group_name = message.text.strip()
+	
+	if not group_name:
+		await message.answer("❌ Название группы не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	data = await state.get_data()
+	card_id = data.get("card_id")
+	
+	if not card_id:
+		await message.answer("❌ Ошибка: ID карты не найден. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	try:
+		# Создаем новую группу
+		group_id = await db.add_card_group(group_name)
+		
+		# Привязываем карту к группе
+		await db.set_card_group(card_id, group_id)
+		
+		await message.answer(
+			f"✅ Группа '{group_name}' создана и карта привязана к ней!",
+			reply_markup=simple_back_kb(f"card:view:{card_id}")
+		)
+		await state.clear()
+	except Exception as e:
+		logger.exception(f"Ошибка при создании группы: {e}")
+		if "UNIQUE constraint failed" in str(e):
+			await message.answer("❌ Группа с таким названием уже существует. Попробуйте другое название:")
+		else:
+			await message.answer("❌ Произошла ошибка при создании группы. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(F.data.startswith("card:select_group:"))
+async def card_select_group(cb: CallbackQuery):
+	"""Привязывает карту к выбранной группе"""
+	db = get_db()
+	parts = cb.data.split(":")
+	card_id = int(parts[2])
+	group_id = int(parts[3])
+	
+	try:
+		# Привязываем карту к группе
+		await db.set_card_group(card_id, group_id)
+		
+		# Получаем информацию о группе
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		
+		await cb.answer(f"✅ Карта привязана к группе '{group_name}'", show_alert=True)
+		
+		# Возвращаемся к просмотру карты
+		card = await db.get_card_by_id(card_id)
+		if not card:
+			await cb.answer("Карта не найдена", show_alert=True)
+			return
+		
+		# Формируем информацию о карте
+		text = f"💳 {card['name']}"
+		if card['user_message']:
+			text += f"\n\nТекущее сообщение:\n{card['user_message']}"
+		else:
+			text += "\n\nСообщение не задано"
+		
+		# Получаем привязанные ячейки для этой карты
+		card_columns = await db.list_card_columns(card_id=card_id)
+		if card_columns:
+			# Формируем список ячеек
+			columns_text = ", ".join([col['column'] for col in card_columns])
+			text += f"\n\nЯчейка: {columns_text}"
+		else:
+			text += "\n\nЯчейка: не привязана"
+		
+		# Получаем информацию о группе
+		if card.get("group_id"):
+			group = await db.get_card_group(card["group_id"])
+			if group:
+				text += f"\n\nГруппа: {group['name']}"
+		
+		text += "\n\nЧто хотите сделать?"
+		
+		await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, "admin:cards"), parse_mode="HTML")
+	except Exception as e:
+		logger.exception(f"Ошибка при привязке карты к группе: {e}")
+		await cb.answer("❌ Произошла ошибка при привязке карты к группе", show_alert=True)
 
 
 @admin_router.callback_query(F.data.startswith("card:edit:"))
@@ -516,6 +892,118 @@ async def card_edit(cb: CallbackQuery, state: FSMContext):
 			reply_markup=simple_back_kb(f"card:view:{card_id}"),
 		)
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("card:bind_column:"))
+async def card_bind_column_start(cb: CallbackQuery, state: FSMContext):
+	"""Начинает процесс привязки ячейки к карте"""
+	db = get_db()
+	source_card_id = int(cb.data.split(":")[-1])
+	
+	# Сохраняем ID исходной карты в state
+	await state.update_data(source_card_id=source_card_id, selected_card_id=source_card_id)
+	
+	# Получаем информацию о карте
+	selected_card = await db.get_card_by_id(source_card_id)
+	if not selected_card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	card_name = selected_card['name']
+	
+	# Сохраняем выбранную карту в state
+	await state.update_data(selected_card_id=source_card_id)
+	
+	# Сразу запрашиваем адрес столбца
+	await state.set_state(CardColumnBindStates.waiting_column)
+	await cb.message.edit_text(
+		f"Выбрана карта: {card_name}\n\n"
+		"Введите адрес столбца (только латинские буквы):\n"
+		"Например: A, B, C, D, E, G, AS, AY",
+		reply_markup=simple_back_kb(f"card:view:{source_card_id}")
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data.startswith("card:select_for_column:"),
+	StateFilter(CardColumnBindStates.selecting_card)
+)
+async def card_select_for_column(cb: CallbackQuery, state: FSMContext):
+	"""Обрабатывает выбор карты для привязки ячейки"""
+	db = get_db()
+	data = await state.get_data()
+	source_card_id = data.get("source_card_id")
+	selected_card_id = int(cb.data.split(":")[-1])
+	
+	# Получаем информацию о выбранной карте
+	selected_card = await db.get_card_by_id(selected_card_id)
+	if not selected_card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	card_name = selected_card['name']
+	
+	# Сохраняем выбранную карту в state
+	await state.update_data(selected_card_id=selected_card_id)
+	
+	# Сразу запрашиваем адрес столбца
+	await state.set_state(CardColumnBindStates.waiting_column)
+	await cb.message.edit_text(
+		f"Выбрана карта: {card_name}\n\n"
+		"Введите адрес столбца (только латинские буквы):\n"
+		"Например: A, B, C, D, E, G, AS, AY",
+		reply_markup=simple_back_kb(f"card:view:{source_card_id}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CardColumnBindStates.waiting_column)
+async def card_column_waiting_column(message: Message, state: FSMContext):
+	"""Обрабатывает ввод адреса столбца"""
+	db = get_db()
+	column_input = message.text.strip().upper()  # Приводим к верхнему регистру
+	
+	if not column_input:
+		await message.answer("❌ Адрес столбца не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Проверка на русские символы
+	import re
+	if re.search(r'[А-ЯЁа-яё]', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы. Русские символы не допускаются. Попробуйте еще раз:")
+		return
+	
+	# Проверка на допустимые символы (только латинские буквы)
+	if not re.match(r'^[A-Z]+$', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы (A-Z). Попробуйте еще раз:")
+		return
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	source_card_id = data.get("source_card_id")
+	selected_card_id = data.get("selected_card_id")
+	
+	if not selected_card_id:
+		await message.answer("❌ Ошибка: ID карты не найден. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем привязку
+	try:
+		await db.set_card_column(selected_card_id, column_input)
+		selected_card = await db.get_card_by_id(selected_card_id)
+		
+		await message.answer(
+			f"✅ Ячейка успешно привязана!\n\n"
+			f"Карта: {selected_card['name']}\n"
+			f"Адрес столбца: {column_input}",
+			reply_markup=simple_back_kb(f"card:view:{source_card_id}")
+		)
+		await state.clear()
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении привязки ячейки: {e}")
+		await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
 
 
 @admin_router.callback_query(F.data.startswith("card:delete:"))
@@ -942,7 +1430,7 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 				msg["parsed"]["usd_amount"] = usd_amount
 				msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
 				# Вычисляем количество монет для отображения (опционально)
-				msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({currency})"
+				msg["parsed"]["display"] = f"${int(round(usd_amount))} ({currency})"
 				crypto_data = msg["parsed"]
 				logger.info(f"✅ Обновлена криптовалюта: USD={usd_amount}, currency={currency}")
 				break
@@ -958,13 +1446,74 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 					"usd_amount": usd_amount,
 					"value": usd_amount,  # Для обратной совместимости
 					"currency": currency,
-					"display": f"{int(round(usd_amount))} USD ({currency})"
+					"display": f"${int(round(usd_amount))} ({currency})"
 				},
 				"message_id": None  # Это виртуальное сообщение
 			}
 			messages_list.append(crypto_msg)
 			crypto_data = crypto_msg["parsed"]
 			logger.info(f"✅ Создана криптовалюта: USD={usd_amount}, currency={currency}")
+		
+		# Если валюта XMR, нужно выбрать номер XMR (XMR-1, XMR-2, XMR-3)
+		selected_xmr = None
+		if crypto_data and crypto_data.get("currency") == "XMR":
+			# Проверяем, есть ли уже выбранный номер XMR
+			selected_xmr = data.get("selected_xmr_number")
+			if not selected_xmr:
+				# Если номер не выбран, показываем кнопки выбора XMR
+				await state.update_data(multi_forward_messages=messages_list)
+				await state.set_state(ForwardBindStates.collecting_multi_forward)
+				
+				from app.keyboards import multi_forward_select_kb
+				
+				cash_data = None
+				card_data = None
+				
+				for msg in messages_list:
+					parsed_msg = msg["parsed"]
+					msg_type = parsed_msg.get("type")
+					
+					if msg_type == "cash" and not cash_data:
+						cash_data = parsed_msg
+					elif msg_type == "card" and not card_data:
+						card_data = parsed_msg
+				
+				# Показываем клавиатуру с кнопками XMR-1, XMR-2, XMR-3
+				message_text = await format_multi_forward_message_text(crypto_data)
+				await message.answer(
+					message_text,
+					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=None)
+				)
+				return
+		
+		# Если валюта XMR, нужно выбрать номер XMR (XMR-1, XMR-2, XMR-3)
+		selected_xmr = data.get("selected_xmr_number")
+		if crypto_data and crypto_data.get("currency") == "XMR" and not selected_xmr:
+			# Если номер XMR не выбран, показываем кнопки выбора XMR
+			await state.update_data(multi_forward_messages=messages_list)
+			await state.set_state(ForwardBindStates.collecting_multi_forward)
+			
+			from app.keyboards import multi_forward_select_kb
+			
+			cash_data = None
+			card_data = None
+			
+			for msg in messages_list:
+				parsed_msg = msg["parsed"]
+				msg_type = parsed_msg.get("type")
+				
+				if msg_type == "cash" and not cash_data:
+					cash_data = parsed_msg
+				elif msg_type == "card" and not card_data:
+					card_data = parsed_msg
+			
+			# Показываем клавиатуру с кнопками XMR-1, XMR-2, XMR-3
+			message_text = await format_multi_forward_message_text(crypto_data)
+			await message.answer(
+				message_text,
+				reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=None)
+			)
+			return
 		
 		# Обновляем данные в state
 		await state.update_data(multi_forward_messages=messages_list)
@@ -995,7 +1544,7 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 					chat_id=message.chat.id,
 					message_id=buttons_message_id,
 					text=message_text,
-					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+					reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=selected_xmr)
 				)
 			except Exception as e:
 				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
@@ -1004,7 +1553,7 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 		message_text = await format_multi_forward_message_text(crypto_data)
 		await message.answer(
 			f"✅ Количество обновлено\n\n{message_text}",
-			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
+			reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data, selected_xmr=selected_xmr)
 		)
 		
 	except ValueError:
@@ -1044,7 +1593,7 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 				cash_msg = msg
 				currency = msg["parsed"].get("currency", "RUB")
 				msg["parsed"]["value"] = amount
-				msg["parsed"]["display"] = f"{amount} {currency}"
+				msg["parsed"]["display"] = f"{amount}"
 				cash_data = msg["parsed"]
 				logger.info(f"✅ Обновлены наличные: {cash_data.get('display')}")
 				break
@@ -1059,7 +1608,7 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 					"type": "cash",
 					"value": amount,
 					"currency": currency,
-					"display": f"{amount} {currency}"
+					"display": f"{amount}"
 				},
 				"message_id": None  # Это виртуальное сообщение
 			}
@@ -1223,7 +1772,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						"type": "cash",
 						"value": amount,
 						"currency": currency,
-						"display": f"{amount} {currency}"
+						"display": f"{amount}"
 					}
 					logger.info(f"✅ Переопределено как наличные: {parsed}")
 				else:
@@ -1551,7 +2100,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						"type": "cash",
 						"value": amount,
 						"currency": currency,
-						"display": f"{amount} {currency}"
+						"display": f"{amount}"
 					}
 					logger.info(f"✅ Переопределено как наличные: {parsed}")
 		
@@ -1833,7 +2382,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 
 
 @admin_router.callback_query(
-	F.data.startswith("multi:select:") & ~F.data.startswith("multi:select:xmr:"),
+	F.data.startswith("multi:select:") & ~F.data.startswith("multi:select:xmr:") & ~F.data.startswith("multi:select:group:"),
 	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
 )
 async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
@@ -1904,7 +2453,7 @@ async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					"type": "cash",
 					"value": 0,
 					"currency": "RUB",
-					"display": "0 RUB"
+					"display": "0"
 				},
 				"message_id": None  # Это виртуальное сообщение
 			}
@@ -1941,26 +2490,17 @@ async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		return
 	
 	elif selected_type == "card":
-		# Показываем список карт для выбора
-		rows = await db.list_cards()
-		cards = [(r[0], r[1]) for r in rows]
-		logger.debug(f"Показываем список карт для выбора: count={len(cards)}")
+		# Показываем список групп для выбора
+		groups = await db.list_card_groups()
+		logger.debug(f"Показываем список групп для выбора: count={len(groups)}")
 		
-		if not cards:
-			await cb.answer("Список карт пуст", show_alert=True)
-			return
+		from app.keyboards import card_groups_select_kb
 		
-		text = "Выберите карту:"
-		# Создаем клавиатуру с кнопками для выбора карты
-		from aiogram.utils.keyboard import InlineKeyboardBuilder
+		text = "Выберите группу карт:"
+		if not groups:
+			text = "Групп пока нет. Выберите карты без группы:"
 		
-		kb = InlineKeyboardBuilder()
-		for card_id, card_name in cards:
-			kb.button(text=card_name, callback_data=f"multi:select_card:{card_id}")
-		kb.button(text="⬅️ Назад", callback_data="multi:back_to_main")
-		kb.adjust(1)
-		
-		await cb.message.edit_text(text, reply_markup=kb.as_markup())
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups))
 		await cb.answer()
 		return
 	
@@ -2188,7 +2728,7 @@ async def crypto_change_type(cb: CallbackQuery, state: FSMContext):
 			usd_amount = msg["parsed"].get("usd_amount", msg["parsed"].get("value", 0.0))
 			msg["parsed"]["usd_amount"] = usd_amount
 			msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
-			msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({new_currency})"
+			msg["parsed"]["display"] = f"${int(round(usd_amount))} ({new_currency})"
 			break
 	
 	# Если изменили валюту на не-XMR, сбрасываем выбранный номер XMR
@@ -2282,7 +2822,7 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 					"usd_amount": 0.0,
 					"value": 0.0,  # Для обратной совместимости
 					"currency": "BTC",  # Валюта по умолчанию
-					"display": "0 USD (BTC)"
+					"display": "$0 (BTC)"
 				},
 				"message_id": None  # Это виртуальное сообщение
 			}
@@ -2300,7 +2840,7 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 	
 	# Выбор валюты (BTC, LTC, XMR)
 	currency = action
-	if currency not in ["BTC", "LTC", "XMR"]:
+	if currency not in ["BTC", "LTC", "XMR", "USDT"]:
 		await cb.answer("Неверная валюта", show_alert=True)
 		return
 	
@@ -2323,7 +2863,7 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 		usd_amount = crypto_msg["parsed"].get("usd_amount", crypto_msg["parsed"].get("value", 0.0))
 		crypto_msg["parsed"]["usd_amount"] = usd_amount
 		crypto_msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
-		crypto_msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({currency})"
+		crypto_msg["parsed"]["display"] = f"${int(round(usd_amount))} ({currency})"
 	else:
 		# Создаем новое сообщение с криптовалютой
 		# USD будет введен пользователем позже
@@ -2334,7 +2874,7 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 				"usd_amount": 0.0,
 				"value": 0.0,  # Для обратной совместимости
 				"currency": currency,
-				"display": f"0 USD ({currency})"
+				"display": f"$0 ({currency})"
 			},
 			"message_id": None  # Это виртуальное сообщение
 		}
@@ -2468,7 +3008,7 @@ async def cash_change_currency(cb: CallbackQuery, state: FSMContext):
 		if msg["parsed"].get("type") == "cash":
 			msg["parsed"]["currency"] = new_currency
 			amount = msg["parsed"].get("value", 0)
-			msg["parsed"]["display"] = f"{amount} {new_currency}"
+			msg["parsed"]["display"] = f"{amount}"
 			break
 	
 	# Обновляем данные в state
@@ -2563,6 +3103,44 @@ async def cash_edit_back(cb: CallbackQuery, state: FSMContext):
 		message_text,
 		reply_markup=multi_forward_select_kb(crypto_data, cash_data, card_data)
 	)
+	await cb.answer()
+
+
+@admin_router.callback_query(
+	F.data.startswith("multi:select:group:"),
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+)
+async def multi_select_group(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора группы карт - показывает карты из выбранной группы"""
+	db = get_db()
+	# Формат: multi:select:group:{group_id} или multi:select:group:0 для карт без группы
+	group_id_str = cb.data.split(":")[-1]
+	group_id = int(group_id_str) if group_id_str != "0" else None
+	
+	if group_id:
+		# Получаем карты из группы
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		text = f"Карты из группы '{group_name}':"
+	else:
+		# Получаем карты без группы
+		cards = await db.get_cards_without_group()
+		text = "Карты без группы:"
+	
+	if not cards:
+		await cb.answer("В этой группе нет карт" if group_id else "Нет карт без группы", show_alert=True)
+		return
+	
+	# Создаем клавиатуру с картами
+	from aiogram.utils.keyboard import InlineKeyboardBuilder
+	kb = InlineKeyboardBuilder()
+	for card_id, card_name, _ in cards:
+		kb.button(text=f"💳 {card_name}", callback_data=f"multi:select_card:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data="multi:select:card")
+	kb.adjust(1)
+	
+	await cb.message.edit_text(text, reply_markup=kb.as_markup())
 	await cb.answer()
 
 

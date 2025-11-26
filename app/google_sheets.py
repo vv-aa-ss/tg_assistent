@@ -9,6 +9,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 import aiohttp
 
+from app.di import get_db
+
 logger = logging.getLogger("app.google_sheets")
 
 
@@ -320,74 +322,49 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 		return start_row
 
 
-def get_card_column(card_name: str, user_name: str) -> Optional[str]:
+async def get_card_column(card_name: str, user_name: Optional[str] = None) -> Optional[str]:
 	"""
-	Определяет столбец для записи суммы RUB на основе карты и имени пользователя.
+	Определяет столбец для записи суммы RUB на основе карты.
+	Использует базу данных для поиска соответствия.
 	Возвращает букву столбца или None, если не найдено соответствие.
 	
-	Приоритет: сначала пытается извлечь информацию о пользователе из названия карты,
-	если там есть скобки с именем (например, "ТИНЕК (Артём С)"), 
-	иначе использует переданный user_name.
+	Args:
+		card_name: Название карты
+		user_name: Имя пользователя (не используется, оставлено для обратной совместимости)
+	
+	Returns:
+		Адрес столбца или None, если не найдено
 	"""
-	# Нормализуем имена для сравнения
-	card_upper = card_name.upper() if card_name else ""
-	user_upper = user_name.upper() if user_name else ""
+	if not card_name:
+		logger.warning(f"❌ get_card_column: card_name пустое")
+		return None
 	
-	# Пытаемся извлечь имя пользователя из названия карты (если есть скобки)
-	# Например: "ТИНЕК  (Артём С)" -> "Артём С"
-	extracted_user_name = None
-	if card_name:
-		# Ищем паттерн: название карты, затем скобки с именем
-		# Паттерн: любое количество пробелов, открывающая скобка, имя с инициалом, закрывающая скобка
-		match = re.search(r'\(([А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z]\.?)\)', card_name)
-		if match:
-			extracted_user_name = match.group(1)
-			logger.debug(f"🔍 Извлечено имя из названия карты: '{extracted_user_name}'")
+	logger.debug(f"🔍 get_card_column: card_name='{card_name}'")
 	
-	# Используем извлеченное имя из карты, если оно есть, иначе используем переданное user_name
-	final_user_name = extracted_user_name if extracted_user_name else user_name
-	final_user_upper = final_user_name.upper() if final_user_name else ""
+	# Получаем базу данных
+	db = get_db()
 	
-	logger.debug(f"🔍 get_card_column: card_name='{card_name}', user_name='{user_name}' -> final_user_name='{final_user_name}' (card_upper='{card_upper}', final_user_upper='{final_user_upper}')")
+	# Ищем карту по названию в базе данных
+	cards = await db.list_cards()
+	card_id = None
+	for card in cards:
+		# Проверяем точное совпадение или частичное (если название карты содержится в card_name)
+		if card[1].upper() in card_name.upper() or card_name.upper() in card[1].upper():
+			card_id = card[0]
+			logger.debug(f"✅ Найдена карта в БД: id={card_id}, name='{card[1]}'")
+			break
 	
-	# Проверяем наличие имени и инициала
-	has_artem = "АРТЕМ" in final_user_upper or "АРТЁМ" in final_user_upper
-	has_evgeniy = "ЕВГЕНИЙ" in final_user_upper
+	if not card_id:
+		logger.warning(f"❌ get_card_column: карта '{card_name}' не найдена в базе данных")
+		return None
 	
-	# Проверяем инициалы как отдельные слова (после пробела или в конце строки)
-	# Используем регулярные выражения для точной проверки
-	# Паттерн: пробел + инициал + опциональная точка + конец строки или пробел
-	v_match = re.search(r'\sВ\.?$|\sВ\.?\s', final_user_upper)
-	s_match = re.search(r'\sС\.?$|\sС\.?\s', final_user_upper)
-	r_match = re.search(r'\sР\.?$|\sР\.?\s', final_user_upper)
+	# Получаем адрес столбца для карты
+	column = await db.get_card_column(card_id)
+	if column:
+		logger.info(f"✅ Найден адрес столбца: card_id={card_id}, card_name='{card_name}' -> column='{column}'")
+		return column
 	
-	has_v = bool(v_match) and not bool(s_match)
-	has_s = bool(s_match) and not bool(v_match)
-	has_r = bool(r_match) and not bool(s_match) and not bool(v_match)
-	
-	logger.debug(f"🔍 Проверка инициалов: has_artem={has_artem}, has_evgeniy={has_evgeniy}, has_v={has_v}, has_s={has_s}, has_r={has_r} (v_match={bool(v_match)}, s_match={bool(s_match)}, r_match={bool(r_match)})")
-	
-	# ТИНЕК (Артём В) - столбец E
-	if "ТИНЕК" in card_upper and has_artem and has_v:
-		logger.info(f"✅ Найдено соответствие: ТИНЕК (Артём В) -> столбец E")
-		return "E"
-	
-	# СБЕР (Евгений Р) - столбец B
-	if "СБЕР" in card_upper and has_evgeniy and has_r:
-		logger.info(f"✅ Найдено соответствие: СБЕР (Евгений Р) -> столбец B")
-		return "B"
-	
-	# ТИНЕК (Артем С) - столбец C
-	if "ТИНЕК" in card_upper and has_artem and has_s:
-		logger.info(f"✅ Найдено соответствие: ТИНЕК (Артем С) -> столбец C")
-		return "C"
-	
-	# СБЕР (Артём С) - столбец D
-	if "СБЕР" in card_upper and has_artem and has_s:
-		logger.info(f"✅ Найдено соответствие: СБЕР (Артём С) -> столбец D")
-		return "D"
-	
-	logger.warning(f"❌ Не найдено соответствие для карты '{card_name}' и пользователя '{final_user_name}' (card_upper='{card_upper}', final_user_upper='{final_user_upper}')")
+	logger.warning(f"❌ get_card_column: не найден адрес столбца для card_id={card_id}, card_name='{card_name}'")
 	return None
 
 
@@ -398,7 +375,10 @@ def _write_to_google_sheet_sync(
 	cash_data: Optional[Dict],
 	card_data: Optional[Dict],
 	btc_price: Optional[float],
-	ltc_price: Optional[float]
+	ltc_price: Optional[float],
+	btc_column: Optional[str] = None,
+	ltc_column: Optional[str] = None,
+	usdt_column: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных в Google Sheet.
@@ -455,14 +435,20 @@ def _write_to_google_sheet_sync(
 			if usd_amount > 0:
 				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
 				
-				if crypto_currency == "BTC":
-					# Записываем USD в столбец AS (метод update требует список списков)
-					worksheet.update(f"AS{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AS{empty_row} (BTC)")
-				elif crypto_currency == "LTC":
-					# Записываем USD в столбец AY (метод update требует список списков)
-					worksheet.update(f"AY{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AY{empty_row} (LTC)")
+				if crypto_currency == "BTC" and btc_column:
+					# Записываем USD в столбец из базы данных (метод update требует список списков)
+					worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
+				elif crypto_currency == "LTC" and ltc_column:
+					# Записываем USD в столбец из базы данных (метод update требует список списков)
+					worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
+				elif crypto_currency == "USDT" and usdt_column:
+					# Записываем USD в столбец из базы данных (метод update требует список списков)
+					worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
+				elif crypto_currency in ["BTC", "LTC", "USDT"]:
+					logger.warning(f"⚠️ Не найден адрес столбца для криптовалюты {crypto_currency}")
 			else:
 				logger.warning(f"⚠️ USD сумма не указана для криптовалюты {crypto_currency}")
 		
@@ -473,8 +459,8 @@ def _write_to_google_sheet_sync(
 			card_name = card_data.get("card_name", "")
 			user_name = card_data.get("user_name", "")
 			
-			# Определяем столбец для записи
-			column = get_card_column(card_name, user_name)
+			# Получаем адрес столбца из параметра (вычислен заранее в асинхронной функции)
+			column = card_data.get("column")
 			if column:
 				# Метод update требует список списков
 				worksheet.update(f"{column}{empty_row}", [[cash_amount]])
@@ -520,6 +506,33 @@ async def write_to_google_sheet(
 			elif crypto_currency == "LTC":
 				ltc_price = await get_ltc_price_usd()
 		
+		# Вычисляем адрес столбца для наличных, если есть карта
+		if cash_data and card_data:
+			card_name = card_data.get("card_name", "")
+			user_name = card_data.get("user_name", "")
+			column = await get_card_column(card_name, user_name)
+			if column:
+				# Добавляем адрес столбца в данные карты
+				card_data = card_data.copy()
+				card_data["column"] = column
+				logger.debug(f"✅ Адрес столбца вычислен: card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
+			else:
+				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_name='{card_name}', user_name='{user_name}'")
+		
+		# Получаем адреса столбцов для криптовалют из базы данных
+		btc_column = None
+		ltc_column = None
+		usdt_column = None
+		if crypto_data:
+			db = get_db()
+			crypto_currency = crypto_data.get("currency")
+			if crypto_currency == "BTC":
+				btc_column = await db.get_crypto_column("BTC")
+			elif crypto_currency == "LTC":
+				ltc_column = await db.get_crypto_column("LTC")
+			elif crypto_currency == "USDT":
+				usdt_column = await db.get_crypto_column("USDT")
+		
 		# Выполняем синхронную запись в отдельном потоке
 		return await asyncio.to_thread(
 			_write_to_google_sheet_sync,
@@ -529,30 +542,38 @@ async def write_to_google_sheet(
 			cash_data,
 			card_data,
 			btc_price,
-			ltc_price
+			ltc_price,
+			btc_column,
+			ltc_column,
+			usdt_column
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи в Google Sheet: {e}")
 		return {"success": False, "usd_amount": None}
 
 
-def get_xmr_column(xmr_number: int) -> str:
+async def get_xmr_column(xmr_number: int) -> Optional[str]:
 	"""
-	Определяет столбец для записи USD по номеру XMR.
+	Определяет столбец для записи USD по номеру XMR из базы данных.
 	
 	Args:
 		xmr_number: Номер XMR (1, 2 или 3)
 	
 	Returns:
-		Буква столбца (AU, AV, AW в зависимости от номера)
+		Буква столбца (AU, AV, AW в зависимости от номера) или None, если не найдено
 	"""
-	# Столбцы для USD при выборе XMR-1, XMR-2, XMR-3
-	xmr_columns = {
+	db = get_db()
+	crypto_type = f"XMR-{xmr_number}"
+	column = await db.get_crypto_column(crypto_type)
+	if column:
+		return column
+	# Fallback на старые значения, если не найдено в базе
+	fallback_columns = {
 		1: "AU",  # XMR-1 → USD в столбец AU
 		2: "AV",  # XMR-2 → USD в столбец AV
 		3: "AW"   # XMR-3 → USD в столбец AW
 	}
-	return xmr_columns.get(xmr_number, "AU")  # По умолчанию AU
+	return fallback_columns.get(xmr_number, "AU")  # По умолчанию AU
 
 
 async def write_xmr_to_google_sheet(
@@ -580,8 +601,24 @@ async def write_xmr_to_google_sheet(
 	"""
 	try:
 		# Теперь курс XMR не нужен, так как пользователь вводит USD напрямую
-		# Определяем столбец для записи USD
-		usd_column = get_xmr_column(xmr_number)
+		# Определяем столбец для записи USD из базы данных
+		usd_column = await get_xmr_column(xmr_number)
+		if not usd_column:
+			logger.warning(f"⚠️ Не найден адрес столбца для XMR-{xmr_number}")
+			return {"success": False, "usd_amount": None}
+		
+		# Вычисляем адрес столбца для наличных, если есть карта
+		if cash_data and card_data:
+			card_name = card_data.get("card_name", "")
+			user_name = card_data.get("user_name", "")
+			column = await get_card_column(card_name, user_name)
+			if column:
+				# Добавляем адрес столбца в данные карты
+				card_data = card_data.copy()
+				card_data["column"] = column
+				logger.debug(f"✅ Адрес столбца вычислен: card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
+			else:
+				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_name='{card_name}', user_name='{user_name}'")
 		
 		# Выполняем синхронную запись в отдельном потоке
 		# Передаем None для xmr_price, так как он больше не используется
@@ -671,8 +708,8 @@ def _write_xmr_to_google_sheet_sync(
 			card_name = card_data.get("card_name", "")
 			user_name = card_data.get("user_name", "")
 			
-			# Определяем столбец для записи
-			column = get_card_column(card_name, user_name)
+			# Получаем адрес столбца из параметра (вычислен заранее в асинхронной функции)
+			column = card_data.get("column")
 			if column:
 				# Метод update требует список списков
 				worksheet.update(f"{column}{empty_row}", [[cash_amount]])

@@ -1,6 +1,7 @@
 import aiosqlite
 import os
 import time
+import re
 from typing import Optional, Tuple, List, Dict, Any
 import logging
 
@@ -70,6 +71,11 @@ class Database:
 		await self._ensure_user_card_multi_bind()
 		await self._ensure_users_last_interaction()
 		await self._ensure_card_delivery_log()
+		await self._ensure_card_columns()
+		await self._migrate_card_columns()
+		await self._ensure_crypto_columns()
+		await self._migrate_crypto_columns()
+		await self._ensure_card_groups()
 		await self._db.commit()
 
 	async def _ensure_cards_user_message(self) -> None:
@@ -135,10 +141,160 @@ class Database:
 			await self._db.execute(
 				"CREATE INDEX IF NOT EXISTS idx_card_delivery_user ON card_delivery_log(user_id)"
 			)
+		await self._db.execute(
+			"CREATE INDEX IF NOT EXISTS idx_card_delivery_time ON card_delivery_log(delivered_at)"
+		)
+		_logger.debug("Created table card_delivery_log")
+
+	async def _ensure_card_columns(self) -> None:
+		"""Создает таблицу card_columns для хранения адресов столбцов карт"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='card_columns'"
+		)
+		if not await cur.fetchone():
 			await self._db.execute(
-				"CREATE INDEX IF NOT EXISTS idx_card_delivery_time ON card_delivery_log(delivered_at)"
+				"""
+				CREATE TABLE card_columns (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					card_id INTEGER NOT NULL UNIQUE,
+					column TEXT NOT NULL,
+					FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+				)
+				"""
 			)
-			_logger.debug("Created table card_delivery_log")
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_columns_card_id ON card_columns(card_id)"
+			)
+			_logger.debug("Created table card_columns")
+		else:
+			# Миграция: если таблица существует, проверяем наличие user_name_pattern
+			cur = await self._db.execute("PRAGMA table_info(card_columns)")
+			cols = [r[1] for r in await cur.fetchall()]
+			if "user_name_pattern" in cols:
+				# Создаем новую таблицу без user_name_pattern
+				await self._db.execute(
+					"""
+					CREATE TABLE IF NOT EXISTS card_columns_new (
+						id INTEGER PRIMARY KEY AUTOINCREMENT,
+						card_id INTEGER NOT NULL UNIQUE,
+						column TEXT NOT NULL,
+						FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+					)
+					"""
+				)
+				# Переносим данные: берем первую запись для каждой карты (если есть дубликаты)
+				await self._db.execute(
+					"""
+					INSERT INTO card_columns_new (card_id, column)
+					SELECT card_id, MIN(column) as column
+					FROM card_columns
+					GROUP BY card_id
+					"""
+				)
+				# Удаляем старую таблицу и переименовываем новую
+				await self._db.execute("DROP TABLE card_columns")
+				await self._db.execute("ALTER TABLE card_columns_new RENAME TO card_columns")
+				await self._db.execute(
+					"CREATE INDEX IF NOT EXISTS idx_card_columns_card_id ON card_columns(card_id)"
+				)
+				_logger.debug("Migrated card_columns table: removed user_name_pattern")
+
+	async def _migrate_card_columns(self) -> None:
+		"""Миграция старых данных: добавляет адреса столбцов для существующих карт (устаревший метод, оставлен для совместимости)"""
+		# Миграция больше не нужна, так как структура таблицы упрощена
+		pass
+
+	async def _ensure_crypto_columns(self) -> None:
+		"""Создает таблицу crypto_columns для хранения адресов столбцов криптовалют"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='crypto_columns'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE crypto_columns (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					crypto_type TEXT NOT NULL UNIQUE,
+					column TEXT NOT NULL
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_crypto_columns_type ON crypto_columns(crypto_type)"
+			)
+			_logger.debug("Created table crypto_columns")
+
+	async def _migrate_crypto_columns(self) -> None:
+		"""Миграция старых данных: добавляет адреса столбцов для криптовалют"""
+		assert self._db
+		# Проверяем, есть ли уже данные в таблице
+		cur = await self._db.execute("SELECT COUNT(*) FROM crypto_columns")
+		count = (await cur.fetchone())[0]
+		if count > 0:
+			_logger.debug(f"Таблица crypto_columns уже содержит {count} записей, пропускаем миграцию")
+			return
+		
+		# Миграция старых данных на основе захардкоженных правил
+		# BTC → AS
+		# LTC → AY
+		# XMR-1 → AU
+		# XMR-2 → AV
+		# XMR-3 → AW
+		# USDT → (пока не используется, но добавим для будущего использования)
+		
+		default_columns = {
+			"BTC": "AS",
+			"LTC": "AY",
+			"XMR-1": "AU",
+			"XMR-2": "AV",
+			"XMR-3": "AW",
+			"USDT": "AX"  # Предполагаемый адрес для USDT
+		}
+		
+		migrated = 0
+		for crypto_type, column in default_columns.items():
+			await self.set_crypto_column(crypto_type, column)
+			migrated += 1
+			_logger.info(f"✅ Мигрирован адрес столбца: crypto_type='{crypto_type}', column='{column}'")
+		
+		if migrated > 0:
+			_logger.info(f"✅ Миграция криптовалют завершена: добавлено {migrated} адресов столбцов")
+		else:
+			_logger.debug("Миграция криптовалют не добавила новых записей")
+
+	async def _ensure_card_groups(self) -> None:
+		"""Создает таблицы для группировки карт"""
+		assert self._db
+		# Создаем таблицу групп
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='card_groups'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE card_groups (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					name TEXT NOT NULL UNIQUE,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_groups_name ON card_groups(name)"
+			)
+			_logger.debug("Created table card_groups")
+		
+		# Добавляем поле group_id в таблицу cards, если его нет
+		cur = await self._db.execute("PRAGMA table_info(cards)")
+		cols = [r[1] for r in await cur.fetchall()]
+		if "group_id" not in cols:
+			await self._db.execute("ALTER TABLE cards ADD COLUMN group_id INTEGER")
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_cards_group_id ON cards(group_id)"
+			)
+			_logger.debug("Added group_id column to cards table")
 
 	async def close(self) -> None:
 		if self._db is not None:
@@ -650,7 +806,7 @@ class Database:
 
 	async def get_card_by_id(self, card_id: int) -> Optional[Dict[str, Any]]:
 		assert self._db
-		cur = await self._db.execute("SELECT id, name, details, user_message FROM cards WHERE id = ?", (card_id,))
+		cur = await self._db.execute("SELECT id, name, details, user_message, group_id FROM cards WHERE id = ?", (card_id,))
 		row = await cur.fetchone()
 		if not row:
 			return None
@@ -659,6 +815,7 @@ class Database:
 			"name": row[1],
 			"details": row[2],
 			"user_message": row[3],
+			"group_id": row[4] if len(row) > 4 else None,
 		}
 
 	async def delete_user(self, user_id: int) -> None:
@@ -668,3 +825,303 @@ class Database:
 		await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
 		await self._db.commit()
 		_logger.debug(f"User deleted: id={user_id}")
+
+	async def get_card_column(self, card_id: int, user_name: Optional[str] = None) -> Optional[str]:
+		"""
+		Получает адрес столбца для карты.
+		
+		Args:
+			card_id: ID карты
+			user_name: Имя пользователя (не используется, оставлено для обратной совместимости)
+		
+		Returns:
+			Адрес столбца (например, "E", "B", "C", "D", "G") или None, если не найдено
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT column FROM card_columns WHERE card_id = ?",
+			(card_id,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.debug(f"✅ Найден адрес столбца: card_id={card_id} -> column='{row[0]}'")
+			return row[0]
+		
+		_logger.debug(f"❌ Не найден адрес столбца для card_id={card_id}")
+		return None
+
+	async def set_card_column(self, card_id: int, column: str, user_name_pattern: Optional[str] = None) -> int:
+		"""
+		Устанавливает адрес столбца для карты.
+		
+		Args:
+			card_id: ID карты
+			column: Адрес столбца (например, "E", "B", "C", "D", "G")
+			user_name_pattern: Паттерн имени пользователя (не используется, оставлено для обратной совместимости)
+		
+		Returns:
+			ID созданной или обновленной записи
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"INSERT OR REPLACE INTO card_columns(card_id, column) VALUES(?, ?)",
+			(card_id, column)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card column set: card_id={card_id}, column='{column}'")
+		return cur.lastrowid
+
+	async def list_card_columns(self, card_id: Optional[int] = None) -> List[Dict[str, Any]]:
+		"""
+		Получает список адресов столбцов для карт.
+		
+		Args:
+			card_id: Опциональный ID карты для фильтрации
+		
+		Returns:
+			Список словарей с полями: id, card_id, card_name, column
+		"""
+		assert self._db
+		if card_id is not None:
+			query = """
+				SELECT cc.id, cc.card_id, c.name, cc.column
+				FROM card_columns cc
+				JOIN cards c ON c.id = cc.card_id
+				WHERE cc.card_id = ?
+				ORDER BY cc.id
+			"""
+			cur = await self._db.execute(query, (card_id,))
+		else:
+			query = """
+				SELECT cc.id, cc.card_id, c.name, cc.column
+				FROM card_columns cc
+				JOIN cards c ON c.id = cc.card_id
+				ORDER BY cc.card_id, cc.id
+			"""
+			cur = await self._db.execute(query)
+		
+		rows = await cur.fetchall()
+		return [
+			{
+				"id": row[0],
+				"card_id": row[1],
+				"card_name": row[2],
+				"column": row[3],
+			}
+			for row in rows
+		]
+
+	async def delete_card_column(self, column_id: int) -> None:
+		"""
+		Удаляет адрес столбца по ID.
+		
+		Args:
+			column_id: ID записи в таблице card_columns
+		"""
+		assert self._db
+		await self._db.execute("DELETE FROM card_columns WHERE id = ?", (column_id,))
+		await self._db.commit()
+		_logger.debug(f"Card column deleted: id={column_id}")
+
+	async def get_crypto_column(self, crypto_type: str) -> Optional[str]:
+		"""
+		Получает адрес столбца для криптовалюты.
+		
+		Args:
+			crypto_type: Тип криптовалюты (BTC, LTC, XMR-1, XMR-2, XMR-3, USDT)
+		
+		Returns:
+			Адрес столбца (например, "AS", "AY", "AU") или None, если не найдено
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT column FROM crypto_columns WHERE crypto_type = ?",
+			(crypto_type,)
+		)
+		row = await cur.fetchone()
+		if row:
+			_logger.debug(f"✅ Найден адрес столбца: crypto_type='{crypto_type}' -> column='{row[0]}'")
+			return row[0]
+		_logger.debug(f"❌ Не найден адрес столбца для crypto_type='{crypto_type}'")
+		return None
+
+	async def set_crypto_column(self, crypto_type: str, column: str) -> int:
+		"""
+		Устанавливает адрес столбца для криптовалюты.
+		
+		Args:
+			crypto_type: Тип криптовалюты (BTC, LTC, XMR-1, XMR-2, XMR-3, USDT)
+			column: Адрес столбца (например, "AS", "AY", "AU")
+		
+		Returns:
+			ID созданной или обновленной записи
+		"""
+		assert self._db
+		# Используем INSERT OR REPLACE для обновления существующей записи
+		cur = await self._db.execute(
+			"INSERT OR REPLACE INTO crypto_columns (crypto_type, column) VALUES (?, ?)",
+			(crypto_type, column)
+		)
+		await self._db.commit()
+		_logger.debug(f"Crypto column set: crypto_type='{crypto_type}', column='{column}'")
+		return cur.lastrowid
+
+	async def list_crypto_columns(self) -> List[Dict[str, Any]]:
+		"""
+		Получает список всех адресов столбцов криптовалют.
+		
+		Returns:
+			Список словарей с ключами: crypto_type, column
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT crypto_type, column FROM crypto_columns ORDER BY crypto_type"
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"crypto_type": row[0],
+				"column": row[1],
+			}
+			for row in rows
+		]
+
+	async def delete_crypto_column(self, crypto_type: str) -> None:
+		"""
+		Удаляет адрес столбца для криптовалюты.
+		
+		Args:
+			crypto_type: Тип криптовалюты (BTC, LTC, XMR-1, XMR-2, XMR-3, USDT)
+		"""
+		assert self._db
+		await self._db.execute("DELETE FROM crypto_columns WHERE crypto_type = ?", (crypto_type,))
+		await self._db.commit()
+		_logger.debug(f"Crypto column deleted: crypto_type='{crypto_type}'")
+
+	async def add_card_group(self, name: str) -> int:
+		"""
+		Создает новую группу карт.
+		
+		Args:
+			name: Название группы
+		
+		Returns:
+			ID созданной группы
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"INSERT INTO card_groups(name) VALUES(?)",
+			(name,)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card group added: id={cur.lastrowid} name={name!r}")
+		return cur.lastrowid
+
+	async def list_card_groups(self) -> List[Dict[str, Any]]:
+		"""
+		Получает список всех групп карт.
+		
+		Returns:
+			Список словарей с ключами: id, name, created_at
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, name, created_at FROM card_groups ORDER BY name"
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"id": row[0],
+				"name": row[1],
+				"created_at": row[2],
+			}
+			for row in rows
+		]
+
+	async def get_card_group(self, group_id: int) -> Optional[Dict[str, Any]]:
+		"""
+		Получает информацию о группе карт по ID.
+		
+		Args:
+			group_id: ID группы
+		
+		Returns:
+			Словарь с информацией о группе или None, если не найдено
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, name, created_at FROM card_groups WHERE id = ?",
+			(group_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"id": row[0],
+			"name": row[1],
+			"created_at": row[2],
+		}
+
+	async def set_card_group(self, card_id: int, group_id: Optional[int]) -> None:
+		"""
+		Привязывает карту к группе.
+		
+		Args:
+			card_id: ID карты
+			group_id: ID группы (None для удаления привязки)
+		"""
+		assert self._db
+		await self._db.execute(
+			"UPDATE cards SET group_id = ? WHERE id = ?",
+			(group_id, card_id)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card {card_id} set to group {group_id}")
+
+	async def delete_card_group(self, group_id: int) -> None:
+		"""
+		Удаляет группу карт (привязки карт к группе удаляются автоматически).
+		
+		Args:
+			group_id: ID группы
+		"""
+		assert self._db
+		# Сначала удаляем привязки карт к группе
+		await self._db.execute(
+			"UPDATE cards SET group_id = NULL WHERE group_id = ?",
+			(group_id,)
+		)
+		# Затем удаляем саму группу
+		await self._db.execute("DELETE FROM card_groups WHERE id = ?", (group_id,))
+		await self._db.commit()
+		_logger.debug(f"Card group deleted: id={group_id}")
+
+	async def get_cards_by_group(self, group_id: int) -> List[Tuple[int, str, str]]:
+		"""
+		Получает список карт в группе.
+		
+		Args:
+			group_id: ID группы
+		
+		Returns:
+			Список кортежей (id, name, details)
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, name, details FROM cards WHERE group_id = ? ORDER BY name",
+			(group_id,)
+		)
+		return await cur.fetchall()
+
+	async def get_cards_without_group(self) -> List[Tuple[int, str, str]]:
+		"""
+		Получает список карт без группы.
+		
+		Returns:
+			Список кортежей (id, name, details)
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, name, details FROM cards WHERE group_id IS NULL ORDER BY name"
+		)
+		return await cur.fetchall()

@@ -1,3 +1,4 @@
+
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -14,12 +15,34 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 
 def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
+	# Добавляем все кнопки карт
 	for cid, name in cards:
 		kb.button(text=f"💳 {name}", callback_data=f"card:view:{cid}")
+	
+	# Добавляем остальные кнопки
 	if with_add:
 		kb.button(text="➕ Добавить карту", callback_data="card:add")
+	kb.button(text="₿ Крипта", callback_data="admin:crypto")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
-	kb.adjust(1)
+	
+	# Формируем параметры для adjust: карты по 2 в ряд, остальные по 1
+	# Количество дополнительных кнопок
+	additional_buttons = 2  # Крипта и Назад
+	if with_add:
+		additional_buttons += 1  # Добавить карту
+	
+	if len(cards) > 0:
+		# Для карт: по 2 в ряд
+		adjust_params = [2] * (len(cards) // 2)
+		if len(cards) % 2 == 1:
+			adjust_params.append(1)  # Последняя карта одна, если нечетное количество
+		# Для остальных кнопок: по 1 в ряд
+		adjust_params.extend([1] * additional_buttons)
+		kb.adjust(*adjust_params)
+	else:
+		# Если карт нет, все кнопки по одной
+		kb.adjust(1)
+	
 	return kb.as_markup()
 
 
@@ -74,6 +97,26 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
+def card_groups_select_kb(groups: List[Dict], back_to: str = "multi:back_to_main") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора группы карт в контексте /add.
+	
+	Args:
+		groups: Список словарей с информацией о группах
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for group in groups:
+		group_name = group.get("name", "")
+		group_id = group.get("id")
+		kb.button(text=f"📁 {group_name}", callback_data=f"multi:select:group:{group_id}")
+	# Добавляем кнопку для карт без группы
+	kb.button(text="📋 Без группы", callback_data="multi:select:group:0")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
 def user_card_select_kb(
 	cards: List[Tuple[int, str]],
 	user_id: int,
@@ -102,7 +145,67 @@ def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboard
 def card_action_kb(card_id: int, back_to: str = "admin:cards") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="✏️ Изменить сообщение", callback_data=f"card:edit:{card_id}")
+	kb.button(text="🔗 Привязать ячейку", callback_data=f"card:bind_column:{card_id}")
+	kb.button(text="📁 Группы", callback_data=f"card:groups:{card_id}")
 	kb.button(text="🗑️ Удалить карту", callback_data=f"card:delete:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def card_groups_list_kb(groups: List[Dict], card_id: int, back_to: str = "admin:cards") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для списка групп карт.
+	
+	Args:
+		groups: Список словарей с информацией о группах
+		card_id: ID карты
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for group in groups:
+		group_name = group.get("name", "")
+		group_id = group.get("id")
+		kb.button(text=f"📁 {group_name}", callback_data=f"card:select_group:{card_id}:{group_id}")
+	kb.button(text="➕ Новая группа", callback_data=f"card:new_group:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data=f"card:view:{card_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def crypto_list_kb(crypto_columns: List[Dict], back_to: str = "admin:cards") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для списка криптовалют с их адресами столбцов.
+	
+	Args:
+		crypto_columns: Список словарей с ключами crypto_type и column
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for crypto in crypto_columns:
+		crypto_type = crypto.get("crypto_type", "")
+		column = crypto.get("column", "")
+		kb.button(text=f"{crypto_type} → {column}", callback_data=f"crypto:edit:{crypto_type}")
+	kb.button(text="➕ Новая", callback_data="crypto:new")
+	kb.button(text="🗑️ Удалить", callback_data="crypto:delete_list")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def crypto_delete_kb(crypto_columns: List[Dict], back_to: str = "admin:crypto") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора криптовалюты для удаления.
+	
+	Args:
+		crypto_columns: Список словарей с ключами crypto_type и column
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for crypto in crypto_columns:
+		crypto_type = crypto.get("crypto_type", "")
+		column = crypto.get("column", "")
+		kb.button(text=f"{crypto_type} → {column}", callback_data=f"crypto:delete:{crypto_type}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
 	return kb.as_markup()
@@ -274,7 +377,8 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 	"""
 	Создает клавиатуру для выбора криптовалюты.
 	Первый ряд: три кнопки в ряд (BTC, LTC, XMR)
-	Второй ряд: кнопка "Подтвердить" (если show_confirm=True) и "Назад"
+	Второй ряд: кнопка USDT
+	Третий ряд: кнопка "Подтвердить" (если show_confirm=True) и "Назад"
 	"""
 	kb = InlineKeyboardBuilder()
 	
@@ -283,6 +387,9 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 	kb.button(text="LTC", callback_data="crypto:select:LTC")
 	kb.button(text="XMR", callback_data="crypto:select:XMR")
 	
+	# Кнопка USDT под ними
+	kb.button(text="USDT", callback_data="crypto:select:USDT")
+	
 	# Кнопка "Подтвердить" (если нужно)
 	if show_confirm:
 		kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
@@ -290,9 +397,9 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 	# Кнопка "Назад"
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
-	# Первый ряд - три кнопки валют, второй ряд - подтвердить (если есть) и назад
+	# Первый ряд - три кнопки валют, второй ряд - USDT, третий ряд - подтвердить (если есть) и назад
 	if show_confirm:
-		kb.adjust(3, 1, 1)
+		kb.adjust(3, 1, 1, 1)
 	else:
-		kb.adjust(3, 1)
+		kb.adjust(3, 1, 1)
 	return kb.as_markup()
