@@ -445,29 +445,26 @@ def _write_to_google_sheet_sync(
 		logger.info(f"📍 Найдена свободная строка: {empty_row}")
 		
 		# Обрабатываем криптовалюту (BTC или LTC)
+		# Теперь пользователь вводит USD напрямую, не нужно вычислять
 		usd_amount_rounded = None
 		if crypto_data:
 			crypto_currency = crypto_data.get("currency")
-			crypto_amount = crypto_data.get("value", 0.0)
+			# Получаем USD напрямую из данных (пользователь ввел USD)
+			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
-			if crypto_currency == "BTC":
-				if btc_price:
-					usd_amount = crypto_amount * btc_price
-					usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
+			if usd_amount > 0:
+				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
+				
+				if crypto_currency == "BTC":
 					# Записываем USD в столбец AS (метод update требует список списков)
 					worksheet.update(f"AS{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AS{empty_row} (BTC: {crypto_amount}, курс: {btc_price})")
-				else:
-					logger.warning(f"⚠️ Не удалось получить курс BTC, пропускаем запись криптовалюты. BTC количество: {crypto_amount}")
-			elif crypto_currency == "LTC":
-				if ltc_price:
-					usd_amount = crypto_amount * ltc_price
-					usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AS{empty_row} (BTC)")
+				elif crypto_currency == "LTC":
 					# Записываем USD в столбец AY (метод update требует список списков)
 					worksheet.update(f"AY{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AY{empty_row} (LTC: {crypto_amount}, курс: {ltc_price})")
-				else:
-					logger.warning(f"⚠️ Не удалось получить курс LTC, пропускаем запись криптовалюты. LTC количество: {crypto_amount}")
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку AY{empty_row} (LTC)")
+			else:
+				logger.warning(f"⚠️ USD сумма не указана для криптовалюты {crypto_currency}")
 		
 		# Обрабатываем наличные (RUB, BYN и другие валюты)
 		if cash_data and card_data:
@@ -582,13 +579,12 @@ async def write_xmr_to_google_sheet(
 		Словарь с результатами: {"success": bool, "usd_amount": int | None}
 	"""
 	try:
-		# Получаем курс XMR
-		xmr_price = await get_xmr_price_usd()
-		
+		# Теперь курс XMR не нужен, так как пользователь вводит USD напрямую
 		# Определяем столбец для записи USD
 		usd_column = get_xmr_column(xmr_number)
 		
 		# Выполняем синхронную запись в отдельном потоке
+		# Передаем None для xmr_price, так как он больше не используется
 		return await asyncio.to_thread(
 			_write_xmr_to_google_sheet_sync,
 			sheet_id,
@@ -598,7 +594,7 @@ async def write_xmr_to_google_sheet(
 			card_data,
 			xmr_number,
 			usd_column,
-			xmr_price
+			None  # xmr_price больше не нужен
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи XMR в Google Sheet: {e}")
@@ -613,7 +609,7 @@ def _write_xmr_to_google_sheet_sync(
 	card_data: Optional[Dict],
 	xmr_number: int,
 	usd_column: str,
-	xmr_price: Optional[float]
+	xmr_price: Optional[float]  # Оставлено для обратной совместимости, но не используется
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных XMR в Google Sheet.
@@ -654,19 +650,19 @@ def _write_xmr_to_google_sheet_sync(
 		empty_row = _find_empty_row_in_column(worksheet, "BC", start_row=5)
 		logger.info(f"📍 Найдена свободная строка: {empty_row}")
 		
-		# Обрабатываем XMR: конвертируем в USD и записываем в соответствующий столбец
+		# Обрабатываем XMR: записываем USD напрямую (пользователь ввел USD)
 		usd_amount_rounded = None
 		if crypto_data and crypto_data.get("currency") == "XMR":
-			xmr_amount = crypto_data.get("value", 0.0)
+			# Получаем USD напрямую из данных (пользователь ввел USD)
+			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
-			if xmr_price:
-				usd_amount = xmr_amount * xmr_price
+			if usd_amount > 0:
 				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
 				# Записываем USD в соответствующий столбец (метод update требует список списков)
 				worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number}: {xmr_amount} XMR, курс: {xmr_price})")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
 			else:
-				logger.warning(f"⚠️ Не удалось получить курс XMR, пропускаем запись криптовалюты. XMR количество: {xmr_amount}")
+				logger.warning(f"⚠️ USD сумма не указана для XMR-{xmr_number}")
 		
 		# Обрабатываем наличные (RUB, BYN и другие валюты)
 		if cash_data and card_data:

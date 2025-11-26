@@ -151,23 +151,23 @@ def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, ca
 	# Кнопка 1: Криптовалюта
 	if crypto_data:
 		display = crypto_data.get("display", "Криптовалюта")
-		kb.button(text=f"₿ {display}", callback_data="multi:select:crypto")
+		kb.button(text=f"🪙 {display}", callback_data="multi:select:crypto")
 	else:
-		kb.button(text="₿ Не указано", callback_data="multi:select:crypto")
+		kb.button(text="🪙", callback_data="multi:select:crypto")
 	
 	# Кнопка 2: Наличные
 	if cash_data:
 		display = cash_data.get("display", "Наличные")
 		kb.button(text=f"💵 {display}", callback_data="multi:select:cash")
 	else:
-		kb.button(text="💵 Не указано", callback_data="multi:select:cash")
+		kb.button(text="💵", callback_data="multi:select:cash")
 	
 	# Кнопка 3: Карта
 	if card_data:
 		display = card_data.get("display", "Карта")
 		kb.button(text=f"💳 {display}", callback_data="multi:select:card")
 	else:
-		kb.button(text="💳 Не указано", callback_data="multi:select:card")
+		kb.button(text="💳", callback_data="multi:select:card")
 	
 	# Если криптовалюта XMR, добавляем кнопки XMR-1, XMR-2, XMR-3
 	if crypto_data and crypto_data.get("currency") == "XMR":
@@ -231,7 +231,7 @@ def crypto_edit_kb(current_currency: str, amount: float) -> InlineKeyboardMarkup
 	for currency in other_currencies[:2]:  # Берем первые две
 		kb.button(text=currency, callback_data=f"crypto:change_type:{currency}")
 	
-	# Кнопка "Количество"
+	# Кнопка "Количество" (теперь пользователь вводит USD)
 	kb.button(text="Количество", callback_data="crypto:change_amount")
 	
 	# Кнопка "Назад"
@@ -270,12 +270,11 @@ def cash_edit_kb(current_currency: str, amount: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def crypto_select_kb(back_to: str = "multi:back_to_main") -> InlineKeyboardMarkup:
+def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = True) -> InlineKeyboardMarkup:
 	"""
-	Создает клавиатуру для выбора криптовалюты, если она не распознана.
+	Создает клавиатуру для выбора криптовалюты.
 	Первый ряд: три кнопки в ряд (BTC, LTC, XMR)
-	Второй ряд: кнопка "Количество"
-	Третий ряд: кнопка "Назад"
+	Второй ряд: кнопка "Подтвердить" (если show_confirm=True) и "Назад"
 	"""
 	kb = InlineKeyboardBuilder()
 	
@@ -284,12 +283,16 @@ def crypto_select_kb(back_to: str = "multi:back_to_main") -> InlineKeyboardMarku
 	kb.button(text="LTC", callback_data="crypto:select:LTC")
 	kb.button(text="XMR", callback_data="crypto:select:XMR")
 	
-	# Кнопка "Количество"
-	kb.button(text="Количество", callback_data="crypto:select:amount")
+	# Кнопка "Подтвердить" (если нужно)
+	if show_confirm:
+		kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
 	
 	# Кнопка "Назад"
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
-	# Первый ряд - три кнопки валют, второй ряд - количество, третий - назад
-	kb.adjust(3, 1, 1)
+	# Первый ряд - три кнопки валют, второй ряд - подтвердить (если есть) и назад
+	if show_confirm:
+		kb.adjust(3, 1, 1)
+	else:
+		kb.adjust(3, 1)
 	return kb.as_markup()

@@ -3,7 +3,7 @@ import logging
 import os
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -37,6 +37,15 @@ async def main() -> None:
 
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 	dp = Dispatcher(storage=MemoryStorage())
+	
+	# Middleware для логирования всех сообщений
+	class LoggingMiddleware:
+		async def __call__(self, handler, event, data):
+			if isinstance(event, Message):
+				logger.info(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', user_id={event.from_user.id if event.from_user else None}")
+			return await handler(event, data)
+	
+	dp.message.middleware(LoggingMiddleware())
 
 	@dp.message(CommandStart())
 	async def on_start(message: Message):
@@ -50,9 +59,20 @@ async def main() -> None:
 			await message.answer("Добро пожаловать, администратор!", reply_markup=admin_menu_kb())
 		# non-admins: ignore (no reply)
 
+	# ВАЖНО: Сначала включаем admin_router, чтобы команды из него обрабатывались первыми
+	dp.include_router(admin_router)
+
 	# Регистрировать пользователя только когда нет активного состояния и сообщение не переслано
-	@dp.message(~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)), StateFilter(None))
+	# Исключаем команды - они обрабатываются отдельными обработчиками
+	# ВАЖНО: Фильтр ~F.text.startswith("/") исключает команды на уровне декоратора
+	@dp.message(
+		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
+		StateFilter(None),
+		~(F.text.startswith("/") if F.text else False)
+	)
 	async def register_user_on_any_message(message: Message):
+		logger.info(f"🟡 MAIN register_user_on_any_message: message_id={message.message_id}, text='{message.text}', user_id={message.from_user.id if message.from_user else None}")
+		
 		from app.di import get_db
 		logger_msg = logging.getLogger("app.msg")
 		db_local = get_db()
@@ -65,8 +85,6 @@ async def main() -> None:
 			)
 			await db_local.touch_user_by_tg(message.from_user.id)
 		# не отвечаем
-
-	dp.include_router(admin_router)
 	logger.debug("Starting polling...")
 	try:
 		await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

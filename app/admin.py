@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, TelegramObject
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.filters import StateFilter
+from aiogram.filters import StateFilter, Command
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from typing import Any, Awaitable, Callable, Dict, List, Tuple
@@ -51,16 +51,21 @@ class AdminOnlyMiddleware(BaseMiddleware):
 		if isinstance(event, Message):
 			text = event.text or event.caption or ""
 			is_forward = bool(getattr(event, "forward_origin", None) or getattr(event, "forward_from", None))
-			logger.info(f"🔵 MIDDLEWARE: message_id={event.message_id}, is_forward={is_forward}, text='{text[:100]}', from_user={from_user.id if from_user else None}")
+			logger.info(f"🔵 MIDDLEWARE: message_id={event.message_id}, is_forward={is_forward}, text='{text[:100]}', from_user={from_user.id if from_user else None}, handler={handler.__name__ if hasattr(handler, '__name__') else 'unknown'}")
 		
 		if from_user:
 			user_id = getattr(from_user, "id", None)
 			username = getattr(from_user, "username", None)
-			if not is_admin(user_id, username, admin_ids, admin_usernames):
+			is_admin_user = is_admin(user_id, username, admin_ids, admin_usernames)
+			logger.info(f"🔵 MIDDLEWARE: Проверка админа: user_id={user_id}, username={username}, is_admin={is_admin_user}")
+			if not is_admin_user:
 				if isinstance(event, Message):
 					logger.info(f"🔵 MIDDLEWARE: Сообщение {event.message_id} от не-админа, блокируем")
 				return
-		return await handler(event, data)
+		logger.info(f"🔵 MIDDLEWARE: Пропускаем сообщение дальше к handler")
+		result = await handler(event, data)
+		logger.info(f"🔵 MIDDLEWARE: Handler вернул результат")
+		return result
 
 
 admin_router.message.middleware(AdminOnlyMiddleware())
@@ -376,39 +381,19 @@ async def format_multi_forward_message_text(crypto_data: Dict[str, Any] | None) 
 	Формирует текст сообщения "Проверка данных" с суммой в USD, если есть криптовалюта.
 	
 	Args:
-		crypto_data: Данные о криптовалюте (currency, value)
+		crypto_data: Данные о криптовалюте (currency, usd_amount или value)
 	
 	Returns:
 		Текст сообщения с суммой в USD, если есть BTC, LTC или XMR
 	"""
 	text = "📋 Проверка данных:"
 	
-	# Если есть криптовалюта, получаем курс и вычисляем USD
+	# Если есть криптовалюта, показываем USD напрямую (пользователь вводит USD)
 	if crypto_data:
-		crypto_currency = crypto_data.get("currency")
-		crypto_amount = crypto_data.get("value", 0.0)
-		
-		if crypto_currency == "BTC":
-			from app.google_sheets import get_btc_price_usd
-			price = await get_btc_price_usd()
-			if price:
-				usd_amount = crypto_amount * price
-				usd_amount_rounded = int(round(usd_amount))
-				text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
-		elif crypto_currency == "LTC":
-			from app.google_sheets import get_ltc_price_usd
-			price = await get_ltc_price_usd()
-			if price:
-				usd_amount = crypto_amount * price
-				usd_amount_rounded = int(round(usd_amount))
-				text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
-		elif crypto_currency == "XMR":
-			from app.google_sheets import get_xmr_price_usd
-			price = await get_xmr_price_usd()
-			if price:
-				usd_amount = crypto_amount * price
-				usd_amount_rounded = int(round(usd_amount))
-				text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
+		usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
+		if usd_amount > 0:
+			usd_amount_rounded = int(round(usd_amount))
+			text += f"\n\n⬇️⬇️ {usd_amount_rounded} USD"
 	
 	return text
 
@@ -421,6 +406,47 @@ async def cmd_admin(message: Message, state: FSMContext):
 		logger.debug(f"/admin ignored: user {message.from_user.id} is not admin")
 		return
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
+
+
+@admin_router.message(F.text == "/add")
+async def cmd_add(message: Message, state: FSMContext, bot: Bot):
+	"""Команда для вызова меню добавления данных в таблицу"""
+	logger.info(f"🔴🔴🔴 ОБРАБОТЧИК cmd_add ВЫЗВАН! message_id={message.message_id}, user_id={message.from_user.id if message.from_user else None}, text='{message.text}'")
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	logger.info(f"🔴 Проверка админа: user_id={message.from_user.id if message.from_user else None}, admin_ids={admin_ids}, admin_usernames={admin_usernames}")
+	is_admin_user = is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames)
+	logger.info(f"🔴 Результат проверки админа: {is_admin_user}")
+	if not is_admin_user:
+		logger.warning(f"🔴 /add ignored: user {message.from_user.id} is not admin")
+		return
+	logger.info(f"✅ /add обрабатывается для админа {message.from_user.id}")
+	
+	# Устанавливаем состояние collecting_multi_forward с пустым списком сообщений
+	await state.set_state(ForwardBindStates.collecting_multi_forward)
+	session_key = f"multi_{message.from_user.id}_{message.message_id}"
+	await state.update_data(
+		multi_forward_messages=[],
+		multi_forward_session_key=session_key,
+		multi_forward_ready=False
+	)
+	
+	# Создаем пустое меню (все данные None - будут показаны как "Не указано")
+	from app.keyboards import multi_forward_select_kb
+	message_text = await format_multi_forward_message_text(None)
+	
+	sent_message = await message.answer(
+		message_text,
+		reply_markup=multi_forward_select_kb(None, None, None)
+	)
+	
+	# Сохраняем ID сообщения с кнопками
+	await state.update_data(
+		multi_forward_buttons_msg_id=sent_message.message_id,
+		multi_forward_ready=True
+	)
+	
+	logger.info(f"✅ Создано меню добавления данных через команду /add для пользователя {message.from_user.id}")
 
 
 @admin_router.callback_query(F.data == "admin:back")
@@ -893,37 +919,56 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 	if is_forward:
 		logger.warning(f"⚠️ Пересылка попала в editing_crypto_amount, пропускаем: message_id={message.message_id}")
 		return
-	logger.info(f"📝 Получен ввод количества криптовалюты: {message.text}, состояние: {current_state}")
+	logger.info(f"📝 Получен ввод количества USD: {message.text}, состояние: {current_state}")
 	try:
-		amount = float(message.text.replace(",", "."))
-		if amount <= 0:
-			await message.answer("❌ Количество должно быть больше нуля. Попробуйте еще раз:")
+		usd_amount = float(message.text.replace(",", "."))
+		if usd_amount <= 0:
+			await message.answer("❌ Количество USD должно быть больше нуля. Попробуйте еще раз:")
 			return
 		
-		logger.info(f"✅ Парсинг количества успешен: {amount}")
+		logger.info(f"✅ Парсинг USD успешен: {usd_amount}")
 		data = await state.get_data()
 		messages_list = data.get("multi_forward_messages", [])
 		logger.debug(f"📋 Найдено сообщений: {len(messages_list)}")
 		
-		# Находим сообщение с криптовалютой и обновляем количество
+		# Находим сообщение с криптовалютой и обновляем USD
 		crypto_data = None
+		crypto_msg = None
 		for msg in messages_list:
 			if msg["parsed"].get("type") == "crypto":
+				crypto_msg = msg
 				currency = msg["parsed"].get("currency", "BTC")
-				msg["parsed"]["value"] = amount
-				msg["parsed"]["display"] = f"{amount} {currency}"
+				# Сохраняем USD напрямую
+				msg["parsed"]["usd_amount"] = usd_amount
+				msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
+				# Вычисляем количество монет для отображения (опционально)
+				msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({currency})"
 				crypto_data = msg["parsed"]
-				logger.info(f"✅ Обновлена криптовалюта: {crypto_data.get('display')}")
+				logger.info(f"✅ Обновлена криптовалюта: USD={usd_amount}, currency={currency}")
 				break
 		
+		# Если криптовалюты нет, создаем новую запись
 		if not crypto_data:
-			logger.warning("⚠️ Криптовалюта не найдена в сообщениях")
-			await message.answer("❌ Ошибка: криптовалюта не найдена. Попробуйте еще раз.")
-			return
+			logger.info("⚠️ Криптовалюта не найдена в сообщениях, создаем новую запись")
+			currency = "BTC"  # Валюта по умолчанию
+			crypto_msg = {
+				"text": str(usd_amount),
+				"parsed": {
+					"type": "crypto",
+					"usd_amount": usd_amount,
+					"value": usd_amount,  # Для обратной совместимости
+					"currency": currency,
+					"display": f"{int(round(usd_amount))} USD ({currency})"
+				},
+				"message_id": None  # Это виртуальное сообщение
+			}
+			messages_list.append(crypto_msg)
+			crypto_data = crypto_msg["parsed"]
+			logger.info(f"✅ Создана криптовалюта: USD={usd_amount}, currency={currency}")
 		
 		# Обновляем данные в state
 		await state.update_data(multi_forward_messages=messages_list)
-		await state.set_state(ForwardBindStates.waiting_select_card)
+		await state.set_state(ForwardBindStates.collecting_multi_forward)
 		logger.info(f"✅ Состояние обновлено на: {await state.get_state()}")
 		
 		# Обновляем кнопки в основном сообщении
@@ -963,7 +1008,7 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 		)
 		
 	except ValueError:
-		await message.answer("❌ Неверный формат. Введите число, например: 0.000499")
+		await message.answer("❌ Неверный формат. Введите число, например: 100")
 	except Exception as e:
 		logger.exception(f"Ошибка обработки количества криптовалюты: {e}")
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
@@ -993,8 +1038,10 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 		
 		# Находим сообщение с наличными и обновляем количество
 		cash_data = None
+		cash_msg = None
 		for msg in messages_list:
 			if msg["parsed"].get("type") == "cash":
+				cash_msg = msg
 				currency = msg["parsed"].get("currency", "RUB")
 				msg["parsed"]["value"] = amount
 				msg["parsed"]["display"] = f"{amount} {currency}"
@@ -1002,14 +1049,27 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 				logger.info(f"✅ Обновлены наличные: {cash_data.get('display')}")
 				break
 		
+		# Если наличных нет, создаем новую запись
 		if not cash_data:
-			logger.warning("⚠️ Наличные не найдены в сообщениях")
-			await message.answer("❌ Ошибка: наличные не найдены. Попробуйте еще раз.")
-			return
+			logger.info("⚠️ Наличные не найдены в сообщениях, создаем новую запись")
+			currency = "RUB"  # Валюта по умолчанию
+			cash_msg = {
+				"text": str(amount),
+				"parsed": {
+					"type": "cash",
+					"value": amount,
+					"currency": currency,
+					"display": f"{amount} {currency}"
+				},
+				"message_id": None  # Это виртуальное сообщение
+			}
+			messages_list.append(cash_msg)
+			cash_data = cash_msg["parsed"]
+			logger.info(f"✅ Созданы наличные: {cash_data.get('display')}")
 		
 		# Обновляем данные в state
 		await state.update_data(multi_forward_messages=messages_list)
-		await state.set_state(ForwardBindStates.waiting_select_card)
+		await state.set_state(ForwardBindStates.collecting_multi_forward)
 		logger.info(f"✅ Состояние обновлено на: {await state.get_state()}")
 		
 		# Обновляем кнопки в основном сообщении
@@ -1060,6 +1120,10 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 # чтобы не перехватывать сообщения в состоянии редактирования
 @admin_router.message()
 async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMContext):
+	# Пропускаем команды - они обрабатываются отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	# Логируем ВСЕ сообщения, которые попадают в обработчик (ДАЖЕ ДО ПРОВЕРКИ АДМИНА)
 	text = message.text or message.caption or ""
 	is_forward = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from", None))
@@ -1804,45 +1868,56 @@ async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	
 	# Обрабатываем выбор в зависимости от типа
 	if selected_type == "crypto":
-		if not crypto_data:
-			# Криптовалюта не распознана - показываем клавиатуру выбора валюты
-			logger.info("⚠️ Криптовалюта не найдена в сообщениях, показываем выбор валюты")
-			from app.keyboards import crypto_select_kb
-			
-			try:
-				await cb.message.edit_text(
-					"📝 Криптовалюта не распознана.\n\nВыберите тип монеты:",
-					reply_markup=crypto_select_kb(back_to="multi:back_to_main")
-				)
-				await cb.answer()
-			except Exception as e:
-				logger.exception(f"❌ Ошибка при открытии выбора валюты: {e}")
-				await cb.answer("Ошибка при открытии выбора валюты", show_alert=True)
-			return
+		# Всегда показываем клавиатуру выбора валюты (BTC, LTC, XMR, Подтвердить, Назад)
+		logger.info("📝 Показываем выбор валюты")
+		from app.keyboards import crypto_select_kb
 		
-		# Показываем клавиатуру для редактирования криптовалюты
-		from app.keyboards import crypto_edit_kb
-		
-		current_currency = crypto_data.get("currency", "BTC")
-		amount = crypto_data.get("value", 0.0)
-		display = crypto_data.get("display", "Криптовалюта")
-		
-		logger.info(f"📝 Открываем редактирование криптовалюты: {display}, currency={current_currency}, amount={amount}")
+		# Формируем текст сообщения
+		if crypto_data:
+			current_currency = crypto_data.get("currency", "BTC")
+			amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
+			display = crypto_data.get("display", "Криптовалюта")
+			message_text = f"📝 Выбор криптовалюты\n\nТекущая: {display}\n\nВыберите тип монеты:"
+		else:
+			message_text = "📝 Выбор криптовалюты\n\nВыберите тип монеты:"
 		
 		try:
 			await cb.message.edit_text(
-				f"📝 Редактирование: {display}\n\nВыберите тип монеты или измените количество:",
-				reply_markup=crypto_edit_kb(current_currency, amount)
+				message_text,
+				reply_markup=crypto_select_kb(back_to="multi:back_to_main", show_confirm=True)
 			)
 			await cb.answer()
 		except Exception as e:
-			logger.exception(f"❌ Ошибка при редактировании сообщения: {e}")
-			await cb.answer("Ошибка при открытии редактирования", show_alert=True)
+			logger.exception(f"❌ Ошибка при открытии выбора валюты: {e}")
+			await cb.answer("Ошибка при открытии выбора валюты", show_alert=True)
 		return
 	
 	elif selected_type == "cash":
 		if not cash_data:
-			await cb.answer("Наличные не указаны", show_alert=True)
+			# Наличные не указаны - создаем новую запись и запрашиваем ввод
+			logger.info("⚠️ Наличные не найдены в сообщениях, создаем новую запись")
+			
+			# Создаем новое сообщение с наличными (валюта по умолчанию - RUB)
+			cash_msg = {
+				"text": "",
+				"parsed": {
+					"type": "cash",
+					"value": 0,
+					"currency": "RUB",
+					"display": "0 RUB"
+				},
+				"message_id": None  # Это виртуальное сообщение
+			}
+			messages_list.append(cash_msg)
+			await state.update_data(multi_forward_messages=messages_list)
+			
+			# Переходим к вводу количества
+			await state.set_state(ForwardBindStates.editing_cash_amount)
+			await cb.message.edit_text(
+				"📝 Введите количество наличных:\n\nНапример: 100",
+				reply_markup=None
+			)
+			await cb.answer()
 			return
 		
 		# Показываем клавиатуру для редактирования наличных
@@ -2110,8 +2185,10 @@ async def crypto_change_type(cb: CallbackQuery, state: FSMContext):
 	for msg in messages_list:
 		if msg["parsed"].get("type") == "crypto":
 			msg["parsed"]["currency"] = new_currency
-			amount = msg["parsed"].get("value", 0.0)
-			msg["parsed"]["display"] = f"{amount} {new_currency}"
+			usd_amount = msg["parsed"].get("usd_amount", msg["parsed"].get("value", 0.0))
+			msg["parsed"]["usd_amount"] = usd_amount
+			msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
+			msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({new_currency})"
 			break
 	
 	# Если изменили валюту на не-XMR, сбрасываем выбранный номер XMR
@@ -2196,24 +2273,16 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 		
 		# Если криптовалюты нет, создаем с валютой по умолчанию (BTC)
 		if not crypto_msg:
-			# Ищем сообщение с числом (возможно, это было третье сообщение "0.8")
-			crypto_amount = 0.0
-			for msg in messages_list:
-				text = msg.get("text", "")
-				normalized_text = re.sub(r'\s+', ' ', text.strip())
-				crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
-				if crypto_match:
-					crypto_amount = float(crypto_match.group(1))
-					break
-			
 			# Создаем новое сообщение с криптовалютой (валюта по умолчанию - BTC)
+			# USD будет введен пользователем
 			crypto_msg = {
-				"text": f"{crypto_amount}",
+				"text": "",
 				"parsed": {
 					"type": "crypto",
-					"value": crypto_amount,
+					"usd_amount": 0.0,
+					"value": 0.0,  # Для обратной совместимости
 					"currency": "BTC",  # Валюта по умолчанию
-					"display": f"{crypto_amount} BTC"
+					"display": "0 USD (BTC)"
 				},
 				"message_id": None  # Это виртуальное сообщение
 			}
@@ -2223,7 +2292,7 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 		await state.set_state(ForwardBindStates.editing_crypto_amount)
 		logger.info(f"✅ Состояние установлено на: {await state.get_state()}")
 		await cb.message.edit_text(
-			"📝 Введите количество криптовалюты:\n\nНапример: 0.8",
+			"📝 Введите количество USD:\n\nНапример: 100",
 			reply_markup=None
 		)
 		await cb.answer()
@@ -2251,28 +2320,21 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 	if crypto_msg:
 		# Обновляем существующее сообщение с криптовалютой
 		crypto_msg["parsed"]["currency"] = currency
-		amount = crypto_msg["parsed"].get("value", 0.0)
-		crypto_msg["parsed"]["display"] = f"{amount} {currency}"
+		usd_amount = crypto_msg["parsed"].get("usd_amount", crypto_msg["parsed"].get("value", 0.0))
+		crypto_msg["parsed"]["usd_amount"] = usd_amount
+		crypto_msg["parsed"]["value"] = usd_amount  # Для обратной совместимости
+		crypto_msg["parsed"]["display"] = f"{int(round(usd_amount))} USD ({currency})"
 	else:
 		# Создаем новое сообщение с криптовалютой
-		# Ищем сообщение с числом (возможно, это было третье сообщение "0.8")
-		crypto_amount = 0.0
-		for msg in messages_list:
-			text = msg.get("text", "")
-			normalized_text = re.sub(r'\s+', ' ', text.strip())
-			crypto_match = re.search(r'(?:^|\s)(\d+\.\d+)(?:\s|$)', normalized_text)
-			if crypto_match:
-				crypto_amount = float(crypto_match.group(1))
-				break
-		
-		# Добавляем новое сообщение с криптовалютой
+		# USD будет введен пользователем позже
 		crypto_msg = {
-			"text": f"{crypto_amount}",
+			"text": "",
 			"parsed": {
 				"type": "crypto",
-				"value": crypto_amount,
+				"usd_amount": 0.0,
+				"value": 0.0,  # Для обратной совместимости
 				"currency": currency,
-				"display": f"{crypto_amount} {currency}"
+				"display": f"0 USD ({currency})"
 			},
 			"message_id": None  # Это виртуальное сообщение
 		}
@@ -2281,6 +2343,21 @@ async def crypto_select_currency(cb: CallbackQuery, state: FSMContext):
 	# Обновляем данные в state
 	await state.update_data(multi_forward_messages=messages_list)
 	
+	# Проверяем, введен ли USD
+	usd_amount = crypto_msg["parsed"].get("usd_amount", crypto_msg["parsed"].get("value", 0.0))
+	
+	# Если USD не введен (равен 0), предлагаем ввести
+	if usd_amount == 0.0 or usd_amount is None:
+		logger.info(f"⚠️ USD не введен для валюты {currency}, предлагаем ввести")
+		await state.set_state(ForwardBindStates.editing_crypto_amount)
+		await cb.message.edit_text(
+			f"📝 Выбрана валюта: {currency}\n\nВведите количество USD:\n\nНапример: 100",
+			reply_markup=None
+		)
+		await cb.answer(f"✅ Выбрана валюта: {currency}. Введите USD")
+		return
+	
+	# USD введен - возвращаемся к основному меню
 	# Извлекаем данные для обновления клавиатуры
 	crypto_data = crypto_msg["parsed"]
 	cash_data = None
@@ -2332,7 +2409,7 @@ async def crypto_change_amount_start(cb: CallbackQuery, state: FSMContext):
 	await state.set_state(ForwardBindStates.editing_crypto_amount)
 	logger.info(f"✅ Состояние установлено на: {await state.get_state()}")
 	await cb.message.edit_text(
-		"📝 Введите новое количество криптовалюты:\n\nНапример: 0.000499",
+		"📝 Введите количество USD:\n\nНапример: 100",
 		reply_markup=None
 	)
 	await cb.answer()
