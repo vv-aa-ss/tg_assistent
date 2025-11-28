@@ -242,58 +242,86 @@ def similar_users_select_kb(similar_users: List[Dict], hidden_name: str, back_to
 	return kb.as_markup()
 
 
-def multi_forward_select_kb(crypto_data: Dict | None, cash_data: Dict | None, card_data: Dict | None, selected_xmr: int | None = None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
+def multi_forward_select_kb(rows_data: List[Dict] | None = None, selected_xmr: Dict[int, int] | None = None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	"""
-	Создает клавиатуру с тремя кнопками для множественных пересылок.
-	Всегда показывает три кнопки: криптовалюта, наличные, карта.
-	Если криптовалюта XMR, показывает кнопки XMR-1, XMR-2, XMR-3 под первой строкой.
-	Первые три кнопки в ряд, затем кнопки XMR (если есть), затем "Подтвердить" и "Назад".
+	Создает клавиатуру с несколькими строками для множественных пересылок.
+	Каждая строка содержит три кнопки: криптовалюта, наличные, карта.
+	Если криптовалюта XMR, показывает кнопки XMR-1, XMR-2, XMR-3 под соответствующей строкой.
+	Перед "Подтвердить" добавляется кнопка "+" для добавления новой строки (до 5 строк).
+	
+	Args:
+		rows_data: Список словарей, каждый содержит crypto_data, cash_data, card_data и row_index
+		selected_xmr: Словарь {row_index: xmr_number} для выбранных номеров XMR
+		back_to: Callback data для кнопки "Назад"
 	"""
 	kb = InlineKeyboardBuilder()
 	
-	# Кнопка 1: Криптовалюта
-	if crypto_data:
-		display = crypto_data.get("display", "Криптовалюта")
-		kb.button(text=f"🪙 {display}", callback_data="multi:select:crypto")
-	else:
-		kb.button(text="🪙", callback_data="multi:select:crypto")
+	if rows_data is None:
+		rows_data = []
+	if selected_xmr is None:
+		selected_xmr = {}
 	
-	# Кнопка 2: Наличные
-	if cash_data:
-		display = cash_data.get("display", "Наличные")
-		kb.button(text=f"💵 {display}", callback_data="multi:select:cash")
-	else:
-		kb.button(text="💵", callback_data="multi:select:cash")
+	# Если нет строк, создаем одну пустую
+	if not rows_data:
+		rows_data = [{"crypto_data": None, "cash_data": None, "card_data": None, "row_index": 0}]
 	
-	# Кнопка 3: Карта
-	if card_data:
-		display = card_data.get("display", "Карта")
-		kb.button(text=f"💳 {display}", callback_data="multi:select:card")
-	else:
-		kb.button(text="💳", callback_data="multi:select:card")
+	adjust_params = []
 	
-	# Если криптовалюта XMR, добавляем кнопки XMR-1, XMR-2, XMR-3
-	if crypto_data and crypto_data.get("currency") == "XMR":
-		# Кнопки XMR с галочкой на выбранной
-		for xmr_num in [1, 2, 3]:
-			if selected_xmr == xmr_num:
-				kb.button(text=f"✅ XMR-{xmr_num}", callback_data=f"multi:select:xmr:{xmr_num}")
-			else:
-				kb.button(text=f"XMR-{xmr_num}", callback_data=f"multi:select:xmr:{xmr_num}")
+	# Обрабатываем каждую строку
+	for row in rows_data:
+		crypto_data = row.get("crypto_data")
+		cash_data = row.get("cash_data")
+		card_data = row.get("card_data")
+		row_index = row.get("row_index", 0)
+		
+		# Кнопка 1: Криптовалюта
+		if crypto_data:
+			display = crypto_data.get("display", "Криптовалюта")
+			kb.button(text=f"🪙 {display}", callback_data=f"multi:select:crypto:{row_index}")
+		else:
+			kb.button(text="🪙", callback_data=f"multi:select:crypto:{row_index}")
+		
+		# Кнопка 2: Наличные
+		if cash_data:
+			display = cash_data.get("display", "Наличные")
+			kb.button(text=f"💵 {display}", callback_data=f"multi:select:cash:{row_index}")
+		else:
+			kb.button(text="💵", callback_data=f"multi:select:cash:{row_index}")
+		
+		# Кнопка 3: Карта
+		if card_data:
+			display = card_data.get("display", "Карта")
+			kb.button(text=f"💳 {display}", callback_data=f"multi:select:card:{row_index}")
+		else:
+			kb.button(text="💳", callback_data=f"multi:select:card:{row_index}")
+		
+		adjust_params.append(3)  # Три кнопки в ряд
+		
+		# Если криптовалюта XMR, добавляем кнопки XMR-1, XMR-2, XMR-3
+		if crypto_data and crypto_data.get("currency") == "XMR":
+			row_xmr = selected_xmr.get(row_index)
+			# Кнопки XMR с галочкой на выбранной
+			for xmr_num in [1, 2, 3]:
+				if row_xmr == xmr_num:
+					kb.button(text=f"✅ XMR-{xmr_num}", callback_data=f"multi:select:xmr:{row_index}:{xmr_num}")
+				else:
+					kb.button(text=f"XMR-{xmr_num}", callback_data=f"multi:select:xmr:{row_index}:{xmr_num}")
+			adjust_params.append(3)  # Три кнопки XMR в ряд
+	
+	# Кнопка "+" для добавления новой строки (показываем только если меньше 5 строк)
+	if len(rows_data) < 5:
+		kb.button(text="➕", callback_data="multi:add_row")
+		adjust_params.append(1)
 	
 	# Кнопка "Подтвердить"
 	kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
+	adjust_params.append(1)
 	
 	# Кнопка "Назад"
 	kb.button(text="⬅️ Назад", callback_data=back_to)
+	adjust_params.append(1)
 	
-	# Первые три кнопки в ряд
-	# Если есть XMR, то три кнопки XMR в ряд
-	# Затем "Подтвердить" и "Назад" по одной
-	if crypto_data and crypto_data.get("currency") == "XMR":
-		kb.adjust(3, 3, 1, 1)  # 3 кнопки, 3 кнопки XMR, Подтвердить, Назад
-	else:
-		kb.adjust(3, 1, 1)  # 3 кнопки, Подтвердить, Назад
+	kb.adjust(*adjust_params)
 	return kb.as_markup()
 
 

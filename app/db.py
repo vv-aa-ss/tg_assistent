@@ -76,6 +76,7 @@ class Database:
 		await self._ensure_crypto_columns()
 		await self._migrate_crypto_columns()
 		await self._ensure_card_groups()
+		await self._ensure_google_sheets_settings()
 		await self._db.commit()
 
 	async def _ensure_cards_user_message(self) -> None:
@@ -1125,3 +1126,92 @@ class Database:
 			"SELECT id, name, details FROM cards WHERE group_id IS NULL ORDER BY name"
 		)
 		return await cur.fetchall()
+
+	async def _ensure_google_sheets_settings(self) -> None:
+		"""Создает таблицу для хранения настроек Google Sheets"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='google_sheets_settings'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE google_sheets_settings (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					key TEXT NOT NULL UNIQUE,
+					value TEXT NOT NULL
+				)
+				"""
+			)
+			# Устанавливаем значения по умолчанию
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('delete_range', 'A:BB')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('zero_column', 'BC')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+			)
+			_logger.debug("Created table google_sheets_settings with default values")
+		else:
+			# Проверяем наличие всех необходимых ключей
+			cur = await self._db.execute("SELECT key FROM google_sheets_settings")
+			existing_keys = {row[0] for row in await cur.fetchall()}
+			
+			if 'delete_range' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('delete_range', 'A:BB')"
+				)
+			if 'zero_column' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('zero_column', 'BC')"
+				)
+			if 'start_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
+				)
+			if 'rate_max_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+				)
+
+	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+		"""
+		Получает значение настройки Google Sheets.
+		
+		Args:
+			key: Ключ настройки (delete_range, zero_column, start_row)
+			default: Значение по умолчанию, если настройка не найдена
+		
+		Returns:
+			Значение настройки или default
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT value FROM google_sheets_settings WHERE key = ?",
+			(key,)
+		)
+		row = await cur.fetchone()
+		if row:
+			return row[0]
+		return default
+
+	async def set_google_sheets_setting(self, key: str, value: str) -> None:
+		"""
+		Устанавливает значение настройки Google Sheets.
+		
+		Args:
+			key: Ключ настройки (delete_range, zero_column, start_row)
+			value: Значение настройки
+		"""
+		assert self._db
+		await self._db.execute(
+			"INSERT OR REPLACE INTO google_sheets_settings(key, value) VALUES(?, ?)",
+			(key, value)
+		)
+		await self._db.commit()
+		_logger.debug(f"Google Sheets setting set: {key}={value}")
