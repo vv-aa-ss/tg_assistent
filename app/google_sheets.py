@@ -4,7 +4,7 @@
 import logging
 import asyncio
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import gspread
 from google.oauth2.service_account import Credentials
 import aiohttp
@@ -263,36 +263,84 @@ async def get_xmr_price_usd() -> Optional[float]:
 	return None
 
 
-def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 348) -> int:
+def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 348, max_row: Optional[int] = None) -> int:
 	"""
 	Находит первую пустую ячейку в указанном столбце, начиная с start_row.
 	Возвращает номер строки первой пустой ячейки.
 	Использует batch чтение для оптимизации (читает по 50 строк за раз).
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		column: Буква столбца (например, "G")
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
 	"""
 	try:
 		batch_size = 50
 		row = start_row
 		
-		while row <= start_row + 1000:
+		# Определяем максимальную строку для поиска
+		if max_row is not None:
+			search_limit = max_row
+		else:
+			search_limit = start_row + 1000
+		
+		while row <= search_limit:
 			# Читаем batch строк за один запрос
-			end_row = min(row + batch_size - 1, start_row + 1000)
+			end_row = min(row + batch_size - 1, search_limit)
 			range_str = f"{column}{row}:{column}{end_row}"
 			
 			try:
 				values = sheet.get(range_str)
 				# values - это список списков, например [['1'], ['2'], [], ...]
+				# Если весь диапазон пустой, API может вернуть None или пустой список
+				expected_rows = end_row - row + 1
+				received_rows = len(values) if values else 0
+				logger.debug(f"Прочитан диапазон {range_str}: ожидалось {expected_rows} строк, получено {received_rows} значений")
 				
+				# Если values пустой или None, значит все ячейки в диапазоне пустые
+				if not values or len(values) == 0:
+					logger.debug(f"Диапазон {range_str} полностью пустой, возвращаем первую строку {row}")
+					return row
+				
+				# Если получено меньше значений, чем ожидалось, значит остальные ячейки пустые
+				if received_rows < expected_rows:
+					# Первая пустая ячейка - это первая строка после последней полученной
+					first_empty_row = row + received_rows
+					if max_row is not None and first_empty_row > max_row:
+						logger.warning(f"Первая пустая ячейка {first_empty_row} превышает лимит {max_row}")
+						return max_row + 1
+					logger.debug(f"Получено меньше значений ({received_rows} из {expected_rows}), первая пустая ячейка в строке {first_empty_row}")
+					return first_empty_row
+				
+				# Проверяем каждую полученную ячейку
 				for i, cell_list in enumerate(values):
 					current_row = row + i
+					
+					# Проверяем, не превысили ли лимит
+					if max_row is not None and current_row > max_row:
+						logger.warning(f"Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
+						return max_row + 1  # Возвращаем значение больше лимита, чтобы показать, что места нет
+					
 					# Если список пустой или содержит пустую строку, значит ячейка пустая
 					if not cell_list or len(cell_list) == 0:
+						logger.debug(f"Найдена пустая ячейка в строке {current_row} (пустой список)")
 						return current_row
 					
 					cell_value = cell_list[0] if cell_list else None
 					
-					# Проверяем, является ли значение пустым
-					if cell_value is None or cell_value == "":
+					# Проверяем, является ли значение пустым (None, пустая строка, или только пробелы)
+					if cell_value is None:
+						logger.debug(f"Найдена пустая ячейка в строке {current_row} (None)")
 						return current_row
+					
+					# Преобразуем в строку и убираем пробелы для проверки
+					cell_str = str(cell_value).strip() if cell_value else ""
+					if cell_str == "":
+						logger.debug(f"Найдена пустая ячейка в строке {current_row} (пустая строка или пробелы)")
+						return current_row
+					
+					logger.debug(f"Строка {current_row}: значение='{cell_value}' (тип: {type(cell_value)})")
 				
 				# Если в этом batch не нашли пустую, переходим к следующему
 				row = end_row + 1
@@ -300,13 +348,17 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 			except Exception as e:
 				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной ячейке")
 				# Fallback: читаем по одной ячейке
+				if max_row is not None and row > max_row:
+					logger.warning(f"Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
+					return max_row + 1
+				
 				cell_value = sheet.acell(f"{column}{row}").value
 				if cell_value is None or cell_value == "":
 					return row
 				row += 1
 		
-		logger.warning(f"Не найдена пустая ячейка в столбце {column}, начиная с {start_row}")
-		return start_row + 1000
+		logger.warning(f"Не найдена пустая ячейка в столбце {column}, начиная с {start_row} до {search_limit}")
+		return search_limit + 1
 		
 	except Exception as e:
 		logger.exception(f"Ошибка поиска пустой ячейки: {e}")
@@ -1272,7 +1324,7 @@ def _write_to_google_sheet_rate_mode_sync(
 					column = usdt_column
 				
 				if column:
-					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row)
+					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 					if empty_row > rate_max_row:
 						failed_writes.append(f"{currency}: {usd_amount_rounded} USD (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
@@ -1294,7 +1346,7 @@ def _write_to_google_sheet_rate_mode_sync(
 				usd_column = xmr_columns.get(xmr_number)
 				
 				if usd_column:
-					empty_row = _find_empty_cell_in_column(worksheet, usd_column, start_row=start_row)
+					empty_row = _find_empty_cell_in_column(worksheet, usd_column, start_row=start_row, max_row=rate_max_row)
 					if empty_row > rate_max_row:
 						failed_writes.append(f"XMR-{xmr_number}: {usd_amount_rounded} USD (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано XMR-{xmr_number}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
@@ -1318,7 +1370,7 @@ def _write_to_google_sheet_rate_mode_sync(
 				if cash_amount > 0:
 					# В режиме rate записываем со знаком минус
 					cash_amount_negative = -cash_amount
-					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row)
+					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 					if empty_row > rate_max_row:
 						failed_writes.append(f"Карта {card_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для карты {card_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
@@ -1342,3 +1394,109 @@ def _write_to_google_sheet_rate_mode_sync(
 	except Exception as e:
 		logger.exception(f"Ошибка записи данных в режиме rate: {e}")
 		return {"success": False, "written_cells": []}
+
+
+def _get_crypto_values_from_row_4_sync(
+	sheet_id: str,
+	credentials_path: str,
+	crypto_columns: List[Dict[str, str]]
+) -> Dict[str, Optional[str]]:
+	"""
+	Синхронная функция для чтения значений криптовалют из строки 4 Google Sheets.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		crypto_columns: Список словарей с ключами crypto_type и column
+	
+	Returns:
+		Словарь {crypto_type: value} с значениями из строки 4
+	"""
+	result = {}
+	
+	if not sheet_id or not credentials_path:
+		logger.warning("Google Sheets не настроен для чтения криптовалют")
+		return result
+	
+	try:
+		# Создаем клиент Google Sheets
+		client = _get_google_sheets_client(credentials_path)
+		
+		if not client:
+			logger.warning("Не удалось создать клиент Google Sheets")
+			return result
+		
+		# Открываем таблицу
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = spreadsheet.sheet1
+		
+		# Читаем значения из строки 4 для каждой криптовалюты
+		logger.info(f"Начинаем чтение значений криптовалют из строки 4. Всего криптовалют: {len(crypto_columns)}")
+		
+		for crypto in crypto_columns:
+			crypto_type = crypto.get("crypto_type", "")
+			column = crypto.get("column", "")
+			
+			if not column:
+				logger.warning(f"Пропущена криптовалюта {crypto_type}: нет столбца")
+				continue
+			
+			try:
+				# Читаем ячейку из строки 4
+				cell_address = f"{column}4"
+				logger.debug(f"Читаем ячейку {cell_address} для {crypto_type}")
+				
+				cell = worksheet.acell(cell_address)
+				
+				if cell:
+					value = cell.value
+					logger.info(f"Прочитано значение для {crypto_type} из {cell_address}: '{value}' (тип: {type(value)})")
+					
+					# Форматируем значение (убираем лишние пробелы, если есть)
+					if value is not None:
+						value = str(value).strip()
+						# Если значение пустое после strip, считаем его None
+						if not value:
+							value = None
+					else:
+						value = None
+				else:
+					value = None
+					logger.warning(f"Ячейка {cell_address} для {crypto_type} вернула None")
+				
+				result[crypto_type] = value
+				
+			except Exception as e:
+				logger.exception(f"Ошибка чтения ячейки {column}4 для {crypto_type}: {e}")
+				result[crypto_type] = None
+		
+	except Exception as e:
+		logger.exception(f"Ошибка чтения значений криптовалют из строки 4: {e}")
+	
+	return result
+
+
+async def get_crypto_values_from_row_4(
+	sheet_id: str,
+	credentials_path: str,
+	crypto_columns: List[Dict[str, str]]
+) -> Dict[str, Optional[str]]:
+	"""
+	Читает значения криптовалют из строки 4 Google Sheets.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		crypto_columns: Список словарей с ключами crypto_type и column
+	
+	Returns:
+		Словарь {crypto_type: value} с значениями из строки 4
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_get_crypto_values_from_row_4_sync,
+		sheet_id,
+		credentials_path,
+		crypto_columns
+	)

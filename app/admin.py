@@ -14,6 +14,7 @@ import asyncio
 from app.keyboards import (
 	admin_menu_kb,
 	cards_list_kb,
+	cards_groups_kb,
 	users_list_kb,
 	simple_back_kb,
 	cards_select_kb,
@@ -95,6 +96,7 @@ class ForwardBindStates(StatesGroup):
 	collecting_multi_forward = State()
 	editing_crypto_amount = State()  # Состояние для редактирования количества криптовалюты
 	editing_cash_amount = State()  # Состояние для редактирования количества наличных
+	selecting_card_for_cash = State()  # Состояние для выбора карты при вводе наличных
 
 
 class CryptoColumnEditStates(StatesGroup):
@@ -140,7 +142,8 @@ def format_relative(ts: int | None) -> str:
 	now = datetime.now()
 	delta = now - dt
 	if delta.total_seconds() < 0:
-		return dt.strftime("%Y-%m-%d %H:%M")
+		# Если дата в будущем, показываем как 0 дней назад
+		return "0 д назад"
 	if delta <= timedelta(minutes=1):
 		return "только что"
 	if delta < timedelta(hours=1):
@@ -149,10 +152,9 @@ def format_relative(ts: int | None) -> str:
 	if delta < timedelta(days=1):
 		hours = int(delta.total_seconds() // 3600)
 		return f"{hours} ч назад"
-	if delta < timedelta(days=7):
-		days = delta.days
-		return f"{days} д назад"
-	return dt.strftime("%Y-%m-%d %H:%M")
+	# Для всех случаев больше дня показываем только дни назад
+	days = delta.days
+	return f"{days} д назад"
 
 
 def detect_crypto_type(amount: float) -> str:
@@ -606,13 +608,78 @@ async def admin_back(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data == "admin:cards")
 async def admin_cards(cb: CallbackQuery):
+	"""Показывает список групп карт"""
 	db = get_db()
-	rows = await db.list_cards()
-	cards = [(r[0], r[1]) for r in rows]
-	logger.debug(f"Show cards: count={len(cards)}")
-	text = "Список карт:" if cards else "Список карт пуст."
-	await cb.message.edit_text(text, reply_markup=cards_list_kb(cards))
+	groups = await db.list_card_groups()
+	logger.debug(f"Show card groups: count={len(groups)}")
+	
+	text = "Выберите группу карт:" if groups else "Групп пока нет."
+	await cb.message.edit_text(text, reply_markup=cards_groups_kb(groups))
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cards:group:"))
+async def cards_group_view(cb: CallbackQuery):
+	"""Показывает карты выбранной группы или карты вне групп"""
+	db = get_db()
+	group_id_str = cb.data.split(":")[-1]
+	group_id = int(group_id_str) if group_id_str != "0" else None
+	
+	if group_id:
+		# Получаем карты из группы
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		text = f"Карты группы '{group_name}':" if cards else f"В группе '{group_name}' нет карт."
+		
+		# Преобразуем формат карт из (id, name, details) в (id, name)
+		cards_list = [(c[0], c[1]) for c in cards]
+		
+		logger.debug(f"Show cards for group_id={group_id}, count={len(cards_list)}")
+		
+		await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards", group_id=group_id))
+	else:
+		# Получаем карты без группы
+		cards = await db.get_cards_without_group()
+		text = "Карты вне групп:" if cards else "Нет карт вне групп."
+		
+		# Преобразуем формат карт из (id, name, details) в (id, name)
+		cards_list = [(c[0], c[1]) for c in cards]
+		
+		logger.debug(f"Show cards without group, count={len(cards_list)}")
+		
+		await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards"))
+	
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cards:delete_group:"))
+async def cards_delete_group(cb: CallbackQuery):
+	"""Удаляет группу карт и отвязывает все карты от группы"""
+	db = get_db()
+	group_id = int(cb.data.split(":")[-1])
+	
+	# Получаем информацию о группе перед удалением
+	group = await db.get_card_group(group_id)
+	if not group:
+		await cb.answer("Группа не найдена", show_alert=True)
+		return
+	
+	group_name = group.get("name", "Группа")
+	
+	# Удаляем группу (карты автоматически отвязываются)
+	try:
+		await db.delete_card_group(group_id)
+		logger.info(f"Группа '{group_name}' (id={group_id}) удалена, карты отвязаны")
+		
+		# Возвращаемся к списку групп
+		groups = await db.list_card_groups()
+		text = "Выберите группу карт:" if groups else "Групп пока нет."
+		await cb.message.edit_text(text, reply_markup=cards_groups_kb(groups))
+		await cb.answer(f"✅ Группа '{group_name}' удалена, карты отвязаны")
+	except Exception as e:
+		logger.exception(f"Ошибка удаления группы {group_id}: {e}")
+		await cb.answer("❌ Ошибка при удалении группы", show_alert=True)
 
 
 @admin_router.callback_query(F.data == "admin:crypto")
@@ -1268,6 +1335,95 @@ async def admin_users_noop(cb: CallbackQuery):
 	await cb.answer()
 
 
+async def _update_crypto_values_in_stats(
+	bot: Bot,
+	chat_id: int,
+	message_id: int,
+	sheet_id: str,
+	credentials_path: str,
+	crypto_columns: List[Dict[str, str]],
+	base_lines: List[str]
+):
+	"""
+	Обновляет значения криптовалют в сообщении статистики после их загрузки.
+	"""
+	from app.google_sheets import get_crypto_values_from_row_4
+	
+	try:
+		logger.info(f"Начинаем загрузку значений криптовалют из строки 4. Криптовалют: {len(crypto_columns)}")
+		crypto_values = await get_crypto_values_from_row_4(
+			sheet_id,
+			credentials_path,
+			crypto_columns
+		)
+		
+		logger.info(f"Получены значения криптовалют: {crypto_values}")
+		
+		# Формируем строки для раздела "Крипта"
+		crypto_lines = ["", "<b>₿ Крипта</b>"]
+		
+		for crypto in crypto_columns:
+			crypto_type = crypto.get("crypto_type", "")
+			column = crypto.get("column", "")
+			value = crypto_values.get(crypto_type)
+			
+			logger.debug(f"Обработка {crypto_type}: column={column}, value={value}, type={type(value)}")
+			
+			# Проверяем, что значение не None и не пустая строка
+			if value is not None and str(value).strip():
+				# Пытаемся форматировать как число, если возможно
+				try:
+					# Если это число, форматируем его
+					num_value = float(str(value).replace(",", ".").replace(" ", ""))
+					# Форматируем с разделителями тысяч, только целая часть
+					formatted_value = f"{int(round(num_value)):,}".replace(",", " ")
+					logger.debug(f"Отформатировано значение для {crypto_type}: {formatted_value}")
+				except (ValueError, AttributeError):
+					# Если не число, используем как есть
+					formatted_value = str(value).strip()
+					logger.debug(f"Использовано исходное значение для {crypto_type}: {formatted_value}")
+				
+				crypto_lines.append(f"<code>{crypto_type} = {formatted_value} USD</code>")
+			else:
+				logger.warning(f"Значение для {crypto_type} пустое или None (column={column})")
+				crypto_lines.append(f"<code>{crypto_type} = —</code>")
+		
+		# Объединяем базовые строки и строки с криптовалютами
+		all_lines = base_lines + crypto_lines
+		text = "\n".join(all_lines)
+		
+		# Обновляем сообщение
+		try:
+			await bot.edit_message_text(
+				chat_id=chat_id,
+				message_id=message_id,
+				text=text,
+				reply_markup=simple_back_kb("admin:back"),
+				parse_mode="HTML"
+			)
+			logger.info("Сообщение статистики успешно обновлено с значениями криптовалют")
+		except Exception as e:
+			logger.exception(f"Ошибка обновления сообщения статистики: {e}")
+		
+	except Exception as e:
+		logger.exception(f"Ошибка загрузки значений криптовалют: {e}")
+		# Пытаемся обновить сообщение с сообщением об ошибке
+		try:
+			crypto_lines = ["", "<b>₿ Крипта</b>", "<i>Ошибка загрузки данных</i>"]
+			all_lines = base_lines + crypto_lines
+			text = "\n".join(all_lines)
+			
+			await bot.edit_message_text(
+				chat_id=chat_id,
+				message_id=message_id,
+				text=text,
+				reply_markup=simple_back_kb("admin:back"),
+				parse_mode="HTML"
+			)
+		except Exception as update_error:
+			logger.exception(f"Ошибка обновления сообщения с ошибкой: {update_error}")
+
+
 @admin_router.callback_query(F.data == "admin:stats")
 async def admin_stats(cb: CallbackQuery):
 	db = get_db()
@@ -1329,9 +1485,43 @@ async def admin_stats(cb: CallbackQuery):
 	if not top_recent and not top_inactive:
 		lines.append("")
 		lines.append("Нет данных по пользователям.")
+	
+	# Добавляем раздел "Крипта" с заглушками "Загрузка..."
+	from app.config import get_settings
+	from app.google_sheets import get_crypto_values_from_row_4
+	
+	settings = get_settings()
+	crypto_columns = await db.list_crypto_columns()
+	
+	if crypto_columns and settings.google_sheet_id and settings.google_credentials_path:
+		lines.append("")
+		lines.append("<b>₿ Крипта</b>")
+		
+		# Добавляем заглушки "Загрузка..." для каждой криптовалюты
+		for crypto in crypto_columns:
+			crypto_type = crypto.get("crypto_type", "")
+			lines.append(f"<code>{crypto_type} = Загрузка...</code>")
+	
+	# Отправляем сообщение сразу со статистикой активности
 	text = "\n".join(lines)
 	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 	await cb.answer()
+	
+	# Асинхронно загружаем значения криптовалют и обновляем сообщение
+	if crypto_columns and settings.google_sheet_id and settings.google_credentials_path:
+		# Сохраняем базовые строки (без раздела "Крипта")
+		base_lines = lines[:-len(crypto_columns)-2]  # Все строки кроме раздела "Крипта"
+		
+		# Запускаем задачу обновления в фоне
+		asyncio.create_task(_update_crypto_values_in_stats(
+			cb.bot,
+			cb.message.chat.id,
+			cb.message.message_id,
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			crypto_columns,
+			base_lines
+		))
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))
@@ -1619,7 +1809,7 @@ async def crypto_change_amount_process(message: Message, state: FSMContext):
 			except Exception as e:
 				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 		
-		# Возвращаемся к основному меню с тремя кнопками
+		# Возвращаемся к основному меню с двумя кнопками
 		message_text = await format_multi_forward_message_text(rows_data)
 		await message.answer(
 			f"✅ Количество обновлено\n\n{message_text}",
@@ -1654,6 +1844,7 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 		data = await state.get_data()
 		row_index = data.get("current_row_index", 0)
 		rows_data = data.get("multi_forward_rows", [])
+		selected_card_for_cash = data.get("selected_card_for_cash")
 		
 		# Убеждаемся, что строка существует
 		while len(rows_data) <= row_index:
@@ -1661,6 +1852,11 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 		
 		row = rows_data[row_index]
 		cash_data = row.get("cash_data")
+		
+		# Если была выбрана карта для наличных, сохраняем её
+		if selected_card_for_cash:
+			row["card_data"] = selected_card_for_cash
+			logger.info(f"✅ Сохранена выбранная карта для наличных: {selected_card_for_cash.get('display')}")
 		
 		# Обновляем или создаем данные наличных
 		if cash_data:
@@ -1682,6 +1878,9 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 		
 		row["cash_data"] = cash_data
 		rows_data[row_index] = row
+		
+		# Очищаем выбранную карту из state
+		await state.update_data(selected_card_for_cash=None)
 		
 		# Обновляем данные в state
 		await state.update_data(multi_forward_rows=rows_data)
@@ -1707,7 +1906,7 @@ async def cash_change_amount_process(message: Message, state: FSMContext):
 			except Exception as e:
 				logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 		
-		# Возвращаемся к основному меню с тремя кнопками
+		# Возвращаемся к основному меню с двумя кнопками
 		message_text = await format_multi_forward_message_text(rows_data)
 		await message.answer(
 			f"✅ Количество обновлено\n\n{message_text}",
@@ -2503,51 +2702,24 @@ async def multi_forward_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		return
 	
 	elif selected_type == "cash":
-		if not cash_data:
-			# Наличные не указаны - создаем новую запись и запрашиваем ввод
-			logger.info("⚠️ Наличные не найдены в сообщениях, создаем новую запись")
-			
-			# Создаем новое сообщение с наличными (валюта по умолчанию - RUB)
-			cash_msg = {
-				"text": "",
-				"parsed": {
-					"type": "cash",
-					"value": 0,
-					"currency": "RUB",
-					"display": "0"
-				},
-				"message_id": None  # Это виртуальное сообщение
-			}
-			messages_list.append(cash_msg)
-			await state.update_data(multi_forward_messages=messages_list)
-			
-			# Переходим к вводу количества
-			await state.set_state(ForwardBindStates.editing_cash_amount)
-			await cb.message.edit_text(
-				"📝 Введите количество наличных:\n\nНапример: 100",
-				reply_markup=None
-			)
-			await cb.answer()
-			return
+		# Сохраняем row_index для последующего использования
+		await state.update_data(current_row_index=row_index)
 		
-		# Показываем клавиатуру для редактирования наличных
-		from app.keyboards import cash_edit_kb
+		# Всегда сначала показываем выбор группы карт
+		groups = await db.list_card_groups()
+		logger.debug(f"Показываем список групп для выбора карты при вводе наличных: count={len(groups)}")
 		
-		current_currency = cash_data.get("currency", "RUB")
-		amount = cash_data.get("value", 0)
-		display = cash_data.get("display", "Наличные")
+		from app.keyboards import card_groups_select_kb
 		
-		logger.info(f"📝 Открываем редактирование наличных: {display}, currency={current_currency}, amount={amount}")
+		# Переходим в состояние выбора карты для наличных
+		await state.set_state(ForwardBindStates.selecting_card_for_cash)
 		
-		try:
-			await cb.message.edit_text(
-				f"📝 Редактирование: {display}\n\nВыберите валюту или измените количество:",
-				reply_markup=cash_edit_kb(current_currency, amount)
-			)
-			await cb.answer()
-		except Exception as e:
-			logger.exception(f"❌ Ошибка при редактировании сообщения: {e}")
-			await cb.answer("Ошибка при открытии редактирования", show_alert=True)
+		text = "💵 Выберите группу карт для наличных:"
+		if not groups:
+			text = "💵 Групп пока нет. Выберите карты без группы:"
+		
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"multi:select:cash:{row_index}"))
+		await cb.answer()
 		return
 	
 	elif selected_type == "card":
@@ -3389,11 +3561,14 @@ async def cash_edit_back(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(
 	F.data.startswith("multi:select:group:"),
-	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward, ForwardBindStates.selecting_card_for_cash)
 )
 async def multi_select_group(cb: CallbackQuery, state: FSMContext):
 	"""Обработчик выбора группы карт - показывает карты из выбранной группы"""
 	db = get_db()
+	current_state = await state.get_state()
+	is_cash_mode = current_state == ForwardBindStates.selecting_card_for_cash
+	
 	# Формат: multi:select:group:{group_id} или multi:select:group:0 для карт без группы
 	group_id_str = cb.data.split(":")[-1]
 	group_id = int(group_id_str) if group_id_str != "0" else None
@@ -3403,11 +3578,11 @@ async def multi_select_group(cb: CallbackQuery, state: FSMContext):
 		cards = await db.get_cards_by_group(group_id)
 		group = await db.get_card_group(group_id)
 		group_name = group.get("name", "Группа") if group else "Группа"
-		text = f"Карты из группы '{group_name}':"
+		text = f"💵 Карты из группы '{group_name}':" if is_cash_mode else f"Карты из группы '{group_name}':"
 	else:
 		# Получаем карты без группы
 		cards = await db.get_cards_without_group()
-		text = "Карты без группы:"
+		text = "💵 Карты без группы:" if is_cash_mode else "Карты без группы:"
 	
 	if not cards:
 		await cb.answer("В этой группе нет карт" if group_id else "Нет карт без группы", show_alert=True)
@@ -3418,7 +3593,14 @@ async def multi_select_group(cb: CallbackQuery, state: FSMContext):
 	kb = InlineKeyboardBuilder()
 	for card_id, card_name, _ in cards:
 		kb.button(text=f"💳 {card_name}", callback_data=f"multi:select_card:{card_id}")
-	kb.button(text="⬅️ Назад", callback_data="multi:select:card")
+	
+	# Определяем callback для кнопки "Назад" в зависимости от режима
+	if is_cash_mode:
+		data = await state.get_data()
+		row_index = data.get("current_row_index", 0)
+		kb.button(text="⬅️ Назад", callback_data=f"multi:select:cash:{row_index}")
+	else:
+		kb.button(text="⬅️ Назад", callback_data="multi:select:card")
 	kb.adjust(1)
 	
 	await cb.message.edit_text(text, reply_markup=kb.as_markup())
@@ -3427,11 +3609,14 @@ async def multi_select_group(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(
 	F.data.startswith("multi:select_card:"),
-	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward)
+	StateFilter(ForwardBindStates.waiting_select_card, ForwardBindStates.collecting_multi_forward, ForwardBindStates.selecting_card_for_cash)
 )
 async def multi_select_card(cb: CallbackQuery, state: FSMContext):
 	"""Обработчик выбора карты в множественных пересылках"""
 	db = get_db()
+	current_state = await state.get_state()
+	is_cash_mode = current_state == ForwardBindStates.selecting_card_for_cash
+	
 	# Формат: multi:select_card:{card_id}
 	card_id = int(cb.data.split(":")[-1])
 	
@@ -3483,6 +3668,20 @@ async def multi_select_card(cb: CallbackQuery, state: FSMContext):
 	row["card_data"] = card_data
 	rows_data[row_index] = row
 	
+	# Если это режим выбора карты для наличных, переходим к вводу количества
+	if is_cash_mode:
+		# Сохраняем выбранную карту
+		await state.update_data(multi_forward_rows=rows_data, selected_card_for_cash=card_data)
+		
+		# Переходим к вводу количества наличных
+		await state.set_state(ForwardBindStates.editing_cash_amount)
+		await cb.message.edit_text(
+			f"💵 Выбрана карта: {card_data['display']}\n\n📝 Введите количество наличных:\n\nНапример: 100",
+			reply_markup=None
+		)
+		await cb.answer(f"✅ Выбрана карта: {card_name}")
+		return
+	
 	# Обновляем данные в state
 	await state.update_data(multi_forward_rows=rows_data)
 	
@@ -3505,7 +3704,7 @@ async def multi_select_card(cb: CallbackQuery, state: FSMContext):
 		except Exception as e:
 			logger.exception(f"Ошибка обновления сообщения с кнопками: {e}")
 	
-	# Возвращаемся к основному меню с тремя кнопками
+	# Возвращаемся к основному меню с двумя кнопками
 	message_text = await format_multi_forward_message_text(rows_data)
 	await cb.message.edit_text(
 		message_text,

@@ -13,7 +13,39 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True) -> InlineKeyboardMarkup:
+def cards_groups_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для списка групп карт в главном меню.
+	
+	Args:
+		groups: Список словарей с информацией о группах
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Добавляем кнопки групп
+	for group in groups:
+		group_name = group.get("name", "")
+		group_id = group.get("id")
+		kb.button(text=f"📁 {group_name}", callback_data=f"cards:group:{group_id}")
+	
+	# Добавляем кнопку "Вне групп" для карт без группы
+	kb.button(text="📋 Вне групп", callback_data="cards:group:0")
+	
+	# Добавляем остальные кнопки
+	kb.button(text="➕ Добавить карту", callback_data="card:add")
+	kb.button(text="₿ Крипта", callback_data="admin:crypto")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	# Формируем параметры для adjust: группы по 1 в ряд, остальные по 1
+	adjust_params = [1] * (len(groups) + 1)  # Группы + "Вне групп"
+	adjust_params.extend([1, 1, 1])  # Добавить карту, Крипта, Назад
+	kb.adjust(*adjust_params)
+	
+	return kb.as_markup()
+
+
+def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: str = "admin:cards", group_id: Optional[int] = None) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	# Добавляем все кнопки карт
 	for cid, name in cards:
@@ -22,12 +54,18 @@ def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True) -> Inline
 	# Добавляем остальные кнопки
 	if with_add:
 		kb.button(text="➕ Добавить карту", callback_data="card:add")
-	kb.button(text="₿ Крипта", callback_data="admin:crypto")
-	kb.button(text="⬅️ Назад", callback_data="admin:back")
+	
+	# Если это список карт группы, показываем кнопку "Удалить группу" вместо "Крипта"
+	if group_id is not None:
+		kb.button(text="🗑️ Удалить группу", callback_data=f"cards:delete_group:{group_id}")
+	else:
+		kb.button(text="₿ Крипта", callback_data="admin:crypto")
+	
+	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
 	# Формируем параметры для adjust: карты по 2 в ряд, остальные по 1
 	# Количество дополнительных кнопок
-	additional_buttons = 2  # Крипта и Назад
+	additional_buttons = 2  # Крипта/Удалить группу и Назад
 	if with_add:
 		additional_buttons += 1  # Добавить карту
 	
@@ -245,7 +283,8 @@ def similar_users_select_kb(similar_users: List[Dict], hidden_name: str, back_to
 def multi_forward_select_kb(rows_data: List[Dict] | None = None, selected_xmr: Dict[int, int] | None = None, back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру с несколькими строками для множественных пересылок.
-	Каждая строка содержит три кнопки: криптовалюта, наличные, карта.
+	Каждая строка содержит две кнопки: криптовалюта и наличные.
+	При выборе наличных пользователю предлагается выбрать карту из группы, а затем ввести количество.
 	Если криптовалюта XMR, показывает кнопки XMR-1, XMR-2, XMR-3 под соответствующей строкой.
 	Перед "Подтвердить" добавляется кнопка "+" для добавления новой строки (до 5 строк).
 	
@@ -288,14 +327,7 @@ def multi_forward_select_kb(rows_data: List[Dict] | None = None, selected_xmr: D
 		else:
 			kb.button(text="💵", callback_data=f"multi:select:cash:{row_index}")
 		
-		# Кнопка 3: Карта
-		if card_data:
-			display = card_data.get("display", "Карта")
-			kb.button(text=f"💳 {display}", callback_data=f"multi:select:card:{row_index}")
-		else:
-			kb.button(text="💳", callback_data=f"multi:select:card:{row_index}")
-		
-		adjust_params.append(3)  # Три кнопки в ряд
+		adjust_params.append(2)  # Две кнопки в ряд (монеты и наличные)
 		
 		# Если криптовалюта XMR, добавляем кнопки XMR-1, XMR-2, XMR-3
 		if crypto_data and crypto_data.get("currency") == "XMR":
