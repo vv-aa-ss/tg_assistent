@@ -9,6 +9,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb.button(text="📇 Карты", callback_data="admin:cards")
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
 	kb.button(text="📊 Статистика", callback_data="admin:stats")
+	kb.button(text="₿ Крипта", callback_data="admin:crypto")
 	kb.adjust(2)
 	return kb.as_markup()
 
@@ -34,12 +35,11 @@ def cards_groups_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKe
 	
 	# Добавляем остальные кнопки
 	kb.button(text="➕ Добавить карту", callback_data="card:add")
-	kb.button(text="₿ Крипта", callback_data="admin:crypto")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
 	# Формируем параметры для adjust: группы по 1 в ряд, остальные по 1
 	adjust_params = [1] * (len(groups) + 1)  # Группы + "Вне групп"
-	adjust_params.extend([1, 1, 1])  # Добавить карту, Крипта, Назад
+	adjust_params.extend([1, 1])  # Добавить карту, Назад
 	kb.adjust(*adjust_params)
 	
 	return kb.as_markup()
@@ -55,17 +55,17 @@ def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: 
 	if with_add:
 		kb.button(text="➕ Добавить карту", callback_data="card:add")
 	
-	# Если это список карт группы, показываем кнопку "Удалить группу" вместо "Крипта"
+	# Если это список карт группы, показываем кнопку "Удалить группу"
 	if group_id is not None:
 		kb.button(text="🗑️ Удалить группу", callback_data=f"cards:delete_group:{group_id}")
-	else:
-		kb.button(text="₿ Крипта", callback_data="admin:crypto")
 	
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
 	# Формируем параметры для adjust: карты по 2 в ряд, остальные по 1
 	# Количество дополнительных кнопок
-	additional_buttons = 2  # Крипта/Удалить группу и Назад
+	additional_buttons = 1  # Назад (всегда есть)
+	if group_id is not None:
+		additional_buttons += 1  # Удалить группу
 	if with_add:
 		additional_buttons += 1  # Добавить карту
 	
@@ -182,7 +182,7 @@ def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboard
 
 def card_action_kb(card_id: int, back_to: str = "admin:cards") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
-	kb.button(text="✏️ Изменить сообщение", callback_data=f"card:edit:{card_id}")
+	kb.button(text="✏️ Изменить реквизиты", callback_data=f"card:edit:{card_id}")
 	kb.button(text="🔗 Привязать ячейку", callback_data=f"card:bind_column:{card_id}")
 	kb.button(text="📁 Группы", callback_data=f"card:groups:{card_id}")
 	kb.button(text="🗑️ Удалить карту", callback_data=f"card:delete:{card_id}")
