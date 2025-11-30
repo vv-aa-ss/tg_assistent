@@ -885,6 +885,21 @@ async def write_all_to_google_sheet_one_row(
 				# Добавляем адрес столбца в данные карты
 				card_data["column"] = card_columns[key]
 		
+		# Получаем адреса столбцов для наличных
+		cash_columns = {}
+		logger.info(f"🔍 Обработка наличных в режиме /add: cash_list={cash_list}")
+		for cash in cash_list:
+			cash_name = cash.get("cash_name")
+			logger.info(f"🔍 Обработка наличных: cash_name={cash_name}, cash={cash}")
+			if cash_name and cash_name not in cash_columns:
+				cash_column = await db.get_cash_column(cash_name)
+				cash_columns[cash_name] = cash_column
+				# Добавляем адрес столбца в данные наличных
+				cash["column"] = cash_column
+				logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+			elif not cash_name:
+				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
+		
 		# Выполняем синхронную запись в отдельном потоке
 		return await asyncio.to_thread(
 			_write_all_to_google_sheet_one_row_sync,
@@ -987,10 +1002,19 @@ def _write_all_to_google_sheet_one_row_sync(
 					logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (карта: {card_name})")
 		
 		# Записываем наличные без карты (если есть)
-		if cash_list:
-			# Если есть наличные без карты, нужно определить, куда их записывать
-			# Пока пропускаем, так как без карты не знаем столбец
-			logger.warning("⚠️ Наличные без карты не могут быть записаны (неизвестен столбец)")
+		logger.info(f"🔍 Запись наличных без карты в режиме /add: cash_list={cash_list}, len={len(cash_list)}")
+		for cash in cash_list:
+			cash_name = cash.get("cash_name", "")
+			cash_currency = cash.get("currency", "RUB")
+			cash_amount = cash.get("value", 0)
+			column = cash.get("column")
+			logger.info(f"🔍 Наличные для записи: cash_name={cash_name}, amount={cash_amount}, column={column}")
+			
+			if column and cash_amount > 0:
+				worksheet.update(f"{column}{empty_row}", [[cash_amount]])
+				logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
+			elif not column:
+				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
 		
 		return {"success": True}
 		
@@ -1235,6 +1259,21 @@ async def write_to_google_sheet_rate_mode(
 				# Добавляем адрес столбца в данные карты
 				card_data["column"] = card_columns[key]
 		
+		# Получаем адреса столбцов для наличных
+		cash_columns = {}
+		logger.info(f"🔍 Обработка наличных: cash_list={cash_list}")
+		for cash in cash_list:
+			cash_name = cash.get("cash_name")
+			logger.info(f"🔍 Обработка наличных: cash_name={cash_name}, cash={cash}")
+			if cash_name and cash_name not in cash_columns:
+				cash_column = await db.get_cash_column(cash_name)
+				cash_columns[cash_name] = cash_column
+				# Добавляем адрес столбца в данные наличных
+				cash["column"] = cash_column
+				logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+			elif not cash_name:
+				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
+		
 		# Получаем лимит строки из базы данных
 		rate_max_row_str = await db.get_google_sheets_setting("rate_max_row", "355")
 		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 355
@@ -1380,9 +1419,29 @@ def _write_to_google_sheet_rate_mode_sync(
 						column_rows[column] = empty_row
 						logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {column}{empty_row} (карта: {card_name})")
 		
-		# Наличные без карты не записываем (неизвестен столбец)
-		if cash_list:
-			logger.warning("⚠️ Наличные без карты не могут быть записаны в режиме rate (неизвестен столбец)")
+		# Записываем наличные без карты
+		logger.info(f"🔍 Запись наличных без карты: cash_list={cash_list}, len={len(cash_list)}")
+		for cash in cash_list:
+			cash_name = cash.get("cash_name", "")
+			cash_currency = cash.get("currency", "RUB")
+			cash_amount = cash.get("value", 0)
+			column = cash.get("column")
+			
+			if column and cash_amount > 0:
+				# В режиме rate записываем со знаком минус
+				cash_amount_negative = -cash_amount
+				empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
+				if empty_row > rate_max_row:
+					failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
+					logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
+				else:
+					worksheet.update(f"{column}{empty_row}", [[cash_amount_negative]])
+					written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {cash_amount_negative} {cash_currency})")
+					column_rows[column] = empty_row
+					logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
+			elif not column:
+				failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (не указан адрес столбца)")
+				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
 		
 		return {
 			"success": len(written_cells) > 0 or len(failed_writes) == 0,

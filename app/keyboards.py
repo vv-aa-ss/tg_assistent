@@ -1,16 +1,17 @@
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple, Any
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
-	kb.button(text="📇 Карты", callback_data="admin:cards")
+	kb.button(text="💵 Наличные", callback_data="admin:cash")
+	kb.button(text="📇 Безнал", callback_data="admin:cards")
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
-	kb.button(text="📊 Статистика", callback_data="admin:stats")
 	kb.button(text="₿ Крипта", callback_data="admin:crypto")
-	kb.adjust(2)
+	kb.button(text="📊 Статистика", callback_data="admin:stats")
+	kb.adjust(2, 2, 1)
 	return kb.as_markup()
 
 
@@ -135,9 +136,9 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
-def card_groups_select_kb(groups: List[Dict], back_to: str = "multi:back_to_main") -> InlineKeyboardMarkup:
+def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	"""
-	Создает клавиатуру для выбора группы карт в контексте /add.
+	Создает клавиатуру для выбора группы карт.
 	
 	Args:
 		groups: Список словарей с информацией о группах
@@ -147,9 +148,18 @@ def card_groups_select_kb(groups: List[Dict], back_to: str = "multi:back_to_main
 	for group in groups:
 		group_name = group.get("name", "")
 		group_id = group.get("id")
-		kb.button(text=f"📁 {group_name}", callback_data=f"multi:select:group:{group_id}")
+		# Определяем, какой callback использовать в зависимости от back_to
+		if back_to.startswith("add_data:back:"):
+			# Используется в командах /add и /rate
+			kb.button(text=f"📁 {group_name}", callback_data=f"{back_to}:group:{group_id}")
+		else:
+			# Стандартное использование
+			kb.button(text=f"📁 {group_name}", callback_data=f"cards:group:{group_id}")
 	# Добавляем кнопку для карт без группы
-	kb.button(text="📋 Без группы", callback_data="multi:select:group:0")
+	if back_to.startswith("add_data:back:"):
+		kb.button(text="📋 Без группы", callback_data=f"{back_to}:group:0")
+	else:
+		kb.button(text="📋 Без группы", callback_data="cards:group:0")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
 	return kb.as_markup()
@@ -283,7 +293,7 @@ def card_groups_list_kb(groups: List[Dict], card_id: int, back_to: str = "admin:
 	return kb.as_markup()
 
 
-def crypto_list_kb(crypto_columns: List[Dict], back_to: str = "admin:cards") -> InlineKeyboardMarkup:
+def crypto_list_kb(crypto_columns: List[Dict], back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для списка криптовалют с их адресами столбцов.
 	
@@ -317,6 +327,61 @@ def crypto_delete_kb(crypto_columns: List[Dict], back_to: str = "admin:crypto") 
 		column = crypto.get("column", "")
 		kb.button(text=f"{crypto_type} → {column}", callback_data=f"crypto:delete:{crypto_type}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def cash_list_kb(cash_columns: List[Dict], back_to: str = "admin:back") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для списка наличных с их адресами столбцов.
+	
+	Args:
+		cash_columns: Список словарей с ключами cash_name и column
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for cash in cash_columns:
+		cash_name = cash.get("cash_name", "")
+		column = cash.get("column", "")
+		kb.button(text=f"{cash_name} → {column}", callback_data=f"cash:edit:{cash_name}")
+	kb.button(text="➕ Новая", callback_data="cash:new")
+	kb.button(text="🗑️ Удалить", callback_data="cash:delete_list")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def cash_delete_kb(cash_columns: List[Dict], back_to: str = "admin:cash") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для удаления наличных.
+	
+	Args:
+		cash_columns: Список словарей с ключами cash_name и column
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for cash in cash_columns:
+		cash_name = cash.get("cash_name", "")
+		kb.button(text=f"🗑️ {cash_name}", callback_data=f"cash:delete:{cash_name}")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def cash_select_kb(cash_columns: List[Dict], mode: str = "add", back_to: str = "add_data:back") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора названия наличных в командах /add и /rate.
+	
+	Args:
+		cash_columns: Список словарей с ключами cash_name и column
+		mode: Режим работы ("add" или "rate")
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	for cash in cash_columns:
+		cash_name = cash.get("cash_name", "")
+		kb.button(text=cash_name, callback_data=f"add_data:cash_select:{cash_name}:{mode}")
+	kb.button(text="⬅️ Назад", callback_data=f"{back_to}:{mode}")
 	kb.adjust(1)
 	return kb.as_markup()
 
@@ -457,4 +522,78 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 		kb.adjust(3, 1, 1, 1)
 	else:
 		kb.adjust(3, 1, 1)
+	return kb.as_markup()
+
+
+def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора типа данных в командах /add и /rate.
+	
+	Args:
+		mode: Режим работы ("add" или "rate")
+		back_to: Callback data для кнопки "Назад"
+		data: Словарь с выбранными данными (crypto_data, cash_data, card_data, card_cash_data)
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Определяем текст для кнопок на основе выбранных данных
+	crypto_text = "🪙"
+	cash_text = "💵"
+	card_text = "💳"
+	
+	if data:
+		crypto_data = data.get("crypto_data")
+		if crypto_data:
+			currency = crypto_data.get("currency", "")
+			usd_amount = crypto_data.get("usd_amount", 0)
+			xmr_number = crypto_data.get("xmr_number")
+			if xmr_number:
+				crypto_text = f"{int(usd_amount)}USD (XMR-{xmr_number})"
+			else:
+				crypto_text = f"{int(usd_amount)}USD ({currency})"
+		
+		cash_data = data.get("cash_data")
+		if cash_data:
+			amount = cash_data.get("value", 0)
+			cash_text = str(amount)
+		
+		card_data = data.get("card_data")
+		card_cash_data = data.get("card_cash_data")
+		if card_data:
+			card_name = card_data.get("card_name", "")
+			if card_cash_data:
+				amount = card_cash_data.get("value", 0)
+				card_text = f"{card_name}: {amount}р."
+			else:
+				card_text = card_name
+	
+	# Первый ряд: Криптовалюта и Карта
+	kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:{mode}")
+	kb.button(text=card_text, callback_data=f"add_data:type:card:{mode}")
+	# Второй ряд: Наличные
+	kb.button(text=cash_text, callback_data=f"add_data:type:cash:{mode}")
+	# Третий ряд: Подтвердить и Назад
+	kb.button(text="✅ Подтвердить", callback_data=f"add_data:confirm:{mode}")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	kb.adjust(2, 1, 2)
+	return kb.as_markup()
+
+
+def add_data_xmr_select_kb(mode: str = "add", back_to: str = "add_data:back") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора номера XMR (1, 2, 3).
+	
+	Args:
+		mode: Режим работы ("add" или "rate")
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	kb.button(text="XMR-1", callback_data=f"add_data:xmr:1:{mode}")
+	kb.button(text="XMR-2", callback_data=f"add_data:xmr:2:{mode}")
+	kb.button(text="XMR-3", callback_data=f"add_data:xmr:3:{mode}")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	
+	kb.adjust(3, 1)
 	return kb.as_markup()

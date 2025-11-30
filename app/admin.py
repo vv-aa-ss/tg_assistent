@@ -21,6 +21,8 @@ from app.keyboards import (
 	user_card_select_kb,
 	crypto_list_kb,
 	crypto_delete_kb,
+	cash_list_kb,
+	cash_delete_kb,
 	user_action_kb,
 	card_action_kb,
 	user_cards_reply_kb,
@@ -156,6 +158,17 @@ class ForwardBindStates(StatesGroup):
 	selecting_card_for_cash = State()  # Состояние для выбора карты при вводе наличных
 
 
+class AddDataStates(StatesGroup):
+	"""Состояния для команд /add и /rate"""
+	selecting_type = State()  # Выбор типа данных (криптовалюта, наличные, карта)
+	entering_crypto = State()  # Ввод суммы криптовалюты в USD
+	selecting_cash_name = State()  # Выбор названия наличных
+	entering_cash = State()  # Ввод суммы наличных (без карты)
+	entering_card_cash = State()  # Ввод суммы наличных для карты
+	selecting_card = State()  # Выбор карты
+	selecting_xmr = State()  # Выбор номера XMR (1, 2, 3)
+
+
 class CryptoColumnEditStates(StatesGroup):
 	waiting_column = State()
 	waiting_crypto_name = State()
@@ -164,6 +177,12 @@ class CryptoColumnEditStates(StatesGroup):
 
 class CardGroupStates(StatesGroup):
 	waiting_group_name = State()
+
+
+class CashColumnEditStates(StatesGroup):
+	waiting_column = State()
+	waiting_cash_name = State()
+	waiting_cash_column = State()
 
 
 def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
@@ -517,6 +536,503 @@ async def admin_back(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
+def format_add_data_text(data: dict) -> str:
+	"""Форматирует текст с выбранными данными для меню /add"""
+	text = "📋 Добавление данных\n\n"
+	
+	# Показываем выбранные данные
+	selected_items = []
+	
+	crypto_data = data.get("crypto_data")
+	if crypto_data:
+		currency = crypto_data.get("currency", "")
+		usd_amount = crypto_data.get("usd_amount", 0)
+		xmr_number = crypto_data.get("xmr_number")
+		if xmr_number:
+			selected_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
+		else:
+			selected_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
+	
+	card_data = data.get("card_data")
+	cash_data = data.get("cash_data")
+	card_cash_data = data.get("card_cash_data")  # Наличные для карты
+	
+	# Обрабатываем карту
+	if card_data:
+		card_name = card_data.get("card_name", "")
+		if card_cash_data:
+			# Карта с наличными
+			amount = card_cash_data.get("value", 0)
+			selected_items.append(f"💳 Карта: {card_name}: {amount} р.")
+		else:
+			# Только карта без наличных
+			selected_items.append(f"💳 Карта: {card_name}")
+	
+	# Обрабатываем наличные без карты
+	if cash_data:
+		amount = cash_data.get("value", 0)
+		cash_name = cash_data.get("cash_name", "Наличные")
+		selected_items.append(f"💵 {cash_name}: {amount} р.")
+	
+	if selected_items:
+		text += "Выбранные данные:\n" + "\n".join(selected_items) + "\n\n"
+	
+	text += "Выберите тип данных для добавления:"
+	return text
+
+
+@admin_router.message(F.text == "/add")
+async def cmd_add(message: Message, state: FSMContext):
+	"""Команда для вызова меню добавления данных в таблицу (режим add)"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	await state.set_state(AddDataStates.selecting_type)
+	await state.update_data(mode="add", crypto_data=None, cash_data=None, card_data=None, card_cash_data=None, xmr_number=None)
+	
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	await message.answer(text, reply_markup=add_data_type_kb(mode="add", data=data))
+
+
+@admin_router.message(Command("rate"))
+async def cmd_rate(message: Message, state: FSMContext):
+	"""Команда для вызова меню добавления данных в таблицу (режим rate)"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	await state.set_state(AddDataStates.selecting_type)
+	await state.update_data(mode="rate", crypto_data=None, cash_data=None, card_data=None, card_cash_data=None, xmr_number=None)
+	
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	await message.answer(text, reply_markup=add_data_type_kb(mode="rate", data=data))
+
+
+@admin_router.callback_query(F.data == "admin:cash")
+async def admin_cash(cb: CallbackQuery):
+	"""Показывает список наличных с их адресами столбцов"""
+	db = get_db()
+	cash_columns = await db.list_cash_columns()
+	logger.debug(f"Show cash columns: count={len(cash_columns)}")
+	
+	if not cash_columns:
+		text = "Список наличных пуст."
+	else:
+		text = "Список наличных и их адресов столбцов:\n\n"
+		for cash in cash_columns:
+			cash_name = cash.get("cash_name", "")
+			column = cash.get("column", "")
+			text += f"{cash_name} → {column}\n"
+	
+	await cb.message.edit_text(text, reply_markup=cash_list_kb(cash_columns))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:type:"))
+async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора типа данных в командах /add и /rate"""
+	parts = cb.data.split(":")
+	data_type = parts[2]  # crypto, cash, card
+	mode = parts[3]  # add или rate
+	
+	data = await state.get_data()
+	
+	if data_type == "crypto":
+		# Показываем выбор криптовалюты
+		from app.keyboards import crypto_select_kb
+		await state.set_state(AddDataStates.selecting_type)
+		await cb.message.edit_text(
+			"🪙 Выберите криптовалюту:",
+			reply_markup=crypto_select_kb(back_to=f"add_data:back:{mode}", show_confirm=False)
+		)
+		await cb.answer()
+	elif data_type == "cash":
+		# Показываем выбор названия наличных
+		db = get_db()
+		cash_columns = await db.list_cash_columns()
+		if not cash_columns:
+			await cb.answer("❌ Нет доступных наличных. Добавьте наличные в меню 'Наличные'.", show_alert=True)
+			return
+		
+		from app.keyboards import cash_select_kb
+		await state.set_state(AddDataStates.selecting_cash_name)
+		await cb.message.edit_text(
+			"💵 Выберите название наличных:",
+			reply_markup=cash_select_kb(cash_columns, mode=mode, back_to=f"add_data:back")
+		)
+		await cb.answer()
+	elif data_type == "card":
+		# Показываем выбор карты
+		db = get_db()
+		groups = await db.list_card_groups()
+		from app.keyboards import card_groups_select_kb
+		await state.set_state(AddDataStates.selecting_card)
+		text = "💳 Выберите группу карт:" if groups else "💳 Групп пока нет. Выберите карты без группы:"
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"add_data:back:{mode}"))
+		await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:back:") & ~F.data.contains(":group:"))
+async def add_data_back(cb: CallbackQuery, state: FSMContext):
+	"""Возврат к меню выбора типа данных"""
+	parts = cb.data.split(":")
+	mode = parts[2]
+	
+	await state.set_state(AddDataStates.selecting_type)
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:back:") & F.data.contains(":group:"))
+async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора группы карт в командах /add и /rate"""
+	# Формат: add_data:back:{mode}:group:{group_id}
+	parts = cb.data.split(":")
+	mode = parts[2]
+	group_id_str = parts[4]
+	group_id = int(group_id_str) if group_id_str != "0" else None
+	
+	db = get_db()
+	if group_id:
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		text = f"💳 Карты группы '{group_name}':"
+	else:
+		cards = await db.get_cards_without_group()
+		text = "💳 Карты вне групп:"
+	
+	if not cards:
+		await cb.answer("В этой группе нет карт", show_alert=True)
+		return
+	
+	cards_list = [(c[0], c[1]) for c in cards]
+	from app.keyboards import cards_list_kb
+	await state.set_state(AddDataStates.selecting_card)
+	await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, with_add=False, back_to=f"add_data:back:{mode}"))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("crypto:select:"))
+async def add_data_select_crypto(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора криптовалюты в командах /add и /rate"""
+	currency = cb.data.split(":")[-1]
+	data = await state.get_data()
+	mode = data.get("mode", "add")
+	
+	if currency == "XMR":
+		# Для XMR нужно выбрать номер
+		await state.set_state(AddDataStates.selecting_xmr)
+		from app.keyboards import add_data_xmr_select_kb
+		await cb.message.edit_text(
+			"🪙 Выберите номер XMR:",
+			reply_markup=add_data_xmr_select_kb(mode=mode, back_to=f"add_data:back:{mode}")
+		)
+		await cb.answer()
+	else:
+		# Для других криптовалют запрашиваем сумму в USD
+		await state.set_state(AddDataStates.entering_crypto)
+		await state.update_data(crypto_currency=currency)
+		await cb.message.edit_text(
+			f"🪙 Введите сумму в USD для {currency}:",
+			reply_markup=simple_back_kb(f"add_data:back:{mode}")
+		)
+		await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:xmr:"))
+async def add_data_select_xmr(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора номера XMR"""
+	parts = cb.data.split(":")
+	xmr_number = int(parts[2])
+	mode = parts[3]
+	
+	await state.update_data(xmr_number=xmr_number, crypto_currency="XMR")
+	await state.set_state(AddDataStates.entering_crypto)
+	await cb.message.edit_text(
+		f"🪙 Введите сумму в USD для XMR-{xmr_number}:",
+		reply_markup=simple_back_kb(f"add_data:back:{mode}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(AddDataStates.entering_crypto)
+async def add_data_enter_crypto(message: Message, state: FSMContext):
+	"""Обработчик ввода суммы криптовалюты"""
+	try:
+		usd_amount = float(message.text.replace(",", "."))
+		if usd_amount <= 0:
+			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
+			return
+		
+		data = await state.get_data()
+		currency = data.get("crypto_currency", "BTC")
+		xmr_number = data.get("xmr_number")
+		
+		crypto_data = {
+			"currency": currency,
+			"usd_amount": usd_amount,
+			"value": usd_amount
+		}
+		if xmr_number:
+			crypto_data["xmr_number"] = xmr_number
+		
+		await state.update_data(crypto_data=crypto_data)
+		await state.set_state(AddDataStates.selecting_type)
+		
+		mode = data.get("mode", "add")
+		from app.keyboards import add_data_type_kb
+		data = await state.get_data()
+		text = format_add_data_text(data)
+		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число, например: 100")
+	except Exception as e:
+		logger.exception(f"Ошибка обработки криптовалюты: {e}")
+		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(AddDataStates.selecting_cash_name, F.data.startswith("add_data:cash_select:"))
+async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора названия наличных"""
+	parts = cb.data.split(":")
+	cash_name = parts[2]
+	mode = parts[3]
+	
+	# Сохраняем название наличных
+	await state.update_data(cash_name=cash_name)
+	await state.set_state(AddDataStates.entering_cash)
+	
+	await cb.message.edit_text(
+		f"💵 Введите сумму наличных для '{cash_name}' (число):",
+		reply_markup=simple_back_kb(f"add_data:back:{mode}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(AddDataStates.entering_card_cash)
+async def add_data_enter_card_cash(message: Message, state: FSMContext):
+	"""Обработчик ввода суммы наличных для карты"""
+	try:
+		amount = int(float(message.text.replace(",", ".")))
+		if amount <= 0:
+			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
+			return
+		
+		data = await state.get_data()
+		
+		# Сохраняем наличные для карты
+		card_cash_data = {
+			"currency": "RUB",
+			"value": amount,
+			"display": f"{amount} RUB"
+		}
+		
+		await state.update_data(card_cash_data=card_cash_data)
+		await state.set_state(AddDataStates.selecting_type)
+
+		mode = data.get("mode", "add")
+		from app.keyboards import add_data_type_kb
+		data = await state.get_data()
+		text = format_add_data_text(data)
+		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число, например: 200")
+	except Exception as e:
+		logger.exception(f"Ошибка обработки наличных для карты: {e}")
+		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
+
+
+@admin_router.message(AddDataStates.entering_cash)
+async def add_data_enter_cash(message: Message, state: FSMContext):
+	"""Обработчик ввода суммы наличных (без карты)"""
+	try:
+		amount = int(float(message.text.replace(",", ".")))
+		if amount <= 0:
+			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
+			return
+		
+		data = await state.get_data()
+		cash_name = data.get("cash_name", "Наличные")
+		
+		cash_data = {
+			"currency": "RUB",
+			"value": amount,
+			"display": f"{amount} RUB",
+			"cash_name": cash_name  # Сохраняем название для режима rate
+		}
+		
+		await state.update_data(cash_data=cash_data)
+		await state.set_state(AddDataStates.selecting_type)
+
+		mode = data.get("mode", "add")
+		from app.keyboards import add_data_type_kb
+		data = await state.get_data()
+		text = format_add_data_text(data)
+		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число, например: 5000")
+	except Exception as e:
+		logger.exception(f"Ошибка обработки наличных: {e}")
+		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
+
+
+@admin_router.message(AddDataStates.selecting_type)
+async def add_data_selecting_type_message(message: Message, state: FSMContext):
+	"""Обработчик текстовых сообщений в состоянии selecting_type - игнорируем, показываем подсказку"""
+	data = await state.get_data()
+	mode = data.get("mode", "add")
+	from app.keyboards import add_data_type_kb
+	text = format_add_data_text(data)
+	await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+
+
+@admin_router.callback_query(AddDataStates.selecting_card, F.data.startswith("card:view:"))
+async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора карты в командах /add и /rate"""
+	card_id = int(cb.data.split(":")[-1])
+	db = get_db()
+	card = await db.get_card_by_id(card_id)
+	
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	data = await state.get_data()
+	mode = data.get("mode", "add")
+	
+	card_data = {
+		"card_id": card_id,
+		"card_name": card.get("name", ""),
+		"user_name": None
+	}
+	
+	await state.update_data(card_data=card_data)
+	# После выбора карты запрашиваем ввод суммы наличных для карты
+	await state.set_state(AddDataStates.entering_card_cash)
+	
+	from app.keyboards import simple_back_kb
+	text = f"✅ Карта выбрана: {card.get('name', '')}\n\n💵 Введите сумму наличных для карты (число):"
+	await cb.message.edit_text(text, reply_markup=simple_back_kb(f"add_data:back:{mode}"))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:confirm:"))
+async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик подтверждения и записи данных в Google Sheets"""
+	mode = cb.data.split(":")[-1]
+	data = await state.get_data()
+	
+	crypto_data = data.get("crypto_data")
+	cash_data = data.get("cash_data")
+	card_data = data.get("card_data")
+	card_cash_data = data.get("card_cash_data")  # Наличные для карты
+	
+	# Проверяем, что есть хотя бы какие-то данные
+	if not crypto_data and not cash_data and not card_data:
+		await cb.answer("❌ Нет данных для записи. Добавьте хотя бы один тип данных.", show_alert=True)
+		return
+	
+	from app.config import get_settings
+	from app.google_sheets import write_all_to_google_sheet_one_row, write_to_google_sheet_rate_mode
+	
+	settings = get_settings()
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await cb.answer("❌ Google Sheets не настроен", show_alert=True)
+		return
+	
+	# Формируем данные для записи
+	crypto_list = []
+	xmr_list = []
+	cash_list = []
+	card_cash_pairs = []
+	
+	if crypto_data:
+		currency = crypto_data.get("currency")
+		usd_amount = crypto_data.get("usd_amount", 0)
+		xmr_number = crypto_data.get("xmr_number")
+		
+		if currency == "XMR" and xmr_number:
+			xmr_list.append({
+				"xmr_number": xmr_number,
+				"usd_amount": usd_amount
+			})
+		else:
+			crypto_list.append({
+				"currency": currency,
+				"usd_amount": usd_amount
+			})
+	
+	# Обрабатываем карту и наличные для карты
+	if card_data:
+		if card_cash_data:
+			# Карта с наличными
+			card_cash_pairs.append({
+				"card": card_data.copy(),
+				"cash": card_cash_data.copy()
+			})
+		else:
+			# Только карта без наличных
+			card_cash_pairs.append({
+				"card": card_data.copy(),
+				"cash": None
+			})
+	
+	# Обрабатываем наличные без карты
+	if cash_data:
+		# Наличные без карты
+		cash_name = cash_data.get("cash_name")
+		logger.info(f"🔍 Формирование cash_list: cash_data={cash_data}, cash_name={cash_name}")
+		cash_list.append({
+			"currency": cash_data.get("currency", "RUB"),
+			"value": cash_data.get("value", 0),
+			"cash_name": cash_name  # Название наличных для получения адреса столбца
+		})
+		logger.info(f"🔍 Сформирован cash_list: {cash_list}")
+	
+	# Записываем в Google Sheets
+	logger.info(f"🔍 Данные для записи (mode={mode}): crypto_list={crypto_list}, xmr_list={xmr_list}, cash_list={cash_list}, card_cash_pairs={card_cash_pairs}")
+	try:
+		if mode == "rate":
+			result = await write_to_google_sheet_rate_mode(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				crypto_list,
+				xmr_list,
+				cash_list,
+				card_cash_pairs
+			)
+		else:
+			result = await write_all_to_google_sheet_one_row(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				crypto_list,
+				xmr_list,
+				cash_list,
+				card_cash_pairs
+			)
+		
+		if result.get("success"):
+			await cb.answer("✅ Данные успешно записаны в Google Sheets", show_alert=True)
+			await state.clear()
+			await cb.message.edit_text("✅ Данные записаны!", reply_markup=admin_menu_kb())
+		else:
+			await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
+	except Exception as e:
+		logger.exception(f"Ошибка записи в Google Sheets: {e}")
+		await cb.answer("❌ Произошла ошибка при записи", show_alert=True)
+
+
 @admin_router.callback_query(F.data == "admin:cards")
 async def admin_cards(cb: CallbackQuery):
 	"""Показывает список групп карт"""
@@ -736,6 +1252,207 @@ async def crypto_delete(cb: CallbackQuery):
 		await cb.answer("❌ Произошла ошибка при удалении", show_alert=True)
 
 
+@admin_router.callback_query(F.data == "cash:new")
+async def cash_new(cb: CallbackQuery, state: FSMContext):
+	"""Начинает создание новых наличных"""
+	await state.set_state(CashColumnEditStates.waiting_cash_name)
+	await cb.message.edit_text(
+		"Введите название наличных:\n\nНапример: Рубли, Доллары, Евро",
+		reply_markup=simple_back_kb("admin:cash")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CashColumnEditStates.waiting_cash_name)
+async def cash_name_input(message: Message, state: FSMContext):
+	"""Обрабатывает ввод названия наличных"""
+	cash_name = message.text.strip()
+	
+	if not cash_name:
+		await message.answer("❌ Название наличных не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Сохраняем название в state
+	await state.update_data(cash_name=cash_name)
+	await state.set_state(CashColumnEditStates.waiting_cash_column)
+	
+	await message.answer(
+		"✅ Название сохранено.\n\n"
+		"Теперь введите адрес столбца (только латинские буквы):\n"
+		"Например: A, B, AS, AY",
+		reply_markup=simple_back_kb("admin:cash")
+	)
+
+
+@admin_router.message(CashColumnEditStates.waiting_cash_column)
+async def cash_column_input(message: Message, state: FSMContext):
+	"""Обрабатывает ввод адреса столбца для новых наличных"""
+	db = get_db()
+	column_input = message.text.strip().upper()
+	
+	if not column_input:
+		await message.answer("❌ Адрес столбца не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Проверка на русские символы
+	import re
+	if re.search(r'[А-ЯЁа-яё]', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы. Русские символы не допускаются. Попробуйте еще раз:")
+		return
+	
+	# Проверка на допустимые символы (только латинские буквы)
+	if not re.match(r'^[A-Z]+$', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы (A-Z). Попробуйте еще раз:")
+		return
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	cash_name = data.get("cash_name")
+	
+	if not cash_name:
+		await message.answer("❌ Ошибка: название наличных не найдено. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем наличные
+	try:
+		await db.set_cash_column(cash_name, column_input)
+		
+		await message.answer(
+			f"✅ Наличные успешно добавлены!\n\n"
+			f"Название: {cash_name}\n"
+			f"Адрес столбца: {column_input}",
+			reply_markup=simple_back_kb("admin:cash")
+		)
+		await state.clear()
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении наличных: {e}")
+		if "UNIQUE constraint failed" in str(e):
+			await message.answer("❌ Наличные с таким названием уже существуют. Попробуйте другое название:")
+		else:
+			await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(F.data == "cash:delete_list")
+async def cash_delete_list(cb: CallbackQuery):
+	"""Показывает список наличных для удаления"""
+	db = get_db()
+	cash_columns = await db.list_cash_columns()
+	
+	if not cash_columns:
+		await cb.answer("Нет наличных для удаления", show_alert=True)
+		return
+	
+	text = "Выберите наличные для удаления:"
+	await cb.message.edit_text(text, reply_markup=cash_delete_kb(cash_columns))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cash:delete:"))
+async def cash_delete(cb: CallbackQuery):
+	"""Удаляет наличные из базы данных"""
+	db = get_db()
+	cash_name = cb.data.split(":")[-1]
+	
+	try:
+		await db.delete_cash_column(cash_name)
+		await cb.answer(f"✅ Наличные '{cash_name}' удалены", show_alert=True)
+		
+		# Обновляем список
+		cash_columns = await db.list_cash_columns()
+		if not cash_columns:
+			text = "Список наличных пуст."
+		else:
+			text = "Список наличных и их адресов столбцов:\n\n"
+			for cash in cash_columns:
+				cash_name_item = cash.get("cash_name", "")
+				column = cash.get("column", "")
+				text += f"{cash_name_item} → {column}\n"
+		
+		await cb.message.edit_text(text, reply_markup=cash_list_kb(cash_columns))
+	except Exception as e:
+		logger.exception(f"Ошибка при удалении наличных: {e}")
+		await cb.answer("❌ Произошла ошибка при удалении", show_alert=True)
+
+
+@admin_router.callback_query(F.data.startswith("cash:edit:"))
+async def cash_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование адреса столбца для наличных"""
+	db = get_db()
+	cash_name = cb.data.split(":")[-1]
+	
+	# Получаем текущий адрес столбца
+	current_column = await db.get_cash_column(cash_name)
+	
+	# Сохраняем название наличных в state
+	await state.update_data(cash_name=cash_name)
+	await state.set_state(CashColumnEditStates.waiting_column)
+	
+	current_text = f" (текущий: {current_column})" if current_column else ""
+	await cb.message.edit_text(
+		f"Редактирование адреса столбца для {cash_name}{current_text}\n\n"
+		"Введите новый адрес столбца (только латинские буквы):\n"
+		"Например: A, B, C, D, E, AS, AY",
+		reply_markup=simple_back_kb("admin:cash")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CashColumnEditStates.waiting_column)
+async def cash_column_waiting_column(message: Message, state: FSMContext):
+	"""Обрабатывает ввод адреса столбца для наличных"""
+	db = get_db()
+	column_input = message.text.strip().upper()  # Приводим к верхнему регистру
+	
+	if not column_input:
+		await message.answer("❌ Адрес столбца не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Проверка на русские символы
+	import re
+	if re.search(r'[А-ЯЁа-яё]', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы. Русские символы не допускаются. Попробуйте еще раз:")
+		return
+	
+	# Проверка на допустимые символы (только латинские буквы)
+	if not re.match(r'^[A-Z]+$', column_input):
+		await message.answer("❌ Адрес столбца должен содержать только латинские буквы (A-Z). Попробуйте еще раз:")
+		return
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	cash_name = data.get("cash_name")
+	
+	if not cash_name:
+		await message.answer("❌ Ошибка: название наличных не найдено. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем адрес столбца
+	try:
+		await db.set_cash_column(cash_name, column_input)
+		await state.clear()
+		
+		# Обновляем список
+		cash_columns = await db.list_cash_columns()
+		if not cash_columns:
+			text = "Список наличных пуст."
+		else:
+			text = "Список наличных и их адресов столбцов:\n\n"
+			for cash in cash_columns:
+				cash_name_item = cash.get("cash_name", "")
+				column = cash.get("column", "")
+				text += f"{cash_name_item} → {column}\n"
+		
+		await message.answer(
+			f"✅ Адрес столбца для '{cash_name}' обновлен на '{column_input}'",
+			reply_markup=cash_list_kb(cash_columns)
+		)
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении адреса столбца для наличных: {e}")
+		await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
 @admin_router.callback_query(F.data.startswith("crypto:edit:"))
 async def crypto_edit(cb: CallbackQuery, state: FSMContext):
 	"""Начинает редактирование адреса столбца для криптовалюты"""
@@ -805,7 +1522,13 @@ async def crypto_column_waiting_column(message: Message, state: FSMContext):
 
 
 @admin_router.callback_query(F.data.startswith("card:view:"))
-async def card_view(cb: CallbackQuery):
+async def card_view(cb: CallbackQuery, state: FSMContext):
+	# Проверяем, не находимся ли мы в состоянии выбора карты для /add или /rate
+	current_state = await state.get_state()
+	if current_state == AddDataStates.selecting_card.state:
+		# Это выбор карты для /add или /rate, пропускаем обработку
+		return
+	
 	db = get_db()
 	card_id = int(cb.data.split(":")[-1])
 	card = await db.get_card_by_id(card_id)
@@ -2283,10 +3006,10 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 	# Логируем доставку
 	if user_tg_id:
 		await db.log_card_delivery_by_tg(
-			user_tg_id,
-			card_id,
-			admin_id=cb.from_user.id if cb.from_user else None,
-		)
+		user_tg_id,
+		card_id,
+		admin_id=cb.from_user.id if cb.from_user else None,
+	)
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 	elif user_id_for_hidden:

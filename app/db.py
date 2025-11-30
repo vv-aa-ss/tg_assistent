@@ -75,6 +75,7 @@ class Database:
 		await self._migrate_card_columns()
 		await self._ensure_crypto_columns()
 		await self._migrate_crypto_columns()
+		await self._ensure_cash_columns()
 		await self._ensure_card_groups()
 		await self._ensure_google_sheets_settings()
 		await self._ensure_card_requisites()
@@ -265,6 +266,27 @@ class Database:
 			_logger.info(f"✅ Миграция криптовалют завершена: добавлено {migrated} адресов столбцов")
 		else:
 			_logger.debug("Миграция криптовалют не добавила новых записей")
+
+	async def _ensure_cash_columns(self) -> None:
+		"""Создает таблицу cash_columns для хранения адресов столбцов наличных"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='cash_columns'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE cash_columns (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					cash_name TEXT NOT NULL UNIQUE,
+					column TEXT NOT NULL
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_cash_columns_name ON cash_columns(cash_name)"
+			)
+			_logger.debug("Created table cash_columns")
 
 	async def _ensure_card_groups(self) -> None:
 		"""Создает таблицы для группировки карт"""
@@ -999,6 +1021,80 @@ class Database:
 		await self._db.execute("DELETE FROM crypto_columns WHERE crypto_type = ?", (crypto_type,))
 		await self._db.commit()
 		_logger.debug(f"Crypto column deleted: crypto_type='{crypto_type}'")
+
+	async def get_cash_column(self, cash_name: str) -> Optional[str]:
+		"""
+		Получает адрес столбца для наличных.
+		
+		Args:
+			cash_name: Название наличных
+		
+		Returns:
+			Адрес столбца (например, "AS", "AY", "AU") или None, если не найдено
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT column FROM cash_columns WHERE cash_name = ?",
+			(cash_name,)
+		)
+		row = await cur.fetchone()
+		if row:
+			return row[0]
+		_logger.debug(f"Cash column not found for cash_name='{cash_name}'")
+		return None
+
+	async def set_cash_column(self, cash_name: str, column: str) -> int:
+		"""
+		Устанавливает адрес столбца для наличных.
+		
+		Args:
+			cash_name: Название наличных
+			column: Адрес столбца (например, "AS", "AY", "AU")
+		
+		Returns:
+			ID созданной или обновленной записи
+		"""
+		assert self._db
+		# Используем INSERT OR REPLACE для обновления существующей записи
+		cur = await self._db.execute(
+			"INSERT OR REPLACE INTO cash_columns (cash_name, column) VALUES (?, ?)",
+			(cash_name, column)
+		)
+		await self._db.commit()
+		_logger.debug(f"Cash column set: cash_name='{cash_name}', column='{column}'")
+		return cur.lastrowid
+
+	async def list_cash_columns(self) -> List[Dict[str, Any]]:
+		"""
+		Получает список всех адресов столбцов наличных.
+		
+		Returns:
+			Список словарей с ключами: cash_name, column
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT cash_name, column FROM cash_columns ORDER BY cash_name"
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"cash_name": row[0],
+				"column": row[1],
+			}
+			for row in rows
+		]
+
+	async def delete_cash_column(self, cash_name: str) -> None:
+		"""
+		Удаляет адрес столбца для наличных.
+		
+		Args:
+			cash_name: Название наличных
+		"""
+		assert self._db
+		await self._db.execute("DELETE FROM cash_columns WHERE cash_name = ?", (cash_name,))
+		await self._db.commit()
+		_logger.debug(f"Cash column deleted: cash_name='{cash_name}'")
 
 	async def add_card_group(self, name: str) -> int:
 		"""
