@@ -77,6 +77,7 @@ class Database:
 		await self._migrate_crypto_columns()
 		await self._ensure_card_groups()
 		await self._ensure_google_sheets_settings()
+		await self._ensure_card_requisites()
 		await self._db.commit()
 
 	async def _ensure_cards_user_message(self) -> None:
@@ -1127,6 +1128,29 @@ class Database:
 		)
 		return await cur.fetchall()
 
+	async def _ensure_card_requisites(self) -> None:
+		"""Создает таблицу для хранения нескольких реквизитов карты"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='card_requisites'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE card_requisites (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					card_id INTEGER NOT NULL,
+					requisite_text TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_requisites_card_id ON card_requisites(card_id)"
+			)
+			_logger.debug("Created table card_requisites")
+
 	async def _ensure_google_sheets_settings(self) -> None:
 		"""Создает таблицу для хранения настроек Google Sheets"""
 		assert self._db
@@ -1215,3 +1239,79 @@ class Database:
 		)
 		await self._db.commit()
 		_logger.debug(f"Google Sheets setting set: {key}={value}")
+
+	async def add_card_requisite(self, card_id: int, requisite_text: str) -> int:
+		"""
+		Добавляет реквизит для карты.
+		
+		Args:
+			card_id: ID карты
+			requisite_text: Текст реквизита
+		
+		Returns:
+			ID созданной записи
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"INSERT INTO card_requisites(card_id, requisite_text) VALUES(?, ?)",
+			(card_id, requisite_text)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card requisite added: card_id={card_id}, id={cur.lastrowid}")
+		return cur.lastrowid
+
+	async def list_card_requisites(self, card_id: int) -> List[Dict[str, Any]]:
+		"""
+		Получает список всех реквизитов для карты.
+		
+		Args:
+			card_id: ID карты
+		
+		Returns:
+			Список словарей с полями: id, card_id, requisite_text, created_at
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, card_id, requisite_text, created_at FROM card_requisites WHERE card_id = ? ORDER BY created_at",
+			(card_id,)
+		)
+		rows = await cur.fetchall()
+		result = [
+			{
+				"id": row[0],
+				"card_id": row[1],
+				"requisite_text": row[2],
+				"created_at": row[3],
+			}
+			for row in rows
+		]
+		_logger.debug(f"list_card_requisites: card_id={card_id}, found {len(result)} requisites")
+		return result
+
+	async def update_card_requisite(self, requisite_id: int, requisite_text: str) -> None:
+		"""
+		Обновляет текст реквизита по ID.
+		
+		Args:
+			requisite_id: ID реквизита
+			requisite_text: Новый текст реквизита
+		"""
+		assert self._db
+		await self._db.execute(
+			"UPDATE card_requisites SET requisite_text = ? WHERE id = ?",
+			(requisite_text, requisite_id)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card requisite updated: id={requisite_id}")
+	
+	async def delete_card_requisite(self, requisite_id: int) -> None:
+		"""
+		Удаляет реквизит по ID.
+		
+		Args:
+			requisite_id: ID реквизита
+		"""
+		assert self._db
+		await self._db.execute("DELETE FROM card_requisites WHERE id = ?", (requisite_id,))
+		await self._db.commit()
+		_logger.debug(f"Card requisite deleted: id={requisite_id}")

@@ -27,6 +27,8 @@ from app.keyboards import (
 	similar_users_select_kb,
 	card_groups_list_kb,
 	card_groups_select_kb,
+	requisites_list_kb,
+	requisite_action_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -39,6 +41,61 @@ USERS_PER_PAGE = 6
 # Ключ: (user_id, session_key), значение: asyncio.Lock
 _multi_forward_locks: Dict[Tuple[int, str], asyncio.Lock] = {}
 _locks_lock = asyncio.Lock()  # Блокировка для доступа к словарю блокировок
+
+
+async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db) -> int:
+	"""
+	Отправляет все реквизиты карты админу отдельными сообщениями.
+	Отправляет и реквизиты из таблицы card_requisites, и user_message (если есть) для обратной совместимости.
+	
+	Args:
+		bot: Экземпляр бота
+		admin_chat_id: ID чата админа
+		card_id: ID карты
+		db: Экземпляр базы данных
+	
+	Returns:
+		Количество успешно отправленных реквизитов
+	"""
+	logger.info(f"📤 send_card_requisites_to_admin: card_id={card_id}, admin_chat_id={admin_chat_id}")
+	requisites = await db.list_card_requisites(card_id)
+	logger.info(f"📋 Найдено реквизитов в таблице: {len(requisites)} для card_id={card_id}")
+	
+	sent_count = 0
+	
+	# Отправляем все реквизиты из таблицы card_requisites
+	if requisites:
+		for idx, requisite in enumerate(requisites, 1):
+			try:
+				logger.info(f"📨 Отправка реквизита {idx}/{len(requisites)} (id={requisite['id']}) админу {admin_chat_id}")
+				await bot.send_message(
+					chat_id=admin_chat_id,
+					text=requisite["requisite_text"],
+					parse_mode="HTML"
+				)
+				sent_count += 1
+				logger.info(f"✅ Реквизит {requisite['id']} успешно отправлен админу {admin_chat_id}")
+			except Exception as e:
+				logger.exception(f"❌ Ошибка отправки реквизита {requisite['id']} админу {admin_chat_id}: {e}")
+	
+	# Также отправляем user_message (для обратной совместимости со старыми данными)
+	user_msg = await db.get_card_user_message(card_id)
+	logger.info(f"🔍 Проверка user_message для card_id={card_id}: value={user_msg[:100] if user_msg else None}..., is_empty={not (user_msg and user_msg.strip())}")
+	if user_msg and user_msg.strip():
+		try:
+			logger.info(f"📨 Отправка user_message админу {admin_chat_id}")
+			await bot.send_message(chat_id=admin_chat_id, text=user_msg, parse_mode="HTML")
+			sent_count += 1
+			logger.info(f"✅ user_message отправлен админу {admin_chat_id}")
+		except Exception as e:
+			logger.exception(f"❌ Ошибка отправки user_message админу {admin_chat_id}: {e}")
+	else:
+		logger.info(f"⚠️ user_message для card_id={card_id} пустой или отсутствует, пропускаем")
+	
+	if sent_count == 0:
+		logger.warning(f"⚠️ Нет ни реквизитов, ни user_message для card_id={card_id}")
+	
+	return sent_count
 
 
 class AdminOnlyMiddleware(BaseMiddleware):
@@ -83,6 +140,11 @@ class AddCardStates(StatesGroup):
 
 class CardUserMessageStates(StatesGroup):
 	waiting_message = State()
+
+
+class CardRequisiteStates(StatesGroup):
+	waiting_requisite = State()
+	waiting_edit_requisite = State()
 
 
 class CardColumnBindStates(StatesGroup):
@@ -1063,7 +1125,7 @@ async def card_select_group(cb: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("card:edit:"))
 async def card_edit(cb: CallbackQuery, state: FSMContext):
-	"""Показывает форму для изменения сообщения карты"""
+	"""Показывает список всех реквизитов карты для редактирования"""
 	db = get_db()
 	card_id = int(cb.data.split(":")[-1])
 	card = await db.get_card_by_id(card_id)
@@ -1071,23 +1133,273 @@ async def card_edit(cb: CallbackQuery, state: FSMContext):
 		await cb.answer("Карта не найдена", show_alert=True)
 		return
 	
-	current = card['user_message']
-	logger.debug(f"Edit user_message for card_id={card_id}")
-	await state.set_state(CardUserMessageStates.waiting_message)
+	# Получаем все реквизиты
+	requisites = await db.list_card_requisites(card_id)
+	user_msg = card.get("user_message")
+	has_user_message = bool(user_msg and user_msg.strip())
+	
+	# Формируем текст
+	text = f"💳 {card['name']}\n\n"
+	if has_user_message or requisites:
+		text += "Выберите реквизит для редактирования:"
+	else:
+		text += "Реквизитов пока нет."
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=requisites_list_kb(requisites, card_id, has_user_message, f"card:view:{card_id}"),
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("card:add_requisite:"))
+async def card_add_requisite(cb: CallbackQuery, state: FSMContext):
+	"""Показывает форму для добавления реквизита карты"""
+	db = get_db()
+	card_id = int(cb.data.split(":")[-1])
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	logger.debug(f"Add requisite for card_id={card_id}")
+	await state.set_state(CardRequisiteStates.waiting_requisite)
 	await state.update_data(card_id=card_id)
-	if current:
-		pref = f"Текущее сообщение карты:\n\n{current}\n\n"
+	await cb.message.edit_text(
+		"Отправьте текст реквизита:",
+		reply_markup=simple_back_kb(f"card:view:{card_id}"),
+	)
+	await cb.answer()
+
+
+@admin_router.message(CardRequisiteStates.waiting_requisite)
+async def card_set_requisite(message: Message, state: FSMContext):
+	db = get_db()
+	data = await state.get_data()
+	card_id = int(data.get("card_id"))
+	# Получаем текст реквизита с сохранением HTML форматирования
+	html_text = message.html_text or message.html_caption or (message.text or message.caption or "").strip()
+	
+	if not html_text.strip():
+		await message.answer("Текст реквизита не может быть пустым")
+		return
+	
+	logger.debug(f"Add requisite for card_id={card_id}")
+	await db.add_card_requisite(card_id, html_text)
+	await state.clear()
+	
+	# Получаем информацию о карте для возврата
+	card = await db.get_card_by_id(card_id)
+	if card:
+		await message.answer("Реквизит добавлен ✅", reply_markup=simple_back_kb(f"card:view:{card_id}"))
+	else:
+		await message.answer("Реквизит добавлен ✅", reply_markup=admin_menu_kb())
+
+
+@admin_router.callback_query(F.data.startswith("req:select:"))
+async def requisite_select(cb: CallbackQuery):
+	"""Показывает меню действий для выбранного реквизита"""
+	db = get_db()
+	requisite_id = int(cb.data.split(":")[-1])
+	
+	# Получаем информацию о реквизите напрямую из базы
+	cur = await db._db.execute("SELECT card_id, requisite_text FROM card_requisites WHERE id = ?", (requisite_id,))
+	row = await cur.fetchone()
+	if not row:
+		await cb.answer("Реквизит не найден", show_alert=True)
+		return
+	
+	card_id = row[0]
+	requisite_text = row[1]
+	requisite = {
+		'id': requisite_id,
+		'card_id': card_id,
+		'requisite_text': requisite_text
+	}
+	
+	# Обрезаем текст для отображения и экранируем HTML-теги
+	text_preview = escape(requisite['requisite_text'][:200])
+	if len(requisite['requisite_text']) > 200:
+		text_preview += "..."
+	
+	text = f"📄 Реквизит:\n\n{text_preview}\n\nВыберите действие:"
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=requisite_action_kb(requisite_id=requisite_id, card_id=card_id, back_to=f"card:edit:{card_id}"),
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("req:edit_main:"))
+async def requisite_edit_main(cb: CallbackQuery):
+	"""Показывает меню действий для основного реквизита (user_message)"""
+	db = get_db()
+	card_id = int(cb.data.split(":")[-1])
+	
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	user_msg = card.get("user_message")
+	if not user_msg or not user_msg.strip():
+		await cb.answer("Основной реквизит отсутствует", show_alert=True)
+		return
+	
+	# Обрезаем текст для отображения и экранируем HTML-теги
+	text_preview = escape(user_msg[:200])
+	if len(user_msg) > 200:
+		text_preview += "..."
+	
+	text = f"📝 Основной реквизит:\n\n{text_preview}\n\nВыберите действие:"
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=requisite_action_kb(card_id=card_id, is_main=True, back_to=f"card:edit:{card_id}"),
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("req:edit:"))
+async def requisite_edit_start(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование реквизита"""
+	db = get_db()
+	parts = cb.data.split(":")
+	
+	if len(parts) == 3 and parts[2].startswith("main:"):
+		# Редактирование основного реквизита
+		card_id = int(parts[2].split(":")[1])
+		card = await db.get_card_by_id(card_id)
+		if not card:
+			await cb.answer("Карта не найдена", show_alert=True)
+			return
+		
+		current = card.get("user_message", "")
+		await state.set_state(CardUserMessageStates.waiting_message)
+		await state.update_data(card_id=card_id, is_main_requisite=True)
+		
+		if current:
+			# Экранируем HTML для безопасного отображения
+			current_escaped = escape(current)
+			text = f"Текущий основной реквизит:\n\n{current_escaped}\n\nОтправьте новый текст реквизита.\nДля очистки отправьте: СБРОС"
+		else:
+			text = "Отправьте текст основного реквизита.\nДля очистки отправьте: СБРОС"
+		
 		await cb.message.edit_text(
-			pref + "Отправьте новое сообщение этой карты.\nДля очистки отправьте: СБРОС",
-			reply_markup=simple_back_kb(f"card:view:{card_id}"),
+			text,
+			reply_markup=simple_back_kb(f"req:edit_main:{card_id}"),
+		)
+	else:
+		# Редактирование дополнительного реквизита
+		requisite_id = int(parts[-1])
+		
+		# Получаем информацию о реквизите
+		cur = await db._db.execute("SELECT card_id, requisite_text FROM card_requisites WHERE id = ?", (requisite_id,))
+		row = await cur.fetchone()
+		if not row:
+			await cb.answer("Реквизит не найден", show_alert=True)
+			return
+		
+		card_id = row[0]
+		current = row[1]
+		
+		await state.set_state(CardRequisiteStates.waiting_edit_requisite)
+		await state.update_data(requisite_id=requisite_id, card_id=card_id)
+		
+		# Экранируем HTML для безопасного отображения
+		current_escaped = escape(current)
+		text = f"Текущий реквизит:\n\n{current_escaped}\n\nОтправьте новый текст реквизита."
+		
+		await cb.message.edit_text(
+			text,
+			reply_markup=simple_back_kb(f"req:select:{requisite_id}"),
+		)
+	
+	await cb.answer()
+
+
+@admin_router.message(CardRequisiteStates.waiting_edit_requisite)
+async def requisite_edit_save(message: Message, state: FSMContext):
+	"""Сохраняет отредактированный реквизит"""
+	db = get_db()
+	data = await state.get_data()
+	requisite_id = int(data.get("requisite_id"))
+	card_id = int(data.get("card_id"))
+	
+	# Получаем текст реквизита с сохранением HTML форматирования
+	html_text = message.html_text or message.html_caption or (message.text or message.caption or "").strip()
+	
+	if not html_text.strip():
+		await message.answer("Текст реквизита не может быть пустым")
+		return
+	
+	logger.debug(f"Update requisite id={requisite_id} for card_id={card_id}")
+	await db.update_card_requisite(requisite_id, html_text)
+	await state.clear()
+	
+	await message.answer("Реквизит обновлен ✅", reply_markup=simple_back_kb(f"card:edit:{card_id}"))
+
+
+@admin_router.callback_query(F.data.startswith("req:delete:"))
+async def requisite_delete(cb: CallbackQuery):
+	"""Удаляет реквизит"""
+	db = get_db()
+	parts = cb.data.split(":")
+	
+	if len(parts) == 3 and parts[2].startswith("main:"):
+		# Удаление основного реквизита (user_message)
+		card_id = int(parts[2].split(":")[1])
+		card = await db.get_card_by_id(card_id)
+		if not card:
+			await cb.answer("Карта не найдена", show_alert=True)
+			return
+		
+		# Очищаем user_message
+		await db._db.execute("UPDATE cards SET user_message = NULL WHERE id = ?", (card_id,))
+		await db._db.commit()
+		
+		await cb.answer("Основной реквизит удален ✅", show_alert=True)
+		# Возвращаемся к списку реквизитов
+		card = await db.get_card_by_id(card_id)
+		requisites = await db.list_card_requisites(card_id)
+		user_msg = card.get("user_message")
+		has_user_message = bool(user_msg and user_msg.strip())
+		
+		text = f"💳 {card['name']}\n\nВыберите реквизит для редактирования:"
+		await cb.message.edit_text(
+			text,
+			reply_markup=requisites_list_kb(requisites, card_id, has_user_message, f"card:view:{card_id}"),
 			parse_mode="HTML",
 		)
 	else:
+		# Удаление дополнительного реквизита
+		requisite_id = int(parts[-1])
+		
+		# Получаем card_id перед удалением
+		cur = await db._db.execute("SELECT card_id FROM card_requisites WHERE id = ?", (requisite_id,))
+		row = await cur.fetchone()
+		if not row:
+			await cb.answer("Реквизит не найден", show_alert=True)
+			return
+		
+		card_id = row[0]
+		
+		await db.delete_card_requisite(requisite_id)
+		await cb.answer("Реквизит удален ✅", show_alert=True)
+		
+		# Возвращаемся к списку реквизитов
+		card = await db.get_card_by_id(card_id)
+		requisites = await db.list_card_requisites(card_id)
+		user_msg = card.get("user_message")
+		has_user_message = bool(user_msg and user_msg.strip())
+		
+		text = f"💳 {card['name']}\n\nВыберите реквизит для редактирования:"
 		await cb.message.edit_text(
-			"Отправьте новое сообщение этой карты.\nДля очистки отправьте: СБРОС",
-			reply_markup=simple_back_kb(f"card:view:{card_id}"),
+			text,
+			reply_markup=requisites_list_kb(requisites, card_id, has_user_message, f"card:view:{card_id}"),
+			parse_mode="HTML",
 		)
-	await cb.answer()
 
 
 @admin_router.callback_query(F.data.startswith("card:bind_column:"))
@@ -1227,29 +1539,58 @@ async def card_set_user_message(message: Message, state: FSMContext):
 	db = get_db()
 	data = await state.get_data()
 	card_id = int(data.get("card_id"))
+	is_main_requisite = data.get("is_main_requisite", False)
+	
 	# Используем html_text для сохранения форматирования, но проверяем "СБРОС" по чистому тексту
 	plain_text = (message.text or message.caption or "").strip()
-	logger.debug(f"Set user_message for card_id={card_id}, reset={(plain_text.upper()=='СБРОС')}")
+	logger.debug(f"Set user_message for card_id={card_id}, reset={(plain_text.upper()=='СБРОС')}, is_main_requisite={is_main_requisite}")
+	
 	if plain_text.upper() == "СБРОС":
 		await db.set_card_user_message(card_id, None)
 		await state.clear()
-		# Получаем информацию о карте для возврата
-		card = await db.get_card_by_id(card_id)
-		if card:
-			await message.answer("Сообщение карты очищено ✅", reply_markup=simple_back_kb(f"card:view:{card_id}"))
+		if is_main_requisite:
+			# Возвращаемся к списку реквизитов
+			card = await db.get_card_by_id(card_id)
+			requisites = await db.list_card_requisites(card_id)
+			user_msg = card.get("user_message") if card else None
+			has_user_message = bool(user_msg and user_msg.strip())
+			text = f"💳 {card['name']}\n\nВыберите реквизит для редактирования:" if card else "Реквизит очищен ✅"
+			await message.answer(
+				"Основной реквизит очищен ✅",
+				reply_markup=requisites_list_kb(requisites, card_id, has_user_message, f"card:view:{card_id}") if card else simple_back_kb(f"card:view:{card_id}"),
+			)
 		else:
-			await message.answer("Сообщение карты очищено ✅", reply_markup=admin_menu_kb())
+			# Получаем информацию о карте для возврата
+			card = await db.get_card_by_id(card_id)
+			if card:
+				await message.answer("Сообщение карты очищено ✅", reply_markup=simple_back_kb(f"card:view:{card_id}"))
+			else:
+				await message.answer("Сообщение карты очищено ✅", reply_markup=admin_menu_kb())
 		return
+	
 	# Сохраняем текст с HTML форматированием (html_text автоматически конвертирует entities в HTML)
 	html_text = message.html_text or message.html_caption or plain_text
 	await db.set_card_user_message(card_id, html_text)
 	await state.clear()
-	# Получаем информацию о карте для возврата
-	card = await db.get_card_by_id(card_id)
-	if card:
-		await message.answer("Сообщение карты сохранено ✅", reply_markup=simple_back_kb(f"card:view:{card_id}"))
+	
+	if is_main_requisite:
+		# Возвращаемся к списку реквизитов
+		card = await db.get_card_by_id(card_id)
+		requisites = await db.list_card_requisites(card_id)
+		user_msg = card.get("user_message") if card else None
+		has_user_message = bool(user_msg and user_msg.strip())
+		text = f"💳 {card['name']}\n\nВыберите реквизит для редактирования:" if card else "Реквизит обновлен ✅"
+		await message.answer(
+			"Основной реквизит обновлен ✅",
+			reply_markup=requisites_list_kb(requisites, card_id, has_user_message, f"card:view:{card_id}") if card else simple_back_kb(f"card:view:{card_id}"),
+		)
 	else:
-		await message.answer("Сообщение карты сохранено ✅", reply_markup=admin_menu_kb())
+		# Получаем информацию о карте для возврата
+		card = await db.get_card_by_id(card_id)
+		if card:
+			await message.answer("Сообщение карты сохранено ✅", reply_markup=simple_back_kb(f"card:view:{card_id}"))
+		else:
+			await message.answer("Сообщение карты сохранено ✅", reply_markup=admin_menu_kb())
 
 
 @admin_router.callback_query(F.data == "card:add")
@@ -2535,23 +2876,37 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		if cards_for_user:
 			if len(cards_for_user) == 1:
 				card = cards_for_user[0]
+				card_id = card["card_id"]
+				logger.info(f"🔍 Получение реквизитов для card_id={card_id}")
+				requisites = await db.list_card_requisites(card_id)
+				logger.info(f"📊 Получено реквизитов из БД: {len(requisites)} для card_id={card_id}")
+				if requisites:
+					for idx, req in enumerate(requisites, 1):
+						logger.info(f"  Реквизит {idx}: id={req['id']}, text_preview={req['requisite_text'][:50]}...")
+				
+				# Проверяем наличие user_message
 				user_msg = card.get("user_message")
-				admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
-				if user_msg:
-					await message.answer(admin_text, parse_mode="HTML")
-				else:
-					await message.answer(admin_text)
+				has_user_message = bool(user_msg and user_msg.strip())
+				logger.info(f"📋 user_message для card_id={card_id}: has={has_user_message}, value={user_msg[:100] if user_msg else None}...")
+				
+				# Подсчитываем общее количество реквизитов (из таблицы + user_message если есть)
+				total_requisites_count = len(requisites) + (1 if has_user_message else 0)
+				logger.info(f"📊 Общее количество реквизитов для card_id={card_id}: {total_requisites_count} (из таблицы: {len(requisites)}, user_message: {1 if has_user_message else 0})")
+				
 				await db.log_card_delivery_by_tg(
 					orig_tg_id,
-					card["card_id"],
+					card_id,
 					admin_id=message.from_user.id if message.from_user else None,
 				)
-				if user_msg:
-					try:
-						await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
-						logger.debug("Sent user_message to user")
-					except Exception as e:
-						logger.exception(f"Failed to send user_message: {e}")
+				
+				# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+				logger.info(f"🚀 Вызов send_card_requisites_to_admin для card_id={card_id}, admin_chat_id={message.chat.id}")
+				try:
+					admin_chat_id = message.chat.id
+					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db)
+					logger.info(f"✅ send_card_requisites_to_admin завершена для card_id={card_id}, отправлено: {sent_count}")
+				except Exception as e:
+					logger.exception(f"❌ КРИТИЧЕСКАЯ ОШИБКА в send_card_requisites_to_admin: {e}")
 				return
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
@@ -2845,21 +3200,17 @@ async def multi_forward_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 						if user_by_name:
 							orig_tg_id = user_by_name.get("tg_id")
 					
-					user_msg = card.get("user_message")
+					card_id = card["card_id"]
 					
-					# Если нашли пользователя, логируем и отправляем сообщение
+					# Если нашли пользователя, логируем и отправляем реквизиты
 					if orig_tg_id:
 						await db.log_card_delivery_by_tg(
 							orig_tg_id,
-							card["card_id"],
+							card_id,
 							admin_id=cb.from_user.id if cb.from_user else None,
 						)
-						if user_msg:
-							try:
-								await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
-								logger.info(f"Отправлено сообщение карты пользователю {orig_tg_id}")
-							except Exception as e:
-								logger.exception(f"Ошибка отправки сообщения пользователю {orig_tg_id}: {e}")
+						# Отправляем все реквизиты админу
+						await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 	
 	# Определяем режим работы (add или rate)
 	mode = data.get("mode", "add")  # По умолчанию режим add
@@ -3747,10 +4098,14 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 	
 	if reply_only:
 		# reply to admin only without binding
+		requisites = await db.list_card_requisites(card_id)
 		user_msg = await db.get_card_user_message(card_id)
+		has_user_message = bool(user_msg and user_msg.strip())
+		total_requisites_count = len(requisites) + (1 if has_user_message else 0)
 		await state.clear()
-		if user_msg:
-			await cb.message.edit_text(user_msg, reply_markup=admin_menu_kb(), parse_mode="HTML")
+		# Отправляем все реквизиты админу
+		if total_requisites_count > 0:
+			await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 		else:
 			await cb.message.edit_text("Сообщение карты отсутствует", reply_markup=admin_menu_kb())
 		await cb.answer()
@@ -3802,23 +4157,22 @@ async def forward_bind_select_card(cb: CallbackQuery, state: FSMContext, bot: Bo
 	card = await db.get_card_by_id(card_id)
 	await state.clear()
 	if card:
+		# Получаем реквизиты карты
+		requisites = await db.list_card_requisites(card_id)
 		user_msg = card.get("user_message")
-		admin_text = user_msg or "Сообщение карты отсутствует"
-		if user_msg:
-			await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
-		else:
-			await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+		has_user_message = bool(user_msg and user_msg.strip())
+		
+		# Подсчитываем общее количество реквизитов (из таблицы + user_message если есть)
+		total_requisites_count = len(requisites) + (1 if has_user_message else 0)
+		
 		await db.log_card_delivery_by_tg(
 			orig_tg_id,
 			card_id,
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
-		if user_msg:
-			try:
-				await bot.send_message(chat_id=orig_tg_id, text=user_msg, parse_mode="HTML")
-				logger.debug("Sent user_message after binding")
-			except Exception as e:
-				logger.exception(f"Failed to send user_message after binding: {e}")
+		
+		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 	await cb.answer()
 
 
@@ -3859,23 +4213,19 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		if len(cards_for_user) == 1:
 			# Одна карта - используем её
 			card = cards_for_user[0]
+			card_id = card["card_id"]
+			requisites = await db.list_card_requisites(card_id)
 			user_msg = card.get("user_message")
-			admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
+			has_user_message = bool(user_msg)
+			
+			# Подсчитываем общее количество реквизитов (из таблицы + user_message если есть)
+			total_requisites_count = len(requisites) + (1 if has_user_message else 0)
 			
 			await state.clear()
-			if user_msg:
-				await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
-			else:
-				await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+			await db.log_card_delivery_by_tg(tg_id, card_id, admin_id=cb.from_user.id if cb.from_user else None)
 			
-			await db.log_card_delivery_by_tg(tg_id, card["card_id"], admin_id=cb.from_user.id if cb.from_user else None)
-			
-			if user_msg:
-				try:
-					await bot.send_message(chat_id=tg_id, text=user_msg, parse_mode="HTML")
-					logger.info(f"Отправлено сообщение карты пользователю {tg_id}")
-				except Exception as e:
-					logger.exception(f"Ошибка отправки сообщения пользователю {tg_id}: {e}")
+			# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+			sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 		else:
 			# Несколько карт - выбираем
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
@@ -3939,26 +4289,24 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		await cb.answer("Карта не найдена", show_alert=True)
 		return
 	await state.clear()
+	
+	# Получаем реквизиты карты
+	requisites = await db.list_card_requisites(card_id)
 	user_msg = card.get("user_message")
-	admin_text = user_msg or "Сообщение карты отсутствует"
-	if user_msg:
-		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb(), parse_mode="HTML")
-	else:
-		await cb.message.edit_text(admin_text, reply_markup=admin_menu_kb())
+	has_user_message = bool(user_msg)
+	
+	# Подсчитываем общее количество реквизитов (из таблицы + user_message если есть)
+	total_requisites_count = len(requisites) + (1 if has_user_message else 0)
 	
 	# Логируем доставку
 	if user_tg_id:
 		await db.log_card_delivery_by_tg(
-		user_tg_id,
-		card_id,
-		admin_id=cb.from_user.id if cb.from_user else None,
-	)
-	if user_msg:
-		try:
-			await bot.send_message(chat_id=user_tg_id, text=user_msg, parse_mode="HTML")
-			logger.info(f"Sent user_message for existing binding card_id={card_id} to user {user_tg_id}")
-		except Exception as e:
-			logger.exception(f"Failed to send user_message for existing card: {e}")
+			user_tg_id,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
+		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(

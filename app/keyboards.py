@@ -183,11 +183,83 @@ def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboard
 def card_action_kb(card_id: int, back_to: str = "admin:cards") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="✏️ Изменить реквизиты", callback_data=f"card:edit:{card_id}")
+	kb.button(text="➕ Реквизиты", callback_data=f"card:add_requisite:{card_id}")
 	kb.button(text="🔗 Привязать ячейку", callback_data=f"card:bind_column:{card_id}")
 	kb.button(text="📁 Группы", callback_data=f"card:groups:{card_id}")
 	kb.button(text="🗑️ Удалить карту", callback_data=f"card:delete:{card_id}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
+	return kb.as_markup()
+
+
+def requisites_list_kb(requisites: List[Dict], card_id: int, has_user_message: bool = False, back_to: str = None) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру со списком реквизитов карты.
+	
+	Args:
+		requisites: Список реквизитов из таблицы card_requisites
+		card_id: ID карты
+		has_user_message: Есть ли user_message (основной реквизит)
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Добавляем основной реквизит (user_message) если есть
+	if has_user_message:
+		kb.button(text="📝 Основной реквизит", callback_data=f"req:edit_main:{card_id}")
+	
+	# Добавляем дополнительные реквизиты
+	for idx, req in enumerate(requisites, 1):
+		# Обрезаем текст для отображения в кнопке (максимум 50 символов)
+		text_preview = req['requisite_text'][:50]
+		if len(req['requisite_text']) > 50:
+			text_preview += "..."
+		kb.button(text=f"📄 Реквизит {idx}: {text_preview}", callback_data=f"req:select:{req['id']}")
+	
+	# Кнопка "Назад"
+	if back_to:
+		kb.button(text="⬅️ Назад", callback_data=back_to)
+	else:
+		kb.button(text="⬅️ Назад", callback_data=f"card:view:{card_id}")
+	
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def requisite_action_kb(requisite_id: int = None, card_id: int = None, is_main: bool = False, back_to: str = None) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру с действиями для реквизита.
+	
+	Args:
+		requisite_id: ID реквизита (для дополнительных реквизитов)
+		card_id: ID карты (для основного реквизита)
+		is_main: Является ли это основным реквизитом (user_message)
+		back_to: Callback data для кнопки "Назад"
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	if is_main:
+		edit_callback = f"req:edit:main:{card_id}"
+		delete_callback = f"req:delete:main:{card_id}"
+	else:
+		edit_callback = f"req:edit:{requisite_id}"
+		delete_callback = f"req:delete:{requisite_id}"
+	
+	kb.button(text="✏️ Изменить", callback_data=edit_callback)
+	kb.button(text="🗑️ Удалить", callback_data=delete_callback)
+	
+	if back_to:
+		kb.button(text="⬅️ Назад", callback_data=back_to)
+	else:
+		if is_main and card_id:
+			kb.button(text="⬅️ Назад", callback_data=f"card:edit:{card_id}")
+		elif requisite_id:
+			# Для дополнительных реквизитов нужно получить card_id, но проще вернуться к списку
+			kb.button(text="⬅️ Назад", callback_data="card:edit:0")  # Будет исправлено в обработчике
+		else:
+			kb.button(text="⬅️ Назад", callback_data="admin:cards")
+	
+	kb.adjust(2, 1)
 	return kb.as_markup()
 
 
