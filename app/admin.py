@@ -540,18 +540,53 @@ def format_add_data_text(data: dict) -> str:
 	"""Форматирует текст с выбранными данными для меню /add"""
 	text = "📋 Добавление данных\n\n"
 	
-	# Показываем выбранные данные
+	# Показываем все сохраненные блоки данных
 	selected_items = []
 	
+	# Показываем сохраненные блоки
+	saved_blocks = data.get("saved_blocks", [])
+	for block_idx, block in enumerate(saved_blocks, 1):
+		block_items = []
+		block_crypto = block.get("crypto_data")
+		if block_crypto:
+			currency = block_crypto.get("currency", "")
+			usd_amount = block_crypto.get("usd_amount", 0)
+			xmr_number = block_crypto.get("xmr_number")
+			if xmr_number:
+				block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
+			else:
+				block_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
+		
+		block_card = block.get("card_data")
+		block_card_cash = block.get("card_cash_data")
+		if block_card:
+			card_name = block_card.get("card_name", "")
+			if block_card_cash:
+				amount = block_card_cash.get("value", 0)
+				block_items.append(f"💳 Карта: {card_name}: {amount} р.")
+			else:
+				block_items.append(f"💳 Карта: {card_name}")
+		
+		block_cash = block.get("cash_data")
+		if block_cash:
+			amount = block_cash.get("value", 0)
+			cash_name = block_cash.get("cash_name", "Наличные")
+			block_items.append(f"💵 {cash_name}: {amount} р.")
+		
+		if block_items:
+			selected_items.append(f"Блок {block_idx}: " + ", ".join(block_items))
+	
+	# Показываем текущий блок (если есть)
+	current_block_items = []
 	crypto_data = data.get("crypto_data")
 	if crypto_data:
 		currency = crypto_data.get("currency", "")
 		usd_amount = crypto_data.get("usd_amount", 0)
 		xmr_number = crypto_data.get("xmr_number")
 		if xmr_number:
-			selected_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
+			current_block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
 		else:
-			selected_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
+			current_block_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
 	
 	card_data = data.get("card_data")
 	cash_data = data.get("cash_data")
@@ -563,16 +598,19 @@ def format_add_data_text(data: dict) -> str:
 		if card_cash_data:
 			# Карта с наличными
 			amount = card_cash_data.get("value", 0)
-			selected_items.append(f"💳 Карта: {card_name}: {amount} р.")
+			current_block_items.append(f"💳 Карта: {card_name}: {amount} р.")
 		else:
 			# Только карта без наличных
-			selected_items.append(f"💳 Карта: {card_name}")
+			current_block_items.append(f"💳 Карта: {card_name}")
 	
 	# Обрабатываем наличные без карты
 	if cash_data:
 		amount = cash_data.get("value", 0)
 		cash_name = cash_data.get("cash_name", "Наличные")
-		selected_items.append(f"💵 {cash_name}: {amount} р.")
+		current_block_items.append(f"💵 {cash_name}: {amount} р.")
+	
+	if current_block_items:
+		selected_items.append("Текущий блок: " + ", ".join(current_block_items))
 	
 	if selected_items:
 		text += "Выбранные данные:\n" + "\n".join(selected_items) + "\n\n"
@@ -590,7 +628,19 @@ async def cmd_add(message: Message, state: FSMContext):
 		return
 	
 	await state.set_state(AddDataStates.selecting_type)
-	await state.update_data(mode="add", crypto_data=None, cash_data=None, card_data=None, card_cash_data=None, xmr_number=None)
+	await state.update_data(
+		mode="add",
+		crypto_data=None,
+		cash_data=None,
+		card_data=None,
+		card_cash_data=None,
+		xmr_number=None,
+		saved_blocks=[],
+		crypto_list=[],
+		xmr_list=[],
+		cash_list=[],
+		card_cash_pairs=[]
+	)
 	
 	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
@@ -607,7 +657,19 @@ async def cmd_rate(message: Message, state: FSMContext):
 		return
 	
 	await state.set_state(AddDataStates.selecting_type)
-	await state.update_data(mode="rate", crypto_data=None, cash_data=None, card_data=None, card_cash_data=None, xmr_number=None)
+	await state.update_data(
+		mode="rate",
+		crypto_data=None,
+		cash_data=None,
+		card_data=None,
+		card_cash_data=None,
+		xmr_number=None,
+		saved_blocks=[],
+		crypto_list=[],
+		xmr_list=[],
+		cash_list=[],
+		card_cash_pairs=[]
+	)
 	
 	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
@@ -927,36 +989,43 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.callback_query(F.data.startswith("add_data:confirm:"))
-async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
-	"""Обработчик подтверждения и записи данных в Google Sheets"""
+@admin_router.callback_query(F.data.startswith("add_data:add_block:"))
+async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик добавления нового блока данных"""
 	mode = cb.data.split(":")[-1]
 	data = await state.get_data()
 	
+	# Получаем текущие данные
 	crypto_data = data.get("crypto_data")
 	cash_data = data.get("cash_data")
 	card_data = data.get("card_data")
-	card_cash_data = data.get("card_cash_data")  # Наличные для карты
+	card_cash_data = data.get("card_cash_data")
 	
-	# Проверяем, что есть хотя бы какие-то данные
-	if not crypto_data and not cash_data and not card_data:
-		await cb.answer("❌ Нет данных для записи. Добавьте хотя бы один тип данных.", show_alert=True)
+	# Проверяем, есть ли данные для сохранения
+	has_data = crypto_data or cash_data or card_data
+	
+	if not has_data:
+		await cb.answer("⚠️ Нет данных для сохранения. Добавьте данные перед нажатием '+'.", show_alert=True)
 		return
 	
-	from app.config import get_settings
-	from app.google_sheets import write_all_to_google_sheet_one_row, write_to_google_sheet_rate_mode
+	# Получаем список сохраненных блоков
+	saved_blocks = data.get("saved_blocks", [])
 	
-	settings = get_settings()
-	if not settings.google_sheet_id or not settings.google_credentials_path:
-		await cb.answer("❌ Google Sheets не настроен", show_alert=True)
-		return
+	# Сохраняем текущий блок как новый сохраненный блок
+	saved_blocks.append({
+		"crypto_data": crypto_data.copy() if crypto_data else None,
+		"cash_data": cash_data.copy() if cash_data else None,
+		"card_data": card_data.copy() if card_data else None,
+		"card_cash_data": card_cash_data.copy() if card_cash_data else None
+	})
 	
-	# Формируем данные для записи
-	crypto_list = []
-	xmr_list = []
-	cash_list = []
-	card_cash_pairs = []
+	# Получаем списки сохраненных данных для записи в Google Sheets
+	crypto_list = data.get("crypto_list", [])
+	xmr_list = data.get("xmr_list", [])
+	cash_list = data.get("cash_list", [])
+	card_cash_pairs = data.get("card_cash_pairs", [])
 	
+	# Добавляем текущие данные в списки для записи
 	if crypto_data:
 		currency = crypto_data.get("currency")
 		usd_amount = crypto_data.get("usd_amount", 0)
@@ -973,32 +1042,121 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				"usd_amount": usd_amount
 			})
 	
-	# Обрабатываем карту и наличные для карты
 	if card_data:
 		if card_cash_data:
-			# Карта с наличными
 			card_cash_pairs.append({
 				"card": card_data.copy(),
 				"cash": card_cash_data.copy()
 			})
 		else:
-			# Только карта без наличных
 			card_cash_pairs.append({
 				"card": card_data.copy(),
 				"cash": None
 			})
 	
-	# Обрабатываем наличные без карты
 	if cash_data:
-		# Наличные без карты
-		cash_name = cash_data.get("cash_name")
-		logger.info(f"🔍 Формирование cash_list: cash_data={cash_data}, cash_name={cash_name}")
 		cash_list.append({
 			"currency": cash_data.get("currency", "RUB"),
 			"value": cash_data.get("value", 0),
-			"cash_name": cash_name  # Название наличных для получения адреса столбца
+			"cash_name": cash_data.get("cash_name")
 		})
-		logger.info(f"🔍 Сформирован cash_list: {cash_list}")
+	
+	# Очищаем текущие данные для нового блока
+	await state.update_data(
+		crypto_data=None,
+		cash_data=None,
+		card_data=None,
+		card_cash_data=None,
+		xmr_number=None,
+		saved_blocks=saved_blocks,
+		crypto_list=crypto_list,
+		xmr_list=xmr_list,
+		cash_list=cash_list,
+		card_cash_pairs=card_cash_pairs
+	)
+	
+	# Обновляем сообщение
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	try:
+		await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	except Exception as e:
+		# Игнорируем ошибку, если сообщение не изменилось
+		if "message is not modified" not in str(e):
+			raise
+	await cb.answer("✅ Блок данных сохранен. Добавьте новый блок.")
+
+
+@admin_router.callback_query(F.data.startswith("add_data:confirm:"))
+async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик подтверждения и записи данных в Google Sheets"""
+	mode = cb.data.split(":")[-1]
+	data = await state.get_data()
+	
+	# Получаем текущие данные
+	crypto_data = data.get("crypto_data")
+	cash_data = data.get("cash_data")
+	card_data = data.get("card_data")
+	card_cash_data = data.get("card_cash_data")  # Наличные для карты
+	
+	# Получаем списки сохраненных данных
+	crypto_list = data.get("crypto_list", [])
+	xmr_list = data.get("xmr_list", [])
+	cash_list = data.get("cash_list", [])
+	card_cash_pairs = data.get("card_cash_pairs", [])
+	
+	# Добавляем текущие данные к спискам (если есть)
+	if crypto_data:
+		currency = crypto_data.get("currency")
+		usd_amount = crypto_data.get("usd_amount", 0)
+		xmr_number = crypto_data.get("xmr_number")
+		
+		if currency == "XMR" and xmr_number:
+			xmr_list.append({
+				"xmr_number": xmr_number,
+				"usd_amount": usd_amount
+			})
+		else:
+			crypto_list.append({
+				"currency": currency,
+				"usd_amount": usd_amount
+			})
+	
+	if card_data:
+		if card_cash_data:
+			card_cash_pairs.append({
+				"card": card_data.copy(),
+				"cash": card_cash_data.copy()
+			})
+		else:
+			card_cash_pairs.append({
+				"card": card_data.copy(),
+				"cash": None
+			})
+	
+	if cash_data:
+		cash_list.append({
+			"currency": cash_data.get("currency", "RUB"),
+			"value": cash_data.get("value", 0),
+			"cash_name": cash_data.get("cash_name")
+		})
+	
+	# Проверяем, что есть хотя бы какие-то данные
+	if not crypto_list and not xmr_list and not cash_list and not card_cash_pairs:
+		await cb.answer("❌ Нет данных для записи. Добавьте хотя бы один тип данных.", show_alert=True)
+		return
+	
+	from app.config import get_settings
+	from app.google_sheets import write_all_to_google_sheet_one_row, write_to_google_sheet_rate_mode
+	
+	settings = get_settings()
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await cb.answer("❌ Google Sheets не настроен", show_alert=True)
+		return
+	
+	# Данные уже собраны в списки выше
+	logger.info(f"🔍 Формирование cash_list: cash_list={cash_list}")
 	
 	# Записываем в Google Sheets
 	logger.info(f"🔍 Данные для записи (mode={mode}): crypto_list={crypto_list}, xmr_list={xmr_list}, cash_list={cash_list}, card_cash_pairs={card_cash_pairs}")

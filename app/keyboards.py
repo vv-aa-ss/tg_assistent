@@ -528,15 +528,55 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора типа данных в командах /add и /rate.
+	Показывает все сохраненные блоки + текущий блок.
 	
 	Args:
 		mode: Режим работы ("add" или "rate")
 		back_to: Callback data для кнопки "Назад"
-		data: Словарь с выбранными данными (crypto_data, cash_data, card_data, card_cash_data)
+		data: Словарь с выбранными данными (saved_blocks, crypto_data, cash_data, card_data, card_cash_data)
 	"""
 	kb = InlineKeyboardBuilder()
 	
-	# Определяем текст для кнопок на основе выбранных данных
+	# Получаем сохраненные блоки
+	saved_blocks = data.get("saved_blocks", []) if data else []
+	
+	# Добавляем кнопки для каждого сохраненного блока
+	for block_idx, block in enumerate(saved_blocks):
+		crypto_text = "🪙"
+		cash_text = "💵"
+		card_text = "💳"
+		
+		block_crypto = block.get("crypto_data")
+		if block_crypto:
+			currency = block_crypto.get("currency", "")
+			usd_amount = block_crypto.get("usd_amount", 0)
+			xmr_number = block_crypto.get("xmr_number")
+			if xmr_number:
+				crypto_text = f"{int(usd_amount)}USD (XMR-{xmr_number})"
+			else:
+				crypto_text = f"{int(usd_amount)}USD ({currency})"
+		
+		block_cash = block.get("cash_data")
+		if block_cash:
+			amount = block_cash.get("value", 0)
+			cash_text = str(amount)
+		
+		block_card = block.get("card_data")
+		block_card_cash = block.get("card_cash_data")
+		if block_card:
+			card_name = block_card.get("card_name", "")
+			if block_card_cash:
+				amount = block_card_cash.get("value", 0)
+				card_text = f"{card_name}: {amount}р."
+			else:
+				card_text = card_name
+		
+		# Каждый сохраненный блок - отдельная строка
+		kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:{mode}")
+		kb.button(text=card_text, callback_data=f"add_data:type:card:{mode}")
+		kb.button(text=cash_text, callback_data=f"add_data:type:cash:{mode}")
+	
+	# Определяем текст для кнопок текущего блока
 	crypto_text = "🪙"
 	cash_text = "💵"
 	card_text = "💳"
@@ -567,16 +607,22 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 			else:
 				card_text = card_name
 	
-	# Первый ряд: Криптовалюта и Карта
+	# Добавляем текущий блок
 	kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:{mode}")
 	kb.button(text=card_text, callback_data=f"add_data:type:card:{mode}")
-	# Второй ряд: Наличные
 	kb.button(text=cash_text, callback_data=f"add_data:type:cash:{mode}")
-	# Третий ряд: Подтвердить и Назад
+	
+	# Кнопка "+" для добавления еще одного блока
+	kb.button(text="➕", callback_data=f"add_data:add_block:{mode}")
+	
+	# Подтвердить и Назад
 	kb.button(text="✅ Подтвердить", callback_data=f"add_data:confirm:{mode}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
-	kb.adjust(2, 1, 2)
+	# Настраиваем расположение: каждая строка блока - 3 кнопки, затем "+", затем "Подтвердить" и "Назад"
+	# saved_blocks + 1 (текущий блок) строк по 3 кнопки, затем 1 кнопка "+", затем 2 кнопки
+	adjust_list = [3] * (len(saved_blocks) + 1) + [1, 2]
+	kb.adjust(*adjust_list)
 	return kb.as_markup()
 
 
