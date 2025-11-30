@@ -31,6 +31,7 @@ from app.keyboards import (
 	card_groups_select_kb,
 	requisites_list_kb,
 	requisite_action_kb,
+	delete_confirmation_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -183,6 +184,11 @@ class CashColumnEditStates(StatesGroup):
 	waiting_column = State()
 	waiting_cash_name = State()
 	waiting_cash_column = State()
+
+
+class DeleteRowStates(StatesGroup):
+	first_confirmation = State()
+	second_confirmation = State()
 
 
 def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
@@ -509,8 +515,36 @@ async def cmd_del(message: Message, state: FSMContext):
 		await message.answer("⚠️ Google Sheets не настроен (отсутствует GOOGLE_SHEET_ID или GOOGLE_CREDENTIALS_PATH)")
 		return
 	
+	# Спрашиваем первое подтверждение
+	await state.set_state(DeleteRowStates.first_confirmation)
+	await message.answer("⚠️ Вы действительно хотите удалить последнюю строку?", reply_markup=delete_confirmation_kb())
+
+
+@admin_router.callback_query(DeleteRowStates.first_confirmation, F.data == "delete:confirm:yes")
+async def delete_first_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления - пользователь нажал 'Да'"""
+	# Переходим ко второму подтверждению
+	await state.set_state(DeleteRowStates.second_confirmation)
+	await cb.message.edit_text("⚠️ Вы уверены? Это действие нельзя отменить.", reply_markup=delete_confirmation_kb())
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteRowStates.first_confirmation, F.data == "delete:confirm:no")
+async def delete_first_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteRowStates.second_confirmation, F.data == "delete:confirm:yes")
+async def delete_second_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления - выполняет удаление"""
 	# Удаляем последнюю строку
 	from app.google_sheets import delete_last_row_from_google_sheet
+	from app.config import get_settings
+	
+	settings = get_settings()
 	
 	try:
 		result = await delete_last_row_from_google_sheet(
@@ -520,13 +554,24 @@ async def cmd_del(message: Message, state: FSMContext):
 		
 		if result.get("success"):
 			deleted_row = result.get("deleted_row")
-			await message.answer(f"✅ Успешно удалена строка {deleted_row}")
+			await cb.message.edit_text(f"✅ Успешно удалена строка {deleted_row}")
 		else:
 			error_message = result.get("message", "Неизвестная ошибка")
-			await message.answer(f"❌ Ошибка удаления: {error_message}")
+			await cb.message.edit_text(f"❌ Ошибка удаления: {error_message}")
 	except Exception as e:
 		logger.exception(f"Ошибка при удалении строки: {e}")
-		await message.answer(f"❌ Произошла ошибка при удалении: {str(e)}")
+		await cb.message.edit_text(f"❌ Произошла ошибка при удалении: {str(e)}")
+	finally:
+		await state.clear()
+		await cb.answer()
+
+
+@admin_router.callback_query(DeleteRowStates.second_confirmation, F.data == "delete:confirm:no")
+async def delete_second_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
 
 
 @admin_router.callback_query(F.data == "admin:back")
@@ -1181,9 +1226,37 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			)
 		
 		if result.get("success"):
+			# Формируем отчет о записи
+			from datetime import datetime
+			current_date = datetime.now().strftime("%d.%m.%Y")
+			
+			written_cells = result.get("written_cells", [])
+			row = result.get("row")
+			
+			report_lines = [f"📊 Отчет о записи данных ({current_date}):\n"]
+			
+			if mode == "add" and row:
+				report_lines.append(f"📍 Строка: {row}\n")
+			
+			if written_cells:
+				report_lines.append("✅ Записано:")
+				for cell_info in written_cells:
+					report_lines.append(f"  • {cell_info}")
+			else:
+				report_lines.append("⚠️ Нет записанных данных")
+			
+			# Проверяем наличие ошибок
+			failed_writes = result.get("failed_writes", [])
+			if failed_writes:
+				report_lines.append("\n❌ Не записано:")
+				for failed in failed_writes:
+					report_lines.append(f"  • {failed}")
+			
+			report_text = "\n".join(report_lines)
+			
 			await cb.answer("✅ Данные успешно записаны в Google Sheets", show_alert=True)
 			await state.clear()
-			await cb.message.edit_text("✅ Данные записаны!", reply_markup=admin_menu_kb())
+			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
 		else:
 			await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
 	except Exception as e:

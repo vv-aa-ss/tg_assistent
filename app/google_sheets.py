@@ -939,7 +939,7 @@ def _write_all_to_google_sheet_one_row_sync(
 		client = _get_google_sheets_client(credentials_path)
 		if not client:
 			logger.error("Не удалось создать клиент Google Sheets")
-			return {"success": False}
+			return {"success": False, "written_cells": []}
 		
 		# Открываем таблицу
 		try:
@@ -953,6 +953,8 @@ def _write_all_to_google_sheet_one_row_sync(
 		empty_row = _find_empty_row_in_column(worksheet, "BC", start_row=5)
 		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row}")
 		
+		written_cells = []  # Список записанных ячеек для отчета
+		
 		# Записываем криптовалюты (BTC, LTC, USDT)
 		for crypto in crypto_list:
 			currency = crypto.get("currency")
@@ -964,12 +966,15 @@ def _write_all_to_google_sheet_one_row_sync(
 				# Записываем в соответствующий столбец
 				if currency == "BTC" and btc_column:
 					worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
+					written_cells.append(f"{btc_column}{empty_row} (BTC: {usd_amount_rounded} USD)")
 					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
 				elif currency == "LTC" and ltc_column:
 					worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
+					written_cells.append(f"{ltc_column}{empty_row} (LTC: {usd_amount_rounded} USD)")
 					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
 				elif currency == "USDT" and usdt_column:
 					worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
+					written_cells.append(f"{usdt_column}{empty_row} (USDT: {usd_amount_rounded} USD)")
 					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
 		
 		# Записываем XMR
@@ -983,6 +988,7 @@ def _write_all_to_google_sheet_one_row_sync(
 				
 				if usd_column:
 					worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
+					written_cells.append(f"{usd_column}{empty_row} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
 					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
 		
 		# Записываем наличные для каждой карты (только наличные из той же строки)
@@ -999,6 +1005,7 @@ def _write_all_to_google_sheet_one_row_sync(
 				
 				if cash_amount > 0:
 					worksheet.update(f"{column}{empty_row}", [[cash_amount]])
+					written_cells.append(f"{column}{empty_row} (Карта {card_name}: {cash_amount} {cash_currency})")
 					logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (карта: {card_name})")
 		
 		# Записываем наличные без карты (если есть)
@@ -1012,11 +1019,12 @@ def _write_all_to_google_sheet_one_row_sync(
 			
 			if column and cash_amount > 0:
 				worksheet.update(f"{column}{empty_row}", [[cash_amount]])
+				written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {cash_amount} {cash_currency})")
 				logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
 			elif not column:
 				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
 		
-		return {"success": True}
+		return {"success": True, "written_cells": written_cells, "row": empty_row}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")

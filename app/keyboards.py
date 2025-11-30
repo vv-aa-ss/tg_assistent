@@ -626,6 +626,17 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 	return kb.as_markup()
 
 
+def delete_confirmation_kb() -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для подтверждения удаления с кнопками "Да" и "Нет".
+	"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="✅ Да", callback_data="delete:confirm:yes")
+	kb.button(text="❌ Нет", callback_data="delete:confirm:no")
+	kb.adjust(2)
+	return kb.as_markup()
+
+
 def add_data_xmr_select_kb(mode: str = "add", back_to: str = "add_data:back") -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора номера XMR (1, 2, 3).
