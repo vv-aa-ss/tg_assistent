@@ -873,17 +873,20 @@ async def write_all_to_google_sheet_one_row(
 			if xmr_number not in xmr_columns:
 				xmr_columns[xmr_number] = await get_xmr_column(xmr_number)
 		
-		# Вычисляем адреса столбцов для карт
+		# Вычисляем адреса столбцов для карт (по card_id для правильного суммирования)
 		card_columns = {}
 		for pair in card_cash_pairs:
 			card_data = pair.get("card")
-			card_name = card_data.get("card_name", "")
-			user_name = card_data.get("user_name", "")
-			key = f"{card_name}_{user_name}"
-			if key not in card_columns:
-				card_columns[key] = await get_card_column(card_name, user_name)
+			card_id = card_data.get("card_id")
+			if card_id and card_id not in card_columns:
+				# Получаем column из базы данных по card_id
+				card_column = await db.get_card_column(card_id)
+				card_columns[card_id] = card_column
 				# Добавляем адрес столбца в данные карты
-				card_data["column"] = card_columns[key]
+				card_data["column"] = card_column
+			elif card_id and card_id in card_columns:
+				# Если column уже определен, используем его
+				card_data["column"] = card_columns[card_id]
 		
 		# Получаем адреса столбцов для наличных
 		cash_columns = {}
@@ -891,13 +894,14 @@ async def write_all_to_google_sheet_one_row(
 		for cash in cash_list:
 			cash_name = cash.get("cash_name")
 			logger.info(f"🔍 Обработка наличных: cash_name={cash_name}, cash={cash}")
-			if cash_name and cash_name not in cash_columns:
-				cash_column = await db.get_cash_column(cash_name)
-				cash_columns[cash_name] = cash_column
-				# Добавляем адрес столбца в данные наличных
-				cash["column"] = cash_column
-				logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
-			elif not cash_name:
+			if cash_name:
+				if cash_name not in cash_columns:
+					cash_column = await db.get_cash_column(cash_name)
+					cash_columns[cash_name] = cash_column
+					logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+				# Всегда добавляем адрес столбца в данные наличных (даже если уже был получен ранее)
+				cash["column"] = cash_columns[cash_name]
+			else:
 				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
 		
 		# Выполняем синхронную запись в отдельном потоке
@@ -955,60 +959,86 @@ def _write_all_to_google_sheet_one_row_sync(
 		
 		written_cells = []  # Список записанных ячеек для отчета
 		
-		# Записываем криптовалюты (BTC, LTC, USDT)
+		# Суммируем криптовалюты с одинаковой валютой
+		crypto_sum = {}  # {currency: total_amount}
 		for crypto in crypto_list:
 			currency = crypto.get("currency")
 			usd_amount = crypto.get("usd_amount", 0.0)
-			
-			if usd_amount > 0:
-				usd_amount_rounded = int(round(usd_amount))
-				
-				# Записываем в соответствующий столбец
-				if currency == "BTC" and btc_column:
-					worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
-					written_cells.append(f"{btc_column}{empty_row} (BTC: {usd_amount_rounded} USD)")
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
-				elif currency == "LTC" and ltc_column:
-					worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
-					written_cells.append(f"{ltc_column}{empty_row} (LTC: {usd_amount_rounded} USD)")
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
-				elif currency == "USDT" and usdt_column:
-					worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
-					written_cells.append(f"{usdt_column}{empty_row} (USDT: {usd_amount_rounded} USD)")
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
+			if usd_amount != 0:
+				if currency not in crypto_sum:
+					crypto_sum[currency] = 0.0
+				crypto_sum[currency] += usd_amount
 		
-		# Записываем XMR
+		# Записываем суммированные криптовалюты (BTC, LTC, USDT)
+		for currency, total_amount in crypto_sum.items():
+			usd_amount_rounded = int(round(total_amount))
+			
+			# Записываем в соответствующий столбец
+			if currency == "BTC" and btc_column:
+				worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
+				written_cells.append(f"{btc_column}{empty_row} (BTC: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
+			elif currency == "LTC" and ltc_column:
+				worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
+				written_cells.append(f"{ltc_column}{empty_row} (LTC: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
+			elif currency == "USDT" and usdt_column:
+				worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
+				written_cells.append(f"{usdt_column}{empty_row} (USDT: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
+		
+		# Суммируем XMR с одинаковым номером
+		xmr_sum = {}  # {xmr_number: total_amount}
 		for xmr in xmr_list:
 			xmr_number = xmr.get("xmr_number")
 			usd_amount = xmr.get("usd_amount", 0.0)
-			
-			if usd_amount > 0:
-				usd_amount_rounded = int(round(usd_amount))
-				usd_column = xmr_columns.get(xmr_number)
-				
-				if usd_column:
-					worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
-					written_cells.append(f"{usd_column}{empty_row} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
+			if usd_amount != 0:
+				if xmr_number not in xmr_sum:
+					xmr_sum[xmr_number] = 0.0
+				xmr_sum[xmr_number] += usd_amount
 		
-		# Записываем наличные для каждой карты (только наличные из той же строки)
+		# Записываем суммированные XMR
+		for xmr_number, total_amount in xmr_sum.items():
+			usd_amount_rounded = int(round(total_amount))
+			usd_column = xmr_columns.get(xmr_number)
+			
+			if usd_column:
+				worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
+				written_cells.append(f"{usd_column}{empty_row} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
+		
+		# Суммируем наличные для каждой карты (по card_id для правильного суммирования)
+		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name}}
 		for pair in card_cash_pairs:
 			card_data = pair.get("card")
 			cash_data = pair.get("cash")
-			card_name = card_data.get("card_name", "")
+			card_id = card_data.get("card_id")
 			column = card_data.get("column")
 			
-			if column and cash_data:
-				# Записываем наличные только для этой карты (из той же строки)
-				cash_currency = cash_data.get("currency", "RUB")
+			if card_id and column and cash_data:
 				cash_amount = cash_data.get("value", 0)
-				
-				if cash_amount > 0:
-					worksheet.update(f"{column}{empty_row}", [[cash_amount]])
-					written_cells.append(f"{column}{empty_row} (Карта {card_name}: {cash_amount} {cash_currency})")
-					logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (карта: {card_name})")
+				if cash_amount != 0:
+					if card_id not in card_cash_sum:
+						card_cash_sum[card_id] = {
+							"column": column,
+							"amount": 0,
+							"card_name": card_data.get("card_name", "")
+						}
+					card_cash_sum[card_id]["amount"] += cash_amount
 		
-		# Записываем наличные без карты (если есть)
+		# Записываем суммированные наличные для карт
+		for card_id, card_info in card_cash_sum.items():
+			column = card_info["column"]
+			total_amount = card_info["amount"]
+			card_name = card_info["card_name"]
+			
+			if total_amount != 0:
+				worksheet.update(f"{column}{empty_row}", [[total_amount]])
+				written_cells.append(f"{column}{empty_row} (Карта {card_name}: {total_amount} RUB)")
+				logger.info(f"✅ Записано {total_amount} RUB в ячейку {column}{empty_row} (карта: {card_name})")
+		
+		# Суммируем наличные без карты (по cash_name)
+		cash_sum = {}  # {cash_name: {"column": column, "amount": total_amount, "currency": currency}}
 		logger.info(f"🔍 Запись наличных без карты в режиме /add: cash_list={cash_list}, len={len(cash_list)}")
 		for cash in cash_list:
 			cash_name = cash.get("cash_name", "")
@@ -1017,12 +1047,21 @@ def _write_all_to_google_sheet_one_row_sync(
 			column = cash.get("column")
 			logger.info(f"🔍 Наличные для записи: cash_name={cash_name}, amount={cash_amount}, column={column}")
 			
-			if column and cash_amount > 0:
-				worksheet.update(f"{column}{empty_row}", [[cash_amount]])
-				written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {cash_amount} {cash_currency})")
-				logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
-			elif not column:
-				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
+			if column and cash_amount != 0:
+				if cash_name not in cash_sum:
+					cash_sum[cash_name] = {"column": column, "amount": 0, "currency": cash_currency}
+				cash_sum[cash_name]["amount"] += cash_amount
+		
+		# Записываем суммированные наличные без карты
+		for cash_name, cash_data in cash_sum.items():
+			column = cash_data["column"]
+			total_amount = cash_data["amount"]
+			cash_currency = cash_data["currency"]
+			
+			if total_amount != 0:
+				worksheet.update(f"{column}{empty_row}", [[total_amount]])
+				written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {total_amount} {cash_currency})")
+				logger.info(f"✅ Записано {total_amount} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
 		
 		return {"success": True, "written_cells": written_cells, "row": empty_row}
 		

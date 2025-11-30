@@ -598,9 +598,9 @@ def format_add_data_text(data: dict) -> str:
 			usd_amount = block_crypto.get("usd_amount", 0)
 			xmr_number = block_crypto.get("xmr_number")
 			if xmr_number:
-				block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
+				block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)}")
 			else:
-				block_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
+				block_items.append(f"🪙 {currency}: ${int(usd_amount)}")
 		
 		block_card = block.get("card_data")
 		block_card_cash = block.get("card_cash_data")
@@ -608,18 +608,18 @@ def format_add_data_text(data: dict) -> str:
 			card_name = block_card.get("card_name", "")
 			if block_card_cash:
 				amount = block_card_cash.get("value", 0)
-				block_items.append(f"💳 Карта: {card_name}: {amount} р.")
+				block_items.append(f"💳{card_name}: {amount} р.")
 			else:
-				block_items.append(f"💳 Карта: {card_name}")
+				block_items.append(f"💳{card_name}")
 		
 		block_cash = block.get("cash_data")
 		if block_cash:
 			amount = block_cash.get("value", 0)
 			cash_name = block_cash.get("cash_name", "Наличные")
-			block_items.append(f"💵 {cash_name}: {amount} р.")
+			block_items.append(f"💵 {cash_name}: {amount}")
 		
 		if block_items:
-			selected_items.append(f"Блок {block_idx}: " + ", ".join(block_items))
+			selected_items.append(f"{block_idx}: " + ", ".join(block_items))
 	
 	# Показываем текущий блок (если есть)
 	current_block_items = []
@@ -629,9 +629,9 @@ def format_add_data_text(data: dict) -> str:
 		usd_amount = crypto_data.get("usd_amount", 0)
 		xmr_number = crypto_data.get("xmr_number")
 		if xmr_number:
-			current_block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)} USD")
+			current_block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)}")
 		else:
-			current_block_items.append(f"🪙 {currency}: ${int(usd_amount)} USD")
+			current_block_items.append(f"🪙 {currency}: ${int(usd_amount)}")
 	
 	card_data = data.get("card_data")
 	cash_data = data.get("cash_data")
@@ -643,19 +643,20 @@ def format_add_data_text(data: dict) -> str:
 		if card_cash_data:
 			# Карта с наличными
 			amount = card_cash_data.get("value", 0)
-			current_block_items.append(f"💳 Карта: {card_name}: {amount} р.")
+			current_block_items.append(f"💳{card_name}: {amount} р.")
 		else:
 			# Только карта без наличных
-			current_block_items.append(f"💳 Карта: {card_name}")
+			current_block_items.append(f"💳{card_name}")
 	
 	# Обрабатываем наличные без карты
 	if cash_data:
 		amount = cash_data.get("value", 0)
 		cash_name = cash_data.get("cash_name", "Наличные")
-		current_block_items.append(f"💵 {cash_name}: {amount} р.")
+		current_block_items.append(f"💵 {cash_name}: {amount}")
 	
 	if current_block_items:
-		selected_items.append("Текущий блок: " + ", ".join(current_block_items))
+		current_block_num = len(saved_blocks) + 1
+		selected_items.append(f"{current_block_num}: " + ", ".join(current_block_items))
 	
 	if selected_items:
 		text += "Выбранные данные:\n" + "\n".join(selected_items) + "\n\n"
@@ -747,7 +748,66 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 	"""Обработчик выбора типа данных в командах /add и /rate"""
 	parts = cb.data.split(":")
 	data_type = parts[2]  # crypto, cash, card
-	mode = parts[3]  # add или rate
+	
+	# Определяем, редактируется ли сохраненный блок или текущий
+	# Формат для сохраненного блока: add_data:type:crypto:block:{block_idx}:{mode}
+	# Формат для текущего блока: add_data:type:crypto:current:{mode}
+	# Старый формат (для обратной совместимости): add_data:type:crypto:{mode}
+	block_idx = None
+	if len(parts) >= 5 and parts[3] == "block":
+		# Редактирование сохраненного блока
+		block_idx = int(parts[4])
+		mode = parts[5]
+		# Загружаем данные блока в текущий блок для редактирования
+		data = await state.get_data()
+		
+		# Сохраняем текущий блок перед загрузкой данных для редактирования (если есть данные)
+		current_crypto_data = data.get("crypto_data")
+		current_cash_data = data.get("cash_data")
+		current_card_data = data.get("card_data")
+		current_card_cash_data = data.get("card_cash_data")
+		has_current_data = current_crypto_data or current_cash_data or current_card_data
+		
+		if has_current_data:
+			# Сохраняем текущий блок в saved_blocks (только в saved_blocks, не в списки)
+			saved_blocks = data.get("saved_blocks", [])
+			
+			# Добавляем текущий блок в saved_blocks
+			saved_blocks.append({
+				"crypto_data": current_crypto_data.copy() if current_crypto_data else None,
+				"cash_data": current_cash_data.copy() if current_cash_data else None,
+				"card_data": current_card_data.copy() if current_card_data else None,
+				"card_cash_data": current_card_cash_data.copy() if current_card_cash_data else None
+			})
+			
+			# Обновляем только saved_blocks (списки будут заполнены при подтверждении из saved_blocks)
+			await state.update_data(saved_blocks=saved_blocks)
+			# Получаем обновленные данные после сохранения текущего блока
+			data = await state.get_data()
+		
+		# Теперь загружаем данные сохраненного блока для редактирования
+		saved_blocks = data.get("saved_blocks", [])
+		if 0 <= block_idx < len(saved_blocks):
+			block = saved_blocks[block_idx]
+			# Загружаем данные блока в текущий блок для редактирования
+			await state.update_data(
+				crypto_data=block.get("crypto_data").copy() if block.get("crypto_data") else None,
+				cash_data=block.get("cash_data").copy() if block.get("cash_data") else None,
+				card_data=block.get("card_data").copy() if block.get("card_data") else None,
+				card_cash_data=block.get("card_cash_data").copy() if block.get("card_cash_data") else None,
+				xmr_number=block.get("crypto_data", {}).get("xmr_number") if block.get("crypto_data") else None,
+				crypto_currency=block.get("crypto_data", {}).get("currency") if block.get("crypto_data") else None,
+				cash_name=block.get("cash_data", {}).get("cash_name") if block.get("cash_data") else None,
+				editing_block_idx=block_idx  # Сохраняем индекс редактируемого блока
+			)
+	elif len(parts) >= 5 and parts[3] == "current":
+		# Редактирование текущего блока
+		mode = parts[4]
+		await state.update_data(editing_block_idx=None)  # Очищаем индекс, если редактируем текущий блок
+	else:
+		# Старый формат (обратная совместимость)
+		mode = parts[3]
+		await state.update_data(editing_block_idx=None)
 	
 	data = await state.get_data()
 	
@@ -878,13 +938,11 @@ async def add_data_enter_crypto(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы криптовалюты"""
 	try:
 		usd_amount = float(message.text.replace(",", "."))
-		if usd_amount <= 0:
-			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
-			return
 		
 		data = await state.get_data()
 		currency = data.get("crypto_currency", "BTC")
 		xmr_number = data.get("xmr_number")
+		editing_block_idx = data.get("editing_block_idx")
 		
 		crypto_data = {
 			"currency": currency,
@@ -894,7 +952,46 @@ async def add_data_enter_crypto(message: Message, state: FSMContext):
 		if xmr_number:
 			crypto_data["xmr_number"] = xmr_number
 		
-		await state.update_data(crypto_data=crypto_data)
+		# Если редактируется сохраненный блок, обновляем его
+		if editing_block_idx is not None:
+			saved_blocks = data.get("saved_blocks", [])
+			if 0 <= editing_block_idx < len(saved_blocks):
+				saved_blocks[editing_block_idx]["crypto_data"] = crypto_data.copy()
+				# Также обновляем в списках для записи по индексу блока
+				crypto_list = data.get("crypto_list", [])
+				xmr_list = data.get("xmr_list", [])
+				
+				# Обновляем элемент в списках по индексу блока (порядок должен совпадать)
+				if currency == "XMR" and xmr_number:
+					# Обновляем в xmr_list
+					if editing_block_idx < len(xmr_list):
+						xmr_list[editing_block_idx]["usd_amount"] = usd_amount
+						xmr_list[editing_block_idx]["xmr_number"] = xmr_number
+				else:
+					# Обновляем в crypto_list
+					if editing_block_idx < len(crypto_list):
+						crypto_list[editing_block_idx]["currency"] = currency
+						crypto_list[editing_block_idx]["usd_amount"] = usd_amount
+				
+				# Очищаем весь текущий блок после обновления сохраненного блока
+				await state.update_data(
+					saved_blocks=saved_blocks,
+					crypto_list=crypto_list,
+					xmr_list=xmr_list,
+					crypto_data=None,  # Очищаем текущий блок
+					card_data=None,  # Очищаем текущий блок
+					card_cash_data=None,  # Очищаем текущий блок
+					cash_data=None,  # Очищаем текущий блок
+					xmr_number=None,  # Очищаем текущий блок
+					crypto_currency=None,  # Очищаем текущий блок
+					cash_name=None,  # Очищаем текущий блок
+					editing_block_idx=None  # Сбрасываем индекс после обновления
+				)
+			else:
+				await state.update_data(crypto_data=crypto_data, editing_block_idx=None)
+		else:
+			await state.update_data(crypto_data=crypto_data)
+		
 		await state.set_state(AddDataStates.selecting_type)
 		
 		mode = data.get("mode", "add")
@@ -903,7 +1000,7 @@ async def add_data_enter_crypto(message: Message, state: FSMContext):
 		text = format_add_data_text(data)
 		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
 	except ValueError:
-		await message.answer("❌ Неверный формат. Введите число, например: 100")
+		await message.answer("❌ Неверный формат. Введите число, например: 100 или -100")
 	except Exception as e:
 		logger.exception(f"Ошибка обработки криптовалюты: {e}")
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
@@ -932,11 +1029,9 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных для карты"""
 	try:
 		amount = int(float(message.text.replace(",", ".")))
-		if amount <= 0:
-			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
-			return
 		
 		data = await state.get_data()
+		editing_block_idx = data.get("editing_block_idx")
 		
 		# Сохраняем наличные для карты
 		card_cash_data = {
@@ -945,7 +1040,35 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 			"display": f"{amount} RUB"
 		}
 		
-		await state.update_data(card_cash_data=card_cash_data)
+		# Если редактируется сохраненный блок, обновляем его
+		if editing_block_idx is not None:
+			saved_blocks = data.get("saved_blocks", [])
+			if 0 <= editing_block_idx < len(saved_blocks):
+				saved_blocks[editing_block_idx]["card_cash_data"] = card_cash_data.copy()
+				# Также обновляем в списках для записи по индексу блока
+				card_cash_pairs = data.get("card_cash_pairs", [])
+				# Обновляем элемент в списке по индексу блока (порядок должен совпадать)
+				if editing_block_idx < len(card_cash_pairs):
+					card_cash_pairs[editing_block_idx]["cash"] = card_cash_data.copy()
+				
+				# Очищаем весь текущий блок после обновления сохраненного блока
+				await state.update_data(
+					saved_blocks=saved_blocks,
+					card_cash_pairs=card_cash_pairs,
+					crypto_data=None,  # Очищаем текущий блок
+					card_data=None,  # Очищаем текущий блок
+					card_cash_data=None,  # Очищаем текущий блок
+					cash_data=None,  # Очищаем текущий блок
+					xmr_number=None,  # Очищаем текущий блок
+					crypto_currency=None,  # Очищаем текущий блок
+					cash_name=None,  # Очищаем текущий блок
+					editing_block_idx=None  # Сбрасываем индекс после обновления
+				)
+			else:
+				await state.update_data(card_cash_data=card_cash_data, editing_block_idx=None)
+		else:
+			await state.update_data(card_cash_data=card_cash_data)
+		
 		await state.set_state(AddDataStates.selecting_type)
 
 		mode = data.get("mode", "add")
@@ -954,7 +1077,7 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 		text = format_add_data_text(data)
 		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
 	except ValueError:
-		await message.answer("❌ Неверный формат. Введите число, например: 200")
+		await message.answer("❌ Неверный формат. Введите число, например: 200 или -200")
 	except Exception as e:
 		logger.exception(f"Ошибка обработки наличных для карты: {e}")
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
@@ -965,12 +1088,10 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных (без карты)"""
 	try:
 		amount = int(float(message.text.replace(",", ".")))
-		if amount <= 0:
-			await message.answer("❌ Сумма должна быть больше нуля. Попробуйте еще раз:")
-			return
 		
 		data = await state.get_data()
 		cash_name = data.get("cash_name", "Наличные")
+		editing_block_idx = data.get("editing_block_idx")
 		
 		cash_data = {
 			"currency": "RUB",
@@ -979,7 +1100,37 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 			"cash_name": cash_name  # Сохраняем название для режима rate
 		}
 		
-		await state.update_data(cash_data=cash_data)
+		# Если редактируется сохраненный блок, обновляем его
+		if editing_block_idx is not None:
+			saved_blocks = data.get("saved_blocks", [])
+			if 0 <= editing_block_idx < len(saved_blocks):
+				saved_blocks[editing_block_idx]["cash_data"] = cash_data.copy()
+				# Также обновляем в списках для записи по индексу блока
+				cash_list = data.get("cash_list", [])
+				# Обновляем элемент в списке по индексу блока (порядок должен совпадать)
+				if editing_block_idx < len(cash_list):
+					cash_list[editing_block_idx]["value"] = amount
+					cash_list[editing_block_idx]["currency"] = cash_data.get("currency", "RUB")
+					cash_list[editing_block_idx]["cash_name"] = cash_name
+				
+				# Очищаем весь текущий блок после обновления сохраненного блока
+				await state.update_data(
+					saved_blocks=saved_blocks,
+					cash_list=cash_list,
+					crypto_data=None,  # Очищаем текущий блок
+					card_data=None,  # Очищаем текущий блок
+					card_cash_data=None,  # Очищаем текущий блок
+					cash_data=None,  # Очищаем текущий блок
+					xmr_number=None,  # Очищаем текущий блок
+					crypto_currency=None,  # Очищаем текущий блок
+					cash_name=None,  # Очищаем текущий блок
+					editing_block_idx=None  # Сбрасываем индекс после обновления
+				)
+			else:
+				await state.update_data(cash_data=cash_data, editing_block_idx=None)
+		else:
+			await state.update_data(cash_data=cash_data)
+		
 		await state.set_state(AddDataStates.selecting_type)
 
 		mode = data.get("mode", "add")
@@ -988,7 +1139,7 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 		text = format_add_data_text(data)
 		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
 	except ValueError:
-		await message.answer("❌ Неверный формат. Введите число, например: 5000")
+		await message.answer("❌ Неверный формат. Введите число, например: 5000 или -5000")
 	except Exception as e:
 		logger.exception(f"Ошибка обработки наличных: {e}")
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
@@ -1017,14 +1168,62 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
+	editing_block_idx = data.get("editing_block_idx")
+	
+	# Получаем адрес столбца для карты
+	column = await db.get_card_column(card_id)
 	
 	card_data = {
 		"card_id": card_id,
 		"card_name": card.get("name", ""),
-		"user_name": None
+		"user_name": None,
+		"column": column
 	}
 	
-	await state.update_data(card_data=card_data)
+	# Если редактируется сохраненный блок, обновляем его
+	if editing_block_idx is not None:
+		saved_blocks = data.get("saved_blocks", [])
+		if 0 <= editing_block_idx < len(saved_blocks):
+			saved_blocks[editing_block_idx]["card_data"] = card_data.copy()
+			# Также обновляем в списках для записи
+			card_cash_pairs = data.get("card_cash_pairs", [])
+			card_cash_data = saved_blocks[editing_block_idx].get("card_cash_data")
+			
+			# Находим и обновляем соответствующую пару или создаем новую
+			found = False
+			for pair in card_cash_pairs:
+				old_card = pair.get("card", {})
+				if old_card.get("card_id") == card_id or old_card.get("card_name") == card.get("name", ""):
+					pair["card"] = card_data.copy()
+					if card_cash_data:
+						pair["cash"] = card_cash_data.copy()
+					found = True
+					break
+			
+			if not found:
+				# Создаем новую пару, если не найдена
+				card_cash_pairs.append({
+					"card": card_data.copy(),
+					"cash": card_cash_data.copy() if card_cash_data else None
+				})
+			
+			# Очищаем весь текущий блок после обновления сохраненного блока
+			await state.update_data(
+				saved_blocks=saved_blocks,
+				card_cash_pairs=card_cash_pairs,
+				crypto_data=None,  # Очищаем текущий блок
+				card_data=None,  # Очищаем текущий блок
+				card_cash_data=None,  # Очищаем текущий блок
+				cash_data=None,  # Очищаем текущий блок
+				xmr_number=None,  # Очищаем текущий блок
+				crypto_currency=None,  # Очищаем текущий блок
+				cash_name=None,  # Очищаем текущий блок
+				editing_block_idx=None  # Сбрасываем индекс после обновления
+			)
+		else:
+			await state.update_data(card_data=card_data, editing_block_idx=None)
+	else:
+		await state.update_data(card_data=card_data)
 	# После выбора карты запрашиваем ввод суммы наличных для карты
 	await state.set_state(AddDataStates.entering_card_cash)
 	
@@ -2070,9 +2269,9 @@ async def requisite_edit_start(cb: CallbackQuery, state: FSMContext):
 	db = get_db()
 	parts = cb.data.split(":")
 	
-	if len(parts) == 3 and parts[2].startswith("main:"):
-		# Редактирование основного реквизита
-		card_id = int(parts[2].split(":")[1])
+	if len(parts) >= 4 and parts[2] == "main":
+		# Редактирование основного реквизита (формат: req:edit:main:card_id)
+		card_id = int(parts[3])
 		card = await db.get_card_by_id(card_id)
 		if not card:
 			await cb.answer("Карта не найдена", show_alert=True)
@@ -2094,7 +2293,7 @@ async def requisite_edit_start(cb: CallbackQuery, state: FSMContext):
 			reply_markup=simple_back_kb(f"req:edit_main:{card_id}"),
 		)
 	else:
-		# Редактирование дополнительного реквизита
+		# Редактирование дополнительного реквизита (формат: req:edit:requisite_id)
 		requisite_id = int(parts[-1])
 		
 		# Получаем информацию о реквизите
@@ -2150,9 +2349,9 @@ async def requisite_delete(cb: CallbackQuery):
 	db = get_db()
 	parts = cb.data.split(":")
 	
-	if len(parts) == 3 and parts[2].startswith("main:"):
-		# Удаление основного реквизита (user_message)
-		card_id = int(parts[2].split(":")[1])
+	if len(parts) >= 4 and parts[2] == "main":
+		# Удаление основного реквизита (user_message) (формат: req:delete:main:card_id)
+		card_id = int(parts[3])
 		card = await db.get_card_by_id(card_id)
 		if not card:
 			await cb.answer("Карта не найдена", show_alert=True)
@@ -2176,7 +2375,7 @@ async def requisite_delete(cb: CallbackQuery):
 			parse_mode="HTML",
 		)
 	else:
-		# Удаление дополнительного реквизита
+		# Удаление дополнительного реквизита (формат: req:delete:requisite_id)
 		requisite_id = int(parts[-1])
 		
 		# Получаем card_id перед удалением

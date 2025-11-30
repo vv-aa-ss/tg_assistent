@@ -559,7 +559,10 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 		block_cash = block.get("cash_data")
 		if block_cash:
 			amount = block_cash.get("value", 0)
-			cash_text = str(amount)
+			cash_name = block_cash.get("cash_name", "Наличные")
+			# Берем первую букву категории
+			cash_letter = cash_name[0].upper() if cash_name else "Н"
+			cash_text = f"{amount} {cash_letter}"
 		
 		block_card = block.get("card_data")
 		block_card_cash = block.get("card_cash_data")
@@ -571,10 +574,10 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 			else:
 				card_text = card_name
 		
-		# Каждый сохраненный блок - отдельная строка
-		kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:{mode}")
-		kb.button(text=card_text, callback_data=f"add_data:type:card:{mode}")
-		kb.button(text=cash_text, callback_data=f"add_data:type:cash:{mode}")
+		# Каждый сохраненный блок - отдельная строка с индексом блока в callback_data
+		kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:block:{block_idx}:{mode}")
+		kb.button(text=card_text, callback_data=f"add_data:type:card:block:{block_idx}:{mode}")
+		kb.button(text=cash_text, callback_data=f"add_data:type:cash:block:{block_idx}:{mode}")
 	
 	# Определяем текст для кнопок текущего блока
 	crypto_text = "🪙"
@@ -595,7 +598,10 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 		cash_data = data.get("cash_data")
 		if cash_data:
 			amount = cash_data.get("value", 0)
-			cash_text = str(amount)
+			cash_name = cash_data.get("cash_name", "Наличные")
+			# Берем первую букву категории
+			cash_letter = cash_name[0].upper() if cash_name else "Н"
+			cash_text = f"{amount} {cash_letter}"
 		
 		card_data = data.get("card_data")
 		card_cash_data = data.get("card_cash_data")
@@ -607,10 +613,10 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 			else:
 				card_text = card_name
 	
-	# Добавляем текущий блок
-	kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:{mode}")
-	kb.button(text=card_text, callback_data=f"add_data:type:card:{mode}")
-	kb.button(text=cash_text, callback_data=f"add_data:type:cash:{mode}")
+	# Добавляем текущий блок (используем "current" вместо индекса)
+	kb.button(text=crypto_text, callback_data=f"add_data:type:crypto:current:{mode}")
+	kb.button(text=card_text, callback_data=f"add_data:type:card:current:{mode}")
+	kb.button(text=cash_text, callback_data=f"add_data:type:cash:current:{mode}")
 	
 	# Кнопка "+" для добавления еще одного блока
 	kb.button(text="➕", callback_data=f"add_data:add_block:{mode}")
