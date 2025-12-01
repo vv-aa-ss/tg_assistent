@@ -1489,9 +1489,13 @@ def _write_to_google_sheet_rate_mode_sync(
 				cash_currency = cash_data.get("currency", "RUB")
 				cash_amount = cash_data.get("value", 0)
 				
-				if cash_amount > 0:
-					# В режиме rate записываем со знаком минус
-					cash_amount_negative = -cash_amount
+				if cash_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
+					# В режиме rate записываем со знаком минус (если значение положительное)
+					# Если значение уже отрицательное, оставляем как есть
+					if cash_amount > 0:
+						cash_amount_negative = -cash_amount
+					else:
+						cash_amount_negative = cash_amount  # Уже отрицательное
 					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 					if empty_row > rate_max_row:
 						failed_writes.append(f"Карта {card_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
@@ -1647,4 +1651,148 @@ async def get_crypto_values_from_row_4(
 		sheet_id,
 		credentials_path,
 		crypto_columns
+	)
+
+
+def _read_card_balance_sync(
+	sheet_id: str,
+	credentials_path: str,
+	column: str,
+	balance_row: int = 4
+) -> Optional[str]:
+	"""
+	Синхронная функция для чтения баланса карты из указанной строки.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		column: Столбец карты (например, "D")
+		balance_row: Номер строки с балансом (по умолчанию 4)
+	
+	Returns:
+		Значение баланса или None
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return None
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = spreadsheet.sheet1
+		
+		cell_address = f"{column}{balance_row}"
+		logger.info(f"🔍 Чтение баланса карты из ячейки {cell_address}")
+		
+		cell = worksheet.acell(cell_address)
+		if cell and cell.value:
+			value = str(cell.value).strip()
+			logger.info(f"✅ Прочитан баланс из {cell_address}: '{value}'")
+			return value
+		else:
+			logger.info(f"⚠️ Ячейка {cell_address} пустая или не найдена")
+			return None
+	except Exception as e:
+		logger.exception(f"❌ Ошибка чтения баланса из {cell_address}: {e}")
+		return None
+
+
+async def read_card_balance(
+	sheet_id: str,
+	credentials_path: str,
+	column: str,
+	balance_row: int = 4
+) -> Optional[str]:
+	"""
+	Читает баланс карты из указанной строки.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		column: Столбец карты (например, "D")
+		balance_row: Номер строки с балансом (по умолчанию 4)
+	
+	Returns:
+		Значение баланса или None
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_card_balance_sync,
+		sheet_id,
+		credentials_path,
+		column,
+		balance_row
+	)
+
+
+def _read_profit_sync(
+	sheet_id: str,
+	credentials_path: str,
+	row: int,
+	profit_column: str = "BC"
+) -> Optional[str]:
+	"""
+	Синхронная функция для чтения профита из указанного столбца.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		row: Номер строки, куда записали данные
+		profit_column: Столбец с профитом (по умолчанию "BC")
+	
+	Returns:
+		Значение профита или None
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return None
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = spreadsheet.sheet1
+		
+		cell_address = f"{profit_column}{row}"
+		logger.info(f"🔍 Чтение профита из ячейки {cell_address}")
+		
+		cell = worksheet.acell(cell_address)
+		if cell and cell.value:
+			value = str(cell.value).strip()
+			logger.info(f"✅ Прочитан профит из {cell_address}: '{value}'")
+			return value
+		else:
+			logger.info(f"⚠️ Ячейка {cell_address} пустая или не найдена")
+			return None
+	except Exception as e:
+		logger.exception(f"❌ Ошибка чтения профита из {cell_address}: {e}")
+		return None
+
+
+async def read_profit(
+	sheet_id: str,
+	credentials_path: str,
+	row: int,
+	profit_column: str = "BC"
+) -> Optional[str]:
+	"""
+	Читает профит из указанного столбца.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		row: Номер строки, куда записали данные
+		profit_column: Столбец с профитом (по умолчанию "BC")
+	
+	Returns:
+		Значение профита или None
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_profit_sync,
+		sheet_id,
+		credentials_path,
+		row,
+		profit_column
 	)

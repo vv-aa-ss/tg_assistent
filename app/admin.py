@@ -1434,10 +1434,12 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		if result.get("success"):
 			# Формируем отчет о записи
 			from datetime import datetime
+			from app.google_sheets import read_card_balance, read_profit
 			current_date = datetime.now().strftime("%d.%m.%Y")
 			
 			written_cells = result.get("written_cells", [])
 			row = result.get("row")
+			column_rows = result.get("column_rows", {})  # Для режима rate: {column: row}
 			
 			report_lines = [f"📊 Отчет о записи данных ({current_date}):\n"]
 			
@@ -1451,6 +1453,67 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			else:
 				report_lines.append("⚠️ Нет записанных данных")
 			
+			# Читаем балансы карт и профиты
+			# Получаем настройки из БД
+			db = get_db()
+			balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
+			profit_column_str = await db.get_google_sheets_setting("profit_column", "BC")
+			balance_row = int(balance_row_str) if balance_row_str else 4
+			profit_column = profit_column_str if profit_column_str else "BC"
+			
+			# Читаем балансы для всех карт из card_cash_pairs
+			card_balances = {}
+			for pair in card_cash_pairs:
+				card_data = pair.get("card")
+				if card_data:
+					card_name = card_data.get("card_name", "")
+					column = card_data.get("column")
+					if column:
+						balance = await read_card_balance(
+							settings.google_sheet_id,
+							settings.google_credentials_path,
+							column,
+							balance_row
+						)
+						if balance:
+							card_balances[card_name] = {"balance": balance, "column": column}
+			
+			# Читаем профиты
+			profits = {}
+			if mode == "add" and row:
+				# В режиме /add все данные в одной строке
+				profit = await read_profit(
+					settings.google_sheet_id,
+					settings.google_credentials_path,
+					row,
+					profit_column
+				)
+				if profit:
+					profits[f"{profit_column}{row}"] = profit
+			elif mode == "rate" and column_rows:
+				# В режиме /rate может быть несколько строк для разных столбцов
+				for column, written_row in column_rows.items():
+					profit = await read_profit(
+						settings.google_sheet_id,
+						settings.google_credentials_path,
+						written_row,
+						profit_column
+					)
+					if profit:
+						profits[f"{profit_column}{written_row}"] = profit
+			
+			# Добавляем информацию о балансах и профите в отчет
+			if card_balances or profits:
+				report_lines.append("\n💰 Дополнительная информация:")
+				
+				if card_balances:
+					for card_name, data in card_balances.items():
+						report_lines.append(f"  💳 {card_name}: Баланс ({data['column']}{balance_row}) = {data['balance']}")
+				
+				if profits:
+					for cell_address, profit_value in profits.items():
+						report_lines.append(f"  📈 Профит сделки ({cell_address}) = {profit_value}")
+			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])
 			if failed_writes:
@@ -1460,7 +1523,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			report_text = "\n".join(report_lines)
 			
-			await cb.answer("✅ Данные успешно записаны в Google Sheets", show_alert=True)
+			await cb.answer()  # Просто закрываем callback без уведомления
 			await state.clear()
 			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
 		else:

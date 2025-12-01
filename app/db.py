@@ -1348,6 +1348,12 @@ class Database:
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
 			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+			)
 			_logger.debug("Created table google_sheets_settings with default values")
 		else:
 			# Проверяем наличие всех необходимых ключей
@@ -1373,6 +1379,14 @@ class Database:
 			if 'rate_last_row' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
+				)
+			if 'balance_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
+				)
+			if 'profit_column' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
 				)
 
 	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
