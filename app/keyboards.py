@@ -136,13 +136,14 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
-def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKeyboardMarkup:
+def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recent_cards: Optional[List[Tuple[int, str]]] = None) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора группы карт.
 	
 	Args:
 		groups: Список словарей с информацией о группах
 		back_to: Callback data для кнопки "Назад"
+		recent_cards: Список кортежей (card_id, card_name) последних используемых карт (максимум 4)
 	"""
 	kb = InlineKeyboardBuilder()
 	for group in groups:
@@ -160,8 +161,33 @@ def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back") -> In
 		kb.button(text="📋 Без группы", callback_data=f"{back_to}:group:0")
 	else:
 		kb.button(text="📋 Без группы", callback_data="cards:group:0")
+	
+	# Добавляем кнопки последних используемых карт (максимум 4)
+	if recent_cards and back_to.startswith("add_data:back:"):
+		# Добавляем только если используется в /add или /rate
+		for card_id, card_name in recent_cards[:4]:  # Ограничиваем до 4 карт
+			kb.button(text=f"💳 {card_name}", callback_data=f"card:view:{card_id}")
+	
 	kb.button(text="⬅️ Назад", callback_data=back_to)
-	kb.adjust(1)
+	
+	# Настраиваем расположение: группы по 1 в ряд, последние карты по 2 в ряд (если есть), затем "Назад"
+	if recent_cards and back_to.startswith("add_data:back:"):
+		recent_count = min(len(recent_cards), 4)
+		adjust_params = [1] * (len(groups) + 1)  # Группы + "Без группы"
+		if recent_count > 0:
+			# Последние карты по 2 в ряд
+			recent_rows = (recent_count + 1) // 2  # Количество рядов для последних карт
+			for i in range(recent_rows):
+				if i == recent_rows - 1 and recent_count % 2 == 1:
+					adjust_params.append(1)  # Последняя карта одна, если нечетное количество
+				else:
+					adjust_params.append(2)  # По 2 карты в ряд
+		adjust_params.append(1)  # Кнопка "Назад"
+		kb.adjust(*adjust_params)
+	else:
+		# Стандартное расположение: все по 1 в ряд
+		kb.adjust(1)
+	
 	return kb.as_markup()
 
 

@@ -1474,9 +1474,13 @@ def _write_to_google_sheet_rate_mode_sync(
 			cash_amount = cash.get("value", 0)
 			column = cash.get("column")
 			
-			if column and cash_amount > 0:
-				# В режиме rate записываем со знаком минус
-				cash_amount_negative = -cash_amount
+			if column and cash_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
+				# В режиме rate записываем со знаком минус (если значение положительное)
+				# Если значение уже отрицательное, оставляем как есть
+				if cash_amount > 0:
+					cash_amount_negative = -cash_amount
+				else:
+					cash_amount_negative = cash_amount  # Уже отрицательное
 				empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 				if empty_row > rate_max_row:
 					failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
@@ -1489,6 +1493,8 @@ def _write_to_google_sheet_rate_mode_sync(
 			elif not column:
 				failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (не указан адрес столбца)")
 				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
+			elif cash_amount == 0:
+				logger.warning(f"⚠️ Пропущено наличные {cash_name}: сумма равна 0")
 		
 		return {
 			"success": len(written_cells) > 0 or len(failed_writes) == 0,

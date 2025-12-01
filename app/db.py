@@ -79,7 +79,18 @@ class Database:
 		await self._ensure_card_groups()
 		await self._ensure_google_sheets_settings()
 		await self._ensure_card_requisites()
+		await self._ensure_menu_user()
 		await self._db.commit()
+
+	async def _ensure_menu_user(self) -> None:
+		"""Создает специального пользователя для логирования выбора карт в меню"""
+		assert self._db
+		# Создаем специального пользователя с tg_id = -1 для логирования выбора карт в меню
+		await self._db.execute(
+			"INSERT OR IGNORE INTO users(tg_id, username, full_name) VALUES(?, ?, ?)",
+			(-1, "_menu_user", "Menu Selection User")
+		)
+		_logger.debug("Ensured menu user exists")
 
 	async def _ensure_cards_user_message(self) -> None:
 		assert self._db
@@ -676,6 +687,64 @@ class Database:
 			_logger.debug(f"Cannot log delivery: tg_id={tg_id} not found")
 			return
 		await self.log_card_delivery(user_id, card_id, admin_id, delivered_at)
+
+	async def get_recent_cards_by_admin(self, admin_id: int, limit: int = 4) -> List[Tuple[int, str]]:
+		"""
+		Получает последние используемые карты по admin_id из card_delivery_log.
+		Возвращает последние N уникальных карт, упорядоченных по времени последнего использования.
+		
+		Args:
+			admin_id: ID администратора
+			limit: Количество карт для возврата (по умолчанию 4)
+		
+		Returns:
+			Список кортежей (card_id, card_name) последних используемых карт
+		"""
+		assert self._db
+		# Используем подзапрос для получения последнего времени использования каждой карты,
+		# затем сортируем по этому времени и ограничиваем результат
+		query = """
+			SELECT c.id, c.name
+			FROM cards c
+			INNER JOIN (
+				SELECT card_id, MAX(delivered_at) as last_used
+				FROM card_delivery_log
+				WHERE admin_id = ?
+				GROUP BY card_id
+			) last_usage ON c.id = last_usage.card_id
+			ORDER BY last_usage.last_used DESC
+			LIMIT ?
+		"""
+		cur = await self._db.execute(query, (admin_id, limit))
+		rows = await cur.fetchall()
+		return [(r[0], r[1]) for r in rows]
+
+	async def log_card_selection(self, card_id: int, admin_id: int, delivered_at: Optional[int] = None) -> None:
+		"""
+		Логирует выбор карты администратором в /add или /rate.
+		Использует специального пользователя с tg_id = -1 для обозначения выбора карты в меню.
+		
+		Args:
+			card_id: ID выбранной карты
+			admin_id: ID администратора
+			delivered_at: Временная метка (по умолчанию текущее время)
+		"""
+		assert self._db
+		timestamp = int(delivered_at or time.time())
+		# Получаем user_id специального пользователя для меню
+		cur = await self._db.execute("SELECT id FROM users WHERE tg_id = -1")
+		row = await cur.fetchone()
+		if not row:
+			_logger.warning("Menu user not found, cannot log card selection")
+			return
+		menu_user_id = row[0]
+		# Используем menu_user_id для обозначения выбора карты в меню (не реальная доставка пользователю)
+		await self._db.execute(
+			"INSERT INTO card_delivery_log(user_id, card_id, delivered_at, admin_id) VALUES(?, ?, ?, ?)",
+			(menu_user_id, card_id, timestamp, admin_id),
+		)
+		await self._db.commit()
+		_logger.debug(f"Logged card selection: card_id={card_id}, admin_id={admin_id}, ts={timestamp}")
 
 	async def list_cards_for_user(self, user_id: int) -> List[Dict[str, Any]]:
 		assert self._db

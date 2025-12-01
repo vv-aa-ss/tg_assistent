@@ -839,10 +839,13 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 		# Показываем выбор карты
 		db = get_db()
 		groups = await db.list_card_groups()
+		# Получаем последние используемые карты для текущего админа
+		admin_id = cb.from_user.id
+		recent_cards = await db.get_recent_cards_by_admin(admin_id, limit=4)
 		from app.keyboards import card_groups_select_kb
 		await state.set_state(AddDataStates.selecting_card)
 		text = "💳 Выберите группу карт:" if groups else "💳 Групп пока нет. Выберите карты без группы:"
-		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"add_data:back:{mode}"))
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"add_data:back:{mode}", recent_cards=recent_cards))
 		await cb.answer()
 
 
@@ -1165,6 +1168,10 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	if not card:
 		await cb.answer("Карта не найдена", show_alert=True)
 		return
+	
+	# Логируем выбор карты для отслеживания последних используемых карт
+	admin_id = cb.from_user.id
+	await db.log_card_selection(card_id, admin_id)
 	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
@@ -3069,6 +3076,18 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	if message.text and message.text.startswith("/"):
 		return
 	
+	# Проверяем текущее состояние FSM - если пользователь находится в процессе /add или других операциях,
+	# не обрабатываем пересылки (они должны обрабатываться соответствующими обработчиками состояний)
+	current_state = await state.get_state()
+	if current_state:
+		# Если есть активное состояние, проверяем, не является ли это состоянием для пересылок
+		# Состояния ForwardBindStates - это состояния для обработки пересылок
+		if current_state not in [ForwardBindStates.waiting_select_card.state, 
+		                          ForwardBindStates.waiting_select_existing_card.state]:
+			# Пользователь находится в другом состоянии (например, /add), пропускаем обработку пересылки
+			logger.debug(f"⚠️ Пропуск обработки пересылки: пользователь находится в состоянии {current_state}")
+			return
+	
 	# Логируем ВСЕ сообщения, которые попадают в обработчик (ДАЖЕ ДО ПРОВЕРКИ АДМИНА)
 	text = message.text or message.caption or ""
 	is_forward = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from", None))
@@ -3396,16 +3415,27 @@ async def hidden_user_no_match(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.callback_query(ForwardBindStates.waiting_select_existing_card, F.data.startswith("user:reply:card:"))
+@admin_router.callback_query(F.data.startswith("user:reply:card:"))
 async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	logger.info(f"🔔 Обработчик forward_existing_card_reply вызван: callback_data={cb.data}")
+	current_state = await state.get_state()
+	logger.info(f"🔔 Текущее состояние: {current_state}")
+	
 	db = get_db()
 	parts = cb.data.split(":")
+	if len(parts) < 5:
+		logger.error(f"❌ Неверный формат callback_data: {cb.data}")
+		await cb.answer("Ошибка: неверный формат данных", show_alert=True)
+		return
+	
 	user_tg_id_val = parts[3]
 	card_id = int(parts[4])
+	logger.info(f"🔔 Парсинг callback: user_tg_id_val={user_tg_id_val}, card_id={card_id}")
 	
 	data = await state.get_data()
 	user_id_for_hidden = data.get("user_id_for_hidden")
 	hidden_user_name = data.get("hidden_user_name")
+	logger.info(f"🔔 Данные состояния: user_id_for_hidden={user_id_for_hidden}, hidden_user_name={hidden_user_name}")
 	
 	# Обрабатываем случай, когда tg_id = 0 (для скрытых пользователей)
 	user_tg_id = int(user_tg_id_val) if user_tg_id_val != "0" else None
@@ -3449,6 +3479,9 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 			card_id,
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
-		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id}). Сообщение не отправлено (нет tg_id)")
+		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id})")
+		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
 	
 	await cb.answer()
