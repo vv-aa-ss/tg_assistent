@@ -296,22 +296,55 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 				# Если весь диапазон пустой, API может вернуть None или пустой список
 				expected_rows = end_row - row + 1
 				received_rows = len(values) if values else 0
-				logger.debug(f"Прочитан диапазон {range_str}: ожидалось {expected_rows} строк, получено {received_rows} значений")
+				logger.info(f"🔍 Прочитан диапазон {range_str}: ожидалось {expected_rows} строк, получено {received_rows} значений")
+				
+				# Детальное логирование всех полученных значений
+				if values:
+					logger.info(f"📋 Детализация значений в диапазоне {range_str}:")
+					for i, cell_list in enumerate(values):
+						current_row = row + i
+						if cell_list and len(cell_list) > 0:
+							cell_value = cell_list[0]
+							cell_str = str(cell_value) if cell_value else ""
+							cell_length = len(cell_str)
+							logger.info(f"  Строка {current_row}: значение='{cell_value}' (длина: {cell_length}, тип: {type(cell_value).__name__})")
+						else:
+							logger.info(f"  Строка {current_row}: ПУСТАЯ (пустой список)")
+				else:
+					logger.info(f"📋 Диапазон {range_str}: values = None или пустой список")
 				
 				# Если values пустой или None, значит все ячейки в диапазоне пустые
 				if not values or len(values) == 0:
-					logger.debug(f"Диапазон {range_str} полностью пустой, возвращаем первую строку {row}")
+					logger.info(f"✅ Диапазон {range_str} полностью пустой, возвращаем первую строку {row}")
 					return row
 				
-				# Если получено меньше значений, чем ожидалось, значит остальные ячейки пустые
+				# Если получено меньше значений, чем ожидалось, нужно проверить каждую строку по отдельности,
+				# так как Google Sheets API может вернуть только непустые значения, и они могут быть не в начале диапазона
 				if received_rows < expected_rows:
-					# Первая пустая ячейка - это первая строка после последней полученной
-					first_empty_row = row + received_rows
+					logger.info(f"⚠️ Получено меньше значений ({received_rows} из {expected_rows}), проверяем каждую строку по отдельности")
+					# Проверяем каждую строку в диапазоне, начиная с start_row
+					for check_row in range(row, end_row + 1):
+						if max_row is not None and check_row > max_row:
+							logger.warning(f"⚠️ Достигнут лимит строки {max_row} в столбце {column}")
+							return max_row + 1
+						try:
+							check_value = sheet.acell(f"{column}{check_row}").value
+							if check_value is None or str(check_value).strip() == "":
+								logger.info(f"✅ Найдена первая пустая ячейка в строке {check_row}")
+								return check_row
+							else:
+								logger.info(f"  Строка {check_row}: заполнена значением '{check_value}' (длина: {len(str(check_value))})")
+						except Exception as e:
+							logger.warning(f"⚠️ Ошибка проверки строки {check_row}: {e}, считаем пустой")
+							return check_row
+					# Если все строки в диапазоне заполнены, продолжаем поиск дальше
+					first_empty_row = end_row + 1
 					if max_row is not None and first_empty_row > max_row:
-						logger.warning(f"Первая пустая ячейка {first_empty_row} превышает лимит {max_row}")
+						logger.warning(f"⚠️ Первая пустая ячейка {first_empty_row} превышает лимит {max_row}")
 						return max_row + 1
-					logger.debug(f"Получено меньше значений ({received_rows} из {expected_rows}), первая пустая ячейка в строке {first_empty_row}")
-					return first_empty_row
+					logger.info(f"✅ Все строки в диапазоне {range_str} заполнены, продолжаем поиск с строки {first_empty_row}")
+					row = first_empty_row
+					continue
 				
 				# Проверяем каждую полученную ячейку
 				for i, cell_list in enumerate(values):
@@ -319,25 +352,25 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 					
 					# Проверяем, не превысили ли лимит
 					if max_row is not None and current_row > max_row:
-						logger.warning(f"Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
+						logger.warning(f"⚠️ Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
 						return max_row + 1  # Возвращаем значение больше лимита, чтобы показать, что места нет
 					
 					# Если список пустой или содержит пустую строку, значит ячейка пустая
 					if not cell_list or len(cell_list) == 0:
-						logger.debug(f"Найдена пустая ячейка в строке {current_row} (пустой список)")
+						logger.info(f"✅ Найдена пустая ячейка в строке {current_row} (пустой список)")
 						return current_row
 					
 					cell_value = cell_list[0] if cell_list else None
 					
 					# Проверяем, является ли значение пустым (None, пустая строка, или только пробелы)
 					if cell_value is None:
-						logger.debug(f"Найдена пустая ячейка в строке {current_row} (None)")
+						logger.info(f"✅ Найдена пустая ячейка в строке {current_row} (None)")
 						return current_row
 					
 					# Преобразуем в строку и убираем пробелы для проверки
 					cell_str = str(cell_value).strip() if cell_value else ""
 					if cell_str == "":
-						logger.debug(f"Найдена пустая ячейка в строке {current_row} (пустая строка или пробелы)")
+						logger.info(f"✅ Найдена пустая ячейка в строке {current_row} (пустая строка или пробелы)")
 						return current_row
 					
 					logger.debug(f"Строка {current_row}: значение='{cell_value}' (тип: {type(cell_value)})")
@@ -1325,6 +1358,10 @@ async def write_to_google_sheet_rate_mode(
 		rate_max_row_str = await db.get_google_sheets_setting("rate_max_row", "355")
 		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 355
 		
+		# Получаем начальную строку для режима rate (по умолчанию 348)
+		rate_last_row_str = await db.get_google_sheets_setting("rate_last_row", "348")
+		rate_start_row = int(rate_last_row_str) if rate_last_row_str else 348
+		
 		# Выполняем синхронную запись в отдельном потоке
 		result = await asyncio.to_thread(
 			_write_to_google_sheet_rate_mode_sync,
@@ -1338,13 +1375,12 @@ async def write_to_google_sheet_rate_mode(
 			ltc_column,
 			usdt_column,
 			xmr_columns,
-			rate_max_row
+			rate_max_row,
+			rate_start_row
 		)
 		
-		# Обновляем последние использованные строки для столбцов
-		if result.get("success") and result.get("column_rows"):
-			for column, row in result["column_rows"].items():
-				await db.set_google_sheets_setting(f"rate_last_row_{column}", str(row))
+		# В режиме rate всегда начинаем с 348 строки, не сохраняем последние использованные строки
+		# (убрано сохранение rate_last_row_{column} для каждого столбца)
 		
 		return result
 	except Exception as e:
@@ -1363,11 +1399,12 @@ def _write_to_google_sheet_rate_mode_sync(
 	ltc_column: Optional[str],
 	usdt_column: Optional[str],
 	xmr_columns: Dict[int, Optional[str]],
-	rate_max_row: int = 355
+	rate_max_row: int = 355,
+	start_row: int = 348
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных в режиме rate.
-	Каждая запись идет в первую пустую ячейку соответствующего столбца, начиная со строки 348.
+	Каждая запись идет в первую пустую ячейку соответствующего столбца, начиная со строки start_row (по умолчанию 348).
 	Если найденная пустая ячейка превышает rate_max_row, запись не выполняется.
 	"""
 	try:
@@ -1387,8 +1424,7 @@ def _write_to_google_sheet_rate_mode_sync(
 		
 		written_cells = []
 		failed_writes = []  # Список данных, которые не удалось записать из-за лимита
-		column_rows = {}  # Словарь {column: row} для обновления последних строк
-		start_row = 348
+		column_rows = {}  # Словарь {column: row} для обновления последних строк (не используется, но оставлен для совместимости)
 		
 		# Записываем криптовалюты (BTC, LTC, USDT)
 		for crypto in crypto_list:

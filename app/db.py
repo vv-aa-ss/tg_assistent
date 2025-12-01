@@ -1345,6 +1345,9 @@ class Database:
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
 			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
+			)
 			_logger.debug("Created table google_sheets_settings with default values")
 		else:
 			# Проверяем наличие всех необходимых ключей
@@ -1366,6 +1369,10 @@ class Database:
 			if 'rate_max_row' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+				)
+			if 'rate_last_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
 				)
 
 	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
