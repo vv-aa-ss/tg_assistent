@@ -32,6 +32,7 @@ from app.keyboards import (
 	requisites_list_kb,
 	requisite_action_kb,
 	delete_confirmation_kb,
+	stat_u_menu_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -1461,46 +1462,57 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			balance_row = int(balance_row_str) if balance_row_str else 4
 			profit_column = profit_column_str if profit_column_str else "BC"
 			
-			# Читаем балансы для всех карт из card_cash_pairs
+			# Читаем балансы для всех карт из card_cash_pairs (batch чтение)
+			from app.google_sheets import read_card_balances_batch, read_profits_batch
+			
 			card_balances = {}
+			balance_cell_addresses = []
+			card_mapping = {}  # {cell_address: (card_name, column)}
+			
 			for pair in card_cash_pairs:
 				card_data = pair.get("card")
 				if card_data:
 					card_name = card_data.get("card_name", "")
 					column = card_data.get("column")
 					if column:
-						balance = await read_card_balance(
-							settings.google_sheet_id,
-							settings.google_credentials_path,
-							column,
-							balance_row
-						)
-						if balance:
-							card_balances[card_name] = {"balance": balance, "column": column}
+						cell_address = f"{column}{balance_row}"
+						balance_cell_addresses.append(cell_address)
+						card_mapping[cell_address] = (card_name, column)
 			
-			# Читаем профиты
-			profits = {}
-			if mode == "add" and row:
-				# В режиме /add все данные в одной строке
-				profit = await read_profit(
+			# Читаем все балансы одним batch запросом
+			if balance_cell_addresses:
+				balances = await read_card_balances_batch(
 					settings.google_sheet_id,
 					settings.google_credentials_path,
-					row,
-					profit_column
+					balance_cell_addresses
 				)
-				if profit:
-					profits[f"{profit_column}{row}"] = profit
+				for cell_address, (card_name, column) in card_mapping.items():
+					balance = balances.get(cell_address)
+					if balance:
+						card_balances[card_name] = {"balance": balance, "column": column}
+			
+			# Читаем профиты (batch чтение)
+			profits = {}
+			profit_cell_addresses = []
+			
+			if mode == "add" and row:
+				# В режиме /add все данные в одной строке
+				cell_address = f"{profit_column}{row}"
+				profit_cell_addresses.append(cell_address)
 			elif mode == "rate" and column_rows:
 				# В режиме /rate может быть несколько строк для разных столбцов
 				for column, written_row in column_rows.items():
-					profit = await read_profit(
-						settings.google_sheet_id,
-						settings.google_credentials_path,
-						written_row,
-						profit_column
-					)
-					if profit:
-						profits[f"{profit_column}{written_row}"] = profit
+					cell_address = f"{profit_column}{written_row}"
+					profit_cell_addresses.append(cell_address)
+			
+			# Читаем все профиты одним batch запросом
+			if profit_cell_addresses:
+				profits_dict = await read_profits_batch(
+					settings.google_sheet_id,
+					settings.google_credentials_path,
+					profit_cell_addresses
+				)
+				profits = profits_dict
 			
 			# Добавляем информацию о балансах и профите в отчет
 			if card_balances or profits:
@@ -2773,7 +2785,8 @@ async def _update_crypto_values_in_stats(
 		logger.info(f"Получены значения криптовалют: {crypto_values}")
 		
 		# Формируем строки для раздела "Крипта"
-		crypto_lines = ["", "<b>₿ Крипта</b>"]
+		# Не добавляем заголовок, так как он уже есть в base_lines
+		crypto_lines = []
 		
 		for crypto in crypto_columns:
 			crypto_type = crypto.get("crypto_type", "")
@@ -2837,104 +2850,288 @@ async def _update_crypto_values_in_stats(
 			logger.exception(f"Ошибка обновления сообщения с ошибкой: {update_error}")
 
 
-@admin_router.callback_query(F.data == "admin:stats")
-async def admin_stats(cb: CallbackQuery):
-	db = get_db()
+async def _build_activity_stats(db):
+	"""Строит сообщение со статистикой по активности (все пользователи)"""
 	stats = await db.get_stats_summary()
 	lines = [
-		"<b>📊 Статистика</b>",
+		"<b>📊 Статистика пользователей</b>",
 		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>",
 		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>",
+		"",
+		"<b>🔥 По активности</b>",
 	]
-	top_recent = stats.get("top_recent") or []
-	top_inactive = stats.get("top_inactive") or []
-	if top_recent:
-		lines.append("")
-		lines.append("<b>🔥 Топ-5 по активности</b>")
-		max_delivery = max((entry["delivery_count"] for entry in top_recent), default=1)
-		for entry in top_recent:
-			if entry["full_name"]:
+	
+	# Получаем всех пользователей, исключая системного пользователя (tg_id = -1)
+	per_user = stats.get("per_user") or []
+	all_users = [u for u in per_user if u.get("tg_id") != -1]
+	
+	# Сортируем по активности (количество выдач, затем по последнему взаимодействию)
+	all_users_sorted = sorted(
+		all_users,
+		key=lambda x: (
+			-(x.get("delivery_count") or 0),
+			-(x.get("last_interaction_at") or 0),
+		),
+	)
+	
+	if all_users_sorted:
+		max_delivery = max((entry.get("delivery_count") or 0 for entry in all_users_sorted), default=1)
+		for entry in all_users_sorted:
+			if entry.get("full_name"):
 				label = entry["full_name"]
-			elif entry["username"]:
+			elif entry.get("username"):
 				label = f"@{entry['username']}"
-			elif entry["tg_id"]:
+			elif entry.get("tg_id"):
 				label = f"tg_id: {entry['tg_id']}"
 			else:
-				label = f"ID {entry['user_id']}"
-			count = entry["delivery_count"]
+				label = f"ID {entry.get('user_id', '?')}"
+			count = entry.get("delivery_count") or 0
 			last_relative = format_relative(entry.get("last_interaction_at"))
 			bar = render_bar(count, max_delivery)
 			lines.append(
 				f"<code>{bar} {count:>3}</code> {escape(label)} <i>({last_relative})</i>"
 			)
-	if top_inactive:
-		lines.append("")
-		lines.append("<b>🕒 Топ-7 по давности активности</b>")
+	else:
+		lines.append("Нет данных по активности.")
+	
+	return "\n".join(lines)
+
+
+async def _build_inactivity_stats(db):
+	"""Строит сообщение со статистикой по давности (все пользователи)"""
+	stats = await db.get_stats_summary()
+	lines = [
+		"<b>📊 Статистика пользователей</b>",
+		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>",
+		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>",
+		"",
+		"<b>🕒 По давности активности</b>",
+	]
+	
+	# Получаем всех пользователей, исключая системного пользователя (tg_id = -1)
+	per_user = stats.get("per_user") or []
+	all_users = [u for u in per_user if u.get("tg_id") != -1]
+	
+	# Сортируем по давности (сначала те, у кого нет last_interaction_at, затем по возрастанию)
+	all_users_sorted = sorted(
+		all_users,
+		key=lambda x: (x.get("last_interaction_at") or 0),
+	)
+	
+	if all_users_sorted:
 		now_ts = int(datetime.now().timestamp())
 		inactivity_values = []
-		for entry in top_inactive:
+		for entry in all_users_sorted:
 			ts = entry.get("last_interaction_at")
 			if ts:
 				inactivity_values.append(max(0, now_ts - ts))
 			else:
 				inactivity_values.append(0)
 		max_inactivity = max(inactivity_values or [1])
-		for idx, entry in enumerate(top_inactive):
+		for idx, entry in enumerate(all_users_sorted):
 			inactivity = inactivity_values[idx] if idx < len(inactivity_values) else 0
-			if entry["full_name"]:
+			if entry.get("full_name"):
 				label = entry["full_name"]
-			elif entry["username"]:
+			elif entry.get("username"):
 				label = f"@{entry['username']}"
-			elif entry["tg_id"]:
+			elif entry.get("tg_id"):
 				label = f"tg_id: {entry['tg_id']}"
 			else:
-				label = f"ID {entry['user_id']}"
+				label = f"ID {entry.get('user_id', '?')}"
 			last_relative = format_relative(entry.get("last_interaction_at"))
 			bar = render_bar(inactivity, max_inactivity)
-			count = entry["delivery_count"]
+			count = entry.get("delivery_count") or 0
 			lines.append(
 				f"<code>{bar} {count:>3}</code> {escape(label)} <i>({last_relative})</i>"
 			)
-	if not top_recent and not top_inactive:
-		lines.append("")
-		lines.append("Нет данных по пользователям.")
+	else:
+		lines.append("Нет данных по давности.")
 	
-	# Добавляем раздел "Крипта" с заглушками "Загрузка..."
+	return "\n".join(lines)
+
+
+@admin_router.message(Command("stat_u"))
+async def admin_stats_command(msg: Message):
+	"""Обработчик команды /stat_u - показывает меню выбора типа статистики"""
+	db = get_db()
+	stats = await db.get_stats_summary()
+	text = (
+		"<b>📊 Статистика пользователей</b>\n"
+		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>\n"
+		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>\n\n"
+		"Выберите тип статистики:"
+	)
+	await msg.answer(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "stat_u:activity")
+async def stat_u_activity(cb: CallbackQuery):
+	"""Обработчик кнопки 'По активности'"""
+	db = get_db()
+	text = await _build_activity_stats(db)
+	await cb.message.edit_text(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "stat_u:inactivity")
+async def stat_u_inactivity(cb: CallbackQuery):
+	"""Обработчик кнопки 'По давности'"""
+	db = get_db()
+	text = await _build_inactivity_stats(db)
+	await cb.message.edit_text(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "stat_u:menu")
+async def stat_u_menu(cb: CallbackQuery):
+	"""Обработчик возврата в меню выбора типа статистики"""
+	db = get_db()
+	stats = await db.get_stats_summary()
+	text = (
+		"<b>📊 Статистика пользователей</b>\n"
+		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>\n"
+		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>\n\n"
+		"Выберите тип статистики:"
+	)
+	await cb.message.edit_text(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
+	await cb.answer()
+
+
+@admin_router.message(Command("stat_bk"))
+async def admin_stat_bk_command(msg: Message, bot: Bot):
+	"""Обработчик команды /stat_bk для отображения балансов всех карт"""
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import read_card_balances_batch
+	
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await msg.answer("❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Получаем balance_row из настроек
+	balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
+	balance_row = int(balance_row_str) if balance_row_str else 4
+	
+	# Получаем все карты
+	all_cards = await db.list_cards()
+	
+	if not all_cards:
+		await msg.answer("❌ Карты не найдены", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Сразу отправляем сообщение о загрузке
+	loading_msg = await msg.answer("⏳ Загрузка балансов карт...", reply_markup=simple_back_kb("admin:back"))
+	
+	# Собираем информацию о картах и их столбцах
+	cards_info = []  # [(card_id, card_name, column, cell_address)]
+	cards_without_column = []
+	cell_addresses = []
+	
+	for card_id, card_name, card_details in all_cards:
+		# Получаем столбец для карты
+		column = await db.get_card_column(card_id)
+		
+		if column:
+			cell_address = f"{column}{balance_row}"
+			cards_info.append((card_id, card_name, column, cell_address))
+			cell_addresses.append(cell_address)
+		else:
+			cards_without_column.append(card_name)
+	
+	# Читаем все балансы одним batch запросом
+	balances = {}
+	if cell_addresses:
+		try:
+			balances = await read_card_balances_batch(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				cell_addresses
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка batch чтения балансов: {e}")
+	
+	# Формируем результат
+	lines = ["<b>💳 Балансы карт</b>"]
+	cards_with_balance = []
+	
+	for card_id, card_name, column, cell_address in cards_info:
+		balance = balances.get(cell_address)
+		if balance:
+			cards_with_balance.append((card_name, column, balance))
+		else:
+			cards_with_balance.append((card_name, column, "—"))
+	
+	# Добавляем карты с балансами
+	if cards_with_balance:
+		for card_name, column, balance in cards_with_balance:
+			lines.append(f"<code>💳 {card_name} ({column}{balance_row}) = {balance}</code>")
+	
+	# Добавляем карты без привязки
+	if cards_without_column:
+		lines.append("")
+		lines.append("<b>⚠️ Карты без привязки к столбцу:</b>")
+		for card_name in cards_without_column:
+			lines.append(f"<code>💳 {card_name}</code>")
+	
+	if not cards_with_balance and not cards_without_column:
+		lines.append("Нет данных о картах.")
+	
+	text = "\n".join(lines)
+	logger.info(f"📊 Отправка балансов карт: карт с балансом={len(cards_with_balance)}, без столбца={len(cards_without_column)}")
+	try:
+		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		logger.info("✅ Сообщение с балансами карт успешно отправлено")
+	except Exception as e:
+		logger.exception(f"❌ Ошибка отправки сообщения с балансами карт: {e}")
+		# Если не удалось обновить, отправляем новое сообщение
+		try:
+			await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		except Exception as e2:
+			logger.exception(f"❌ Ошибка отправки нового сообщения с балансами карт: {e2}")
+
+
+@admin_router.message(Command("stat_k"))
+async def admin_stat_k_command(msg: Message, bot: Bot):
+	"""Обработчик команды /stat_k для отображения балансов крипты"""
+	db = get_db()
 	from app.config import get_settings
 	from app.google_sheets import get_crypto_values_from_row_4
 	
 	settings = get_settings()
 	crypto_columns = await db.list_crypto_columns()
 	
-	if crypto_columns and settings.google_sheet_id and settings.google_credentials_path:
-		lines.append("")
-		lines.append("<b>₿ Крипта</b>")
-		
+	if not crypto_columns:
+		await msg.answer("❌ Криптовалюты не настроены", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	lines = ["<b>₿ Балансы криптовалют</b>"]
+	
+	if settings.google_sheet_id and settings.google_credentials_path:
 		# Добавляем заглушки "Загрузка..." для каждой криптовалюты
 		for crypto in crypto_columns:
 			crypto_type = crypto.get("crypto_type", "")
 			lines.append(f"<code>{crypto_type} = Загрузка...</code>")
-	
-	# Отправляем сообщение сразу со статистикой активности
-	text = "\n".join(lines)
-	await cb.message.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
-	await cb.answer()
-	
-	# Асинхронно загружаем значения криптовалют и обновляем сообщение
-	if crypto_columns and settings.google_sheet_id and settings.google_credentials_path:
-		# Сохраняем базовые строки (без раздела "Крипта")
-		base_lines = lines[:-len(crypto_columns)-2]  # Все строки кроме раздела "Крипта"
 		
-		# Запускаем задачу обновления в фоне
+		text = "\n".join(lines)
+		sent_message = await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		
+		# Асинхронно загружаем значения криптовалют и обновляем сообщение
+		# Передаем только заголовок в base_lines, без строк "Загрузка..."
+		base_lines = ["<b>₿ Балансы криптовалют</b>"]
 		asyncio.create_task(_update_crypto_values_in_stats(
-			cb.bot,
-			cb.message.chat.id,
-			cb.message.message_id,
+			bot,
+			sent_message.chat.id,
+			sent_message.message_id,
 			settings.google_sheet_id,
 			settings.google_credentials_path,
 			crypto_columns,
 			base_lines
 		))
+	else:
+		lines.append("❌ Google Sheets не настроен")
+		await msg.answer("\n".join(lines), reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))

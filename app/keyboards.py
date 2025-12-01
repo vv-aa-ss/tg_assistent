@@ -10,8 +10,7 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb.button(text="📇 Безнал", callback_data="admin:cards")
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
 	kb.button(text="₿ Крипта", callback_data="admin:crypto")
-	kb.button(text="📊 Статистика", callback_data="admin:stats")
-	kb.adjust(2, 2, 1)
+	kb.adjust(2, 2)
 	return kb.as_markup()
 
 
@@ -124,6 +123,16 @@ def users_list_kb(
 def simple_back_kb(back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="⬅️ Назад", callback_data=back_to)
+	return kb.as_markup()
+
+
+def stat_u_menu_kb(back_to: str = "stat_u:menu") -> InlineKeyboardMarkup:
+	"""Клавиатура для меню статистики пользователей"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="🔥 По активности", callback_data="stat_u:activity")
+	kb.button(text="🕒 По давности", callback_data="stat_u:inactivity")
+	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(2, 1)
 	return kb.as_markup()
 
 

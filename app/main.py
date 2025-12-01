@@ -38,6 +38,24 @@ async def main() -> None:
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 	dp = Dispatcher(storage=MemoryStorage())
 	
+	# Определяем команды для админов
+	from aiogram.types import BotCommand, BotCommandScopeDefault
+	admin_commands = [
+		BotCommand(command="add", description="Добавить данные в таблицу"),
+		BotCommand(command="rate", description="Расход"),
+		BotCommand(command="del", description="Удалить последнюю операцию"),
+		BotCommand(command="stat_bk", description="Балансы карт"),
+		BotCommand(command="stat_k", description="Баланс крипты"),
+		BotCommand(command="stat_u", description="Статистика пользователей"),
+	]
+	
+	# Скрываем команды для всех пользователей по умолчанию
+	try:
+		await bot.set_my_commands(commands=[], scope=BotCommandScopeDefault())
+		logger.info("✅ Команды скрыты для обычных пользователей")
+	except Exception as e:
+		logger.warning(f"⚠️ Не удалось скрыть команды для обычных пользователей: {e}")
+	
 	# Middleware для логирования всех сообщений
 	class LoggingMiddleware:
 		async def __call__(self, handler, event, data):
@@ -56,6 +74,18 @@ async def main() -> None:
 			settings.admin_ids,
 			settings.admin_usernames
 		):
+			# Устанавливаем команды для админа после начала диалога
+			# Для личных чатов это работает только после того, как пользователь начал диалог
+			try:
+				from aiogram.types import BotCommandScopeChat
+				await bot.set_my_commands(
+					commands=admin_commands,
+					scope=BotCommandScopeChat(chat_id=message.from_user.id)
+				)
+				logger.info(f"✅ Команды установлены для админа {message.from_user.id} после /start")
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось установить команды для админа {message.from_user.id}: {e}")
+			
 			await message.answer("Добро пожаловать, администратор!", reply_markup=admin_menu_kb())
 		# non-admins: ignore (no reply)
 

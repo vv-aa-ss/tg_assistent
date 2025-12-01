@@ -1582,8 +1582,9 @@ def _get_crypto_values_from_row_4_sync(
 		spreadsheet = client.open_by_key(sheet_id)
 		worksheet = spreadsheet.sheet1
 		
-		# Читаем значения из строки 4 для каждой криптовалюты
-		logger.info(f"Начинаем чтение значений криптовалют из строки 4. Всего криптовалют: {len(crypto_columns)}")
+		# Собираем адреса ячеек для batch чтения
+		cell_addresses = []
+		crypto_mapping = {}  # {cell_address: crypto_type}
 		
 		for crypto in crypto_columns:
 			crypto_type = crypto.get("crypto_type", "")
@@ -1593,34 +1594,51 @@ def _get_crypto_values_from_row_4_sync(
 				logger.warning(f"Пропущена криптовалюта {crypto_type}: нет столбца")
 				continue
 			
+			cell_address = f"{column}4"
+			cell_addresses.append(cell_address)
+			crypto_mapping[cell_address] = crypto_type
+		
+		# Читаем все значения одним batch запросом
+		logger.info(f"Начинаем batch чтение значений криптовалют из строки 4. Всего криптовалют: {len(cell_addresses)}")
+		
+		if cell_addresses:
 			try:
-				# Читаем ячейку из строки 4
-				cell_address = f"{column}4"
-				logger.debug(f"Читаем ячейку {cell_address} для {crypto_type}")
+				# Используем batch_get для чтения всех ячеек за один запрос
+				values = worksheet.batch_get(cell_addresses)
 				
-				cell = worksheet.acell(cell_address)
-				
-				if cell:
-					value = cell.value
-					logger.info(f"Прочитано значение для {crypto_type} из {cell_address}: '{value}' (тип: {type(value)})")
+				# Обрабатываем результаты
+				for i, cell_address in enumerate(cell_addresses):
+					crypto_type = crypto_mapping[cell_address]
 					
-					# Форматируем значение (убираем лишние пробелы, если есть)
-					if value is not None:
-						value = str(value).strip()
-						# Если значение пустое после strip, считаем его None
-						if not value:
+					try:
+						# values[i] - это список строк для данной ячейки (обычно одна строка)
+						# values[i][0] - первая строка
+						# values[i][0][0] - первое значение в строке
+						if i < len(values) and values[i] and len(values[i]) > 0:
+							row = values[i][0]
+							if row and len(row) > 0:
+								value = str(row[0]).strip()
+								# Если значение пустое после strip, считаем его None
+								if not value:
+									value = None
+								logger.debug(f"Прочитано значение для {crypto_type} из {cell_address}: '{value}'")
+							else:
+								value = None
+								logger.debug(f"Ячейка {cell_address} для {crypto_type} пустая")
+						else:
 							value = None
-					else:
-						value = None
-				else:
-					value = None
-					logger.warning(f"Ячейка {cell_address} для {crypto_type} вернула None")
-				
-				result[crypto_type] = value
-				
+							logger.debug(f"Ячейка {cell_address} для {crypto_type} не найдена в ответе")
+						
+						result[crypto_type] = value
+						
+					except (IndexError, TypeError) as e:
+						logger.warning(f"Ошибка обработки ячейки {cell_address} для {crypto_type}: {e}")
+						result[crypto_type] = None
 			except Exception as e:
-				logger.exception(f"Ошибка чтения ячейки {column}4 для {crypto_type}: {e}")
-				result[crypto_type] = None
+				logger.exception(f"Ошибка batch чтения криптовалют: {e}")
+				# В случае ошибки batch чтения, помечаем все как None
+				for cell_address, crypto_type in crypto_mapping.items():
+					result[crypto_type] = None
 		
 	except Exception as e:
 		logger.exception(f"Ошибка чтения значений криптовалют из строки 4: {e}")
@@ -1672,6 +1690,7 @@ def _read_card_balance_sync(
 	Returns:
 		Значение баланса или None
 	"""
+	cell_address = f"{column}{balance_row}"  # Определяем сразу, чтобы использовать в except
 	try:
 		client = _get_google_sheets_client(credentials_path)
 		if not client:
@@ -1681,7 +1700,6 @@ def _read_card_balance_sync(
 		spreadsheet = client.open_by_key(sheet_id)
 		worksheet = spreadsheet.sheet1
 		
-		cell_address = f"{column}{balance_row}"
 		logger.info(f"🔍 Чтение баланса карты из ячейки {cell_address}")
 		
 		cell = worksheet.acell(cell_address)
@@ -1723,6 +1741,92 @@ async def read_card_balance(
 		credentials_path,
 		column,
 		balance_row
+	)
+
+
+def _read_card_balances_batch_sync(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str]
+) -> Dict[str, Optional[str]]:
+	"""
+	Синхронная функция для чтения балансов нескольких карт за один запрос.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["D4", "E4", "F4"])
+	
+	Returns:
+		Словарь {адрес_ячейки: значение} или None при ошибке
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return {}
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = spreadsheet.sheet1
+		
+		logger.info(f"🔍 Batch чтение балансов из {len(cell_addresses)} ячеек")
+		
+		# Используем batch_get для чтения нескольких ячеек за один запрос
+		# batch_get возвращает список списков: [[['value1']], [['value2']], ...]
+		values = worksheet.batch_get(cell_addresses)
+		
+		result = {}
+		for i, cell_address in enumerate(cell_addresses):
+			try:
+				# values[i] - это список строк для данной ячейки (обычно одна строка)
+				# values[i][0] - первая строка
+				# values[i][0][0] - первое значение в строке
+				if i < len(values) and values[i] and len(values[i]) > 0:
+					row = values[i][0]
+					if row and len(row) > 0:
+						value = str(row[0]).strip()
+						result[cell_address] = value
+						logger.debug(f"✅ Прочитан баланс из {cell_address}: '{value}'")
+					else:
+						result[cell_address] = None
+						logger.debug(f"⚠️ Ячейка {cell_address} пустая")
+				else:
+					result[cell_address] = None
+					logger.debug(f"⚠️ Ячейка {cell_address} не найдена в ответе")
+			except (IndexError, TypeError) as e:
+				logger.warning(f"⚠️ Ошибка обработки ячейки {cell_address}: {e}")
+				result[cell_address] = None
+		
+		logger.info(f"✅ Batch чтение завершено: прочитано {len([v for v in result.values() if v])} значений из {len(cell_addresses)} ячеек")
+		return result
+	except Exception as e:
+		logger.exception(f"❌ Ошибка batch чтения балансов: {e}")
+		return {}
+
+
+async def read_card_balances_batch(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str]
+) -> Dict[str, Optional[str]]:
+	"""
+	Читает балансы нескольких карт за один запрос.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["D4", "E4", "F4"])
+	
+	Returns:
+		Словарь {адрес_ячейки: значение}
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_card_balances_batch_sync,
+		sheet_id,
+		credentials_path,
+		cell_addresses
 	)
 
 
@@ -1795,4 +1899,89 @@ async def read_profit(
 		credentials_path,
 		row,
 		profit_column
+	)
+
+
+def _read_profits_batch_sync(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str]
+) -> Dict[str, Optional[str]]:
+	"""
+	Синхронная функция для чтения профитов из нескольких ячеек за один запрос.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["BC123", "BC124", "BC125"])
+	
+	Returns:
+		Словарь {адрес_ячейки: значение}
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return {}
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = spreadsheet.sheet1
+		
+		logger.info(f"🔍 Batch чтение профитов из {len(cell_addresses)} ячеек")
+		
+		# Используем batch_get для чтения нескольких ячеек за один запрос
+		values = worksheet.batch_get(cell_addresses)
+		
+		result = {}
+		for i, cell_address in enumerate(cell_addresses):
+			try:
+				# values[i] - это список строк для данной ячейки (обычно одна строка)
+				# values[i][0] - первая строка
+				# values[i][0][0] - первое значение в строке
+				if i < len(values) and values[i] and len(values[i]) > 0:
+					row = values[i][0]
+					if row and len(row) > 0:
+						value = str(row[0]).strip()
+						result[cell_address] = value
+						logger.debug(f"✅ Прочитан профит из {cell_address}: '{value}'")
+					else:
+						result[cell_address] = None
+						logger.debug(f"⚠️ Ячейка {cell_address} пустая")
+				else:
+					result[cell_address] = None
+					logger.debug(f"⚠️ Ячейка {cell_address} не найдена в ответе")
+			except (IndexError, TypeError) as e:
+				logger.warning(f"⚠️ Ошибка обработки ячейки {cell_address}: {e}")
+				result[cell_address] = None
+		
+		logger.info(f"✅ Batch чтение профитов завершено: прочитано {len([v for v in result.values() if v])} значений из {len(cell_addresses)} ячеек")
+		return result
+	except Exception as e:
+		logger.exception(f"❌ Ошибка batch чтения профитов: {e}")
+		return {}
+
+
+async def read_profits_batch(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str]
+) -> Dict[str, Optional[str]]:
+	"""
+	Читает профиты из нескольких ячеек за один запрос.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["BC123", "BC124", "BC125"])
+	
+	Returns:
+		Словарь {адрес_ячейки: значение}
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_profits_batch_sync,
+		sheet_id,
+		credentials_path,
+		cell_addresses
 	)
