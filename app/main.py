@@ -41,12 +41,14 @@ async def main() -> None:
 	# Определяем команды для админов
 	from aiogram.types import BotCommand, BotCommandScopeDefault
 	admin_commands = [
-		BotCommand(command="add", description="Добавить данные в таблицу"),
+		BotCommand(command="add", description="Операция"),
+		BotCommand(command="del", description="Удалить последнюю"),
 		BotCommand(command="rate", description="Расход"),
-		BotCommand(command="del", description="Удалить последнюю операцию"),
+		BotCommand(command="move", description="Пердвижение средств"),
 		BotCommand(command="stat_bk", description="Балансы карт"),
 		BotCommand(command="stat_k", description="Баланс крипты"),
 		BotCommand(command="stat_u", description="Статистика пользователей"),
+		BotCommand(command="start", description="Меню"),
 	]
 	
 	# Скрываем команды для всех пользователей по умолчанию
