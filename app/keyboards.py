@@ -145,7 +145,7 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
-def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recent_cards: Optional[List[Tuple[int, str]]] = None) -> InlineKeyboardMarkup:
+def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recent_cards: Optional[List[Tuple[int, str]]] = None, forward_mode: bool = False) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора группы карт.
 	
@@ -153,21 +153,27 @@ def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recen
 		groups: Список словарей с информацией о группах
 		back_to: Callback data для кнопки "Назад"
 		recent_cards: Список кортежей (card_id, card_name) последних используемых карт (максимум 4)
+		forward_mode: Если True, используется callback для пересылки (forward:group:)
 	"""
 	kb = InlineKeyboardBuilder()
 	for group in groups:
 		group_name = group.get("name", "")
 		group_id = group.get("id")
-		# Определяем, какой callback использовать в зависимости от back_to
+		# Определяем, какой callback использовать в зависимости от back_to и forward_mode
 		if back_to.startswith("add_data:back:"):
 			# Используется в командах /add и /rate
 			kb.button(text=f"📁 {group_name}", callback_data=f"{back_to}:group:{group_id}")
+		elif forward_mode:
+			# Используется при пересылке
+			kb.button(text=f"📁 {group_name}", callback_data=f"forward:group:{group_id}")
 		else:
 			# Стандартное использование
 			kb.button(text=f"📁 {group_name}", callback_data=f"cards:group:{group_id}")
 	# Добавляем кнопку для карт без группы
 	if back_to.startswith("add_data:back:"):
 		kb.button(text="📋 Без группы", callback_data=f"{back_to}:group:0")
+	elif forward_mode:
+		kb.button(text="📋 Без группы", callback_data="forward:group:0")
 	else:
 		kb.button(text="📋 Без группы", callback_data="cards:group:0")
 	
@@ -528,35 +534,96 @@ def cash_edit_kb(current_currency: str, amount: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = True) -> InlineKeyboardMarkup:
+def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = True, crypto_columns: Optional[List[Dict[str, Any]]] = None) -> InlineKeyboardMarkup:
 	"""
-	Создает клавиатуру для выбора криптовалюты.
-	Первый ряд: три кнопки в ряд (BTC, LTC, XMR)
-	Второй ряд: кнопка USDT
-	Третий ряд: кнопка "Подтвердить" (если show_confirm=True) и "Назад"
+	Создает клавиатуру для выбора криптовалюты на основе данных из crypto_columns.
+	Исключает монеты с названием "🐿" и "💵".
+	Все XMR объединяются в одну кнопку.
+	
+	Args:
+		back_to: Callback data для кнопки "Назад"
+		show_confirm: Показывать ли кнопку "Подтвердить"
+		crypto_columns: Список криптовалют из БД (если None, используется хардкод для обратной совместимости)
 	"""
 	kb = InlineKeyboardBuilder()
 	
-	# Три кнопки валют в ряд
-	kb.button(text="BTC", callback_data="crypto:select:BTC")
-	kb.button(text="LTC", callback_data="crypto:select:LTC")
-	kb.button(text="XMR", callback_data="crypto:select:XMR")
-	
-	# Кнопка USDT под ними
-	kb.button(text="USDT", callback_data="crypto:select:USDT")
-	
-	# Кнопка "Подтвердить" (если нужно)
-	if show_confirm:
-		kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
-	
-	# Кнопка "Назад"
-	kb.button(text="⬅️ Назад", callback_data=back_to)
-	
-	# Первый ряд - три кнопки валют, второй ряд - USDT, третий ряд - подтвердить (если есть) и назад
-	if show_confirm:
-		kb.adjust(3, 1, 1, 1)
+	# Если передан список криптовалют из БД, используем его
+	if crypto_columns:
+		# Фильтруем: исключаем монеты с названием "🐿" и "💵"
+		filtered_crypto = [
+			crypto for crypto in crypto_columns
+			if crypto.get("crypto_type", "") not in ["🐿", "💵"]
+		]
+		
+		# Разделяем на XMR и остальные
+		xmr_types = []
+		other_crypto = []
+		
+		for crypto in filtered_crypto:
+			crypto_type = crypto.get("crypto_type", "")
+			if crypto_type.startswith("XMR"):
+				xmr_types.append(crypto_type)
+			else:
+				other_crypto.append(crypto_type)
+		
+		# Добавляем кнопки для остальных криптовалют (не XMR)
+		for crypto_type in other_crypto:
+			kb.button(text=crypto_type, callback_data=f"crypto:select:{crypto_type}")
+		
+		# Добавляем одну кнопку XMR, если есть хотя бы один XMR
+		if xmr_types:
+			kb.button(text="XMR", callback_data="crypto:select:XMR")
+		
+		# Определяем количество кнопок для adjust
+		other_count = len(other_crypto)
+		has_xmr = len(xmr_types) > 0
+		
+		# Кнопка "Подтвердить" (если нужно)
+		if show_confirm:
+			kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
+		
+		# Кнопка "Назад"
+		kb.button(text="⬅️ Назад", callback_data=back_to)
+		
+		# Настраиваем расположение
+		# Сначала размещаем остальные криптовалюты по 3 в ряд
+		adjust_list = []
+		if other_count > 0:
+			full_rows = other_count // 3
+			remainder = other_count % 3
+			if full_rows > 0:
+				adjust_list.extend([3] * full_rows)
+			if remainder > 0:
+				adjust_list.append(remainder)
+		
+		# XMR в отдельный ряд (если есть)
+		if has_xmr:
+			adjust_list.append(1)
+		
+		# Добавляем кнопки подтверждения и назад
+		if show_confirm:
+			adjust_list.append(1)  # Подтвердить
+		adjust_list.append(1)  # Назад
+		
+		if adjust_list:
+			kb.adjust(*adjust_list)
 	else:
-		kb.adjust(3, 1, 1)
+		# Обратная совместимость: используем хардкод, если список не передан
+		kb.button(text="BTC", callback_data="crypto:select:BTC")
+		kb.button(text="LTC", callback_data="crypto:select:LTC")
+		kb.button(text="XMR", callback_data="crypto:select:XMR")
+		kb.button(text="USDT", callback_data="crypto:select:USDT")
+		
+		if show_confirm:
+			kb.button(text="✅ Подтвердить", callback_data="multi:confirm")
+		
+		kb.button(text="⬅️ Назад", callback_data=back_to)
+		
+		if show_confirm:
+			kb.adjust(3, 1, 1, 1)
+		else:
+			kb.adjust(3, 1, 1)
+	
 	return kb.as_markup()
 
 

@@ -153,6 +153,7 @@ class CardColumnBindStates(StatesGroup):
 
 
 class ForwardBindStates(StatesGroup):
+	waiting_select_group = State()  # Состояние для выбора группы карт при пересылке
 	waiting_select_card = State()
 	waiting_select_existing_card = State()
 	editing_crypto_amount = State()  # Состояние для редактирования количества криптовалюты
@@ -815,10 +816,13 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 	if data_type == "crypto":
 		# Показываем выбор криптовалюты
 		from app.keyboards import crypto_select_kb
+		# Получаем список криптовалют из БД
+		db = get_db()
+		crypto_columns = await db.list_crypto_columns()
 		await state.set_state(AddDataStates.selecting_type)
 		await cb.message.edit_text(
 			"🪙 Выберите криптовалюту:",
-			reply_markup=crypto_select_kb(back_to=f"add_data:back:{mode}", show_confirm=False)
+			reply_markup=crypto_select_kb(back_to=f"add_data:back:{mode}", show_confirm=False, crypto_columns=crypto_columns)
 		)
 		await cb.answer()
 	elif data_type == "cash":
@@ -961,27 +965,11 @@ async def add_data_enter_crypto(message: Message, state: FSMContext):
 			saved_blocks = data.get("saved_blocks", [])
 			if 0 <= editing_block_idx < len(saved_blocks):
 				saved_blocks[editing_block_idx]["crypto_data"] = crypto_data.copy()
-				# Также обновляем в списках для записи по индексу блока
-				crypto_list = data.get("crypto_list", [])
-				xmr_list = data.get("xmr_list", [])
-				
-				# Обновляем элемент в списках по индексу блока (порядок должен совпадать)
-				if currency == "XMR" and xmr_number:
-					# Обновляем в xmr_list
-					if editing_block_idx < len(xmr_list):
-						xmr_list[editing_block_idx]["usd_amount"] = usd_amount
-						xmr_list[editing_block_idx]["xmr_number"] = xmr_number
-				else:
-					# Обновляем в crypto_list
-					if editing_block_idx < len(crypto_list):
-						crypto_list[editing_block_idx]["currency"] = currency
-						crypto_list[editing_block_idx]["usd_amount"] = usd_amount
 				
 				# Очищаем весь текущий блок после обновления сохраненного блока
+				# Списки будут пересобраны из saved_blocks в add_data_confirm
 				await state.update_data(
 					saved_blocks=saved_blocks,
-					crypto_list=crypto_list,
-					xmr_list=xmr_list,
 					crypto_data=None,  # Очищаем текущий блок
 					card_data=None,  # Очищаем текущий блок
 					card_cash_data=None,  # Очищаем текущий блок
@@ -1048,17 +1036,16 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 		if editing_block_idx is not None:
 			saved_blocks = data.get("saved_blocks", [])
 			if 0 <= editing_block_idx < len(saved_blocks):
+				# Обновляем card_cash_data в сохраненном блоке
 				saved_blocks[editing_block_idx]["card_cash_data"] = card_cash_data.copy()
-				# Также обновляем в списках для записи по индексу блока
-				card_cash_pairs = data.get("card_cash_pairs", [])
-				# Обновляем элемент в списке по индексу блока (порядок должен совпадать)
-				if editing_block_idx < len(card_cash_pairs):
-					card_cash_pairs[editing_block_idx]["cash"] = card_cash_data.copy()
+				# Также обновляем card_data, если он был установлен на предыдущем шаге
+				card_data = data.get("card_data")
+				if card_data:
+					saved_blocks[editing_block_idx]["card_data"] = card_data.copy()
 				
 				# Очищаем весь текущий блок после обновления сохраненного блока
 				await state.update_data(
 					saved_blocks=saved_blocks,
-					card_cash_pairs=card_cash_pairs,
 					crypto_data=None,  # Очищаем текущий блок
 					card_data=None,  # Очищаем текущий блок
 					card_cash_data=None,  # Очищаем текущий блок
@@ -1066,7 +1053,7 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 					xmr_number=None,  # Очищаем текущий блок
 					crypto_currency=None,  # Очищаем текущий блок
 					cash_name=None,  # Очищаем текущий блок
-					editing_block_idx=None  # Сбрасываем индекс после обновления
+					editing_block_idx=None  # Сбрасываем индекс после завершения редактирования
 				)
 			else:
 				await state.update_data(card_cash_data=card_cash_data, editing_block_idx=None)
@@ -1109,18 +1096,11 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 			saved_blocks = data.get("saved_blocks", [])
 			if 0 <= editing_block_idx < len(saved_blocks):
 				saved_blocks[editing_block_idx]["cash_data"] = cash_data.copy()
-				# Также обновляем в списках для записи по индексу блока
-				cash_list = data.get("cash_list", [])
-				# Обновляем элемент в списке по индексу блока (порядок должен совпадать)
-				if editing_block_idx < len(cash_list):
-					cash_list[editing_block_idx]["value"] = amount
-					cash_list[editing_block_idx]["currency"] = cash_data.get("currency", "RUB")
-					cash_list[editing_block_idx]["cash_name"] = cash_name
 				
 				# Очищаем весь текущий блок после обновления сохраненного блока
+				# Списки будут пересобраны из saved_blocks в add_data_confirm
 				await state.update_data(
 					saved_blocks=saved_blocks,
-					cash_list=cash_list,
 					crypto_data=None,  # Очищаем текущий блок
 					card_data=None,  # Очищаем текущий блок
 					card_cash_data=None,  # Очищаем текущий блок
@@ -1189,44 +1169,22 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	}
 	
 	# Если редактируется сохраненный блок, обновляем его
+	# НО НЕ сбрасываем editing_block_idx - он нужен для следующего шага (ввода суммы)
 	if editing_block_idx is not None:
 		saved_blocks = data.get("saved_blocks", [])
 		if 0 <= editing_block_idx < len(saved_blocks):
 			saved_blocks[editing_block_idx]["card_data"] = card_data.copy()
-			# Также обновляем в списках для записи
-			card_cash_pairs = data.get("card_cash_pairs", [])
-			card_cash_data = saved_blocks[editing_block_idx].get("card_cash_data")
-			
-			# Находим и обновляем соответствующую пару или создаем новую
-			found = False
-			for pair in card_cash_pairs:
-				old_card = pair.get("card", {})
-				if old_card.get("card_id") == card_id or old_card.get("card_name") == card.get("name", ""):
-					pair["card"] = card_data.copy()
-					if card_cash_data:
-						pair["cash"] = card_cash_data.copy()
-					found = True
-					break
-			
-			if not found:
-				# Создаем новую пару, если не найдена
-				card_cash_pairs.append({
-					"card": card_data.copy(),
-					"cash": card_cash_data.copy() if card_cash_data else None
-				})
-			
-			# Очищаем весь текущий блок после обновления сохраненного блока
+			# Сохраняем card_data во временное хранилище для следующего шага
+			# НЕ очищаем editing_block_idx - он нужен для ввода суммы
 			await state.update_data(
 				saved_blocks=saved_blocks,
-				card_cash_pairs=card_cash_pairs,
-				crypto_data=None,  # Очищаем текущий блок
-				card_data=None,  # Очищаем текущий блок
-				card_cash_data=None,  # Очищаем текущий блок
-				cash_data=None,  # Очищаем текущий блок
-				xmr_number=None,  # Очищаем текущий блок
-				crypto_currency=None,  # Очищаем текущий блок
-				cash_name=None,  # Очищаем текущий блок
-				editing_block_idx=None  # Сбрасываем индекс после обновления
+				card_data=card_data,  # Сохраняем для следующего шага
+				crypto_data=None,  # Очищаем другие данные текущего блока
+				cash_data=None,
+				xmr_number=None,
+				crypto_currency=None,
+				cash_name=None
+				# НЕ сбрасываем editing_block_idx и card_cash_data
 			)
 		else:
 			await state.update_data(card_data=card_data, editing_block_idx=None)
@@ -1260,6 +1218,12 @@ async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
 		await cb.answer("⚠️ Нет данных для сохранения. Добавьте данные перед нажатием '+'.", show_alert=True)
 		return
 	
+	# Проверяем, не редактируется ли сохраненный блок
+	editing_block_idx = data.get("editing_block_idx")
+	if editing_block_idx is not None:
+		await cb.answer("⚠️ Завершите редактирование текущего блока перед добавлением нового.", show_alert=True)
+		return
+	
 	# Получаем список сохраненных блоков
 	saved_blocks = data.get("saved_blocks", [])
 	
@@ -1271,60 +1235,17 @@ async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
 		"card_cash_data": card_cash_data.copy() if card_cash_data else None
 	})
 	
-	# Получаем списки сохраненных данных для записи в Google Sheets
-	crypto_list = data.get("crypto_list", [])
-	xmr_list = data.get("xmr_list", [])
-	cash_list = data.get("cash_list", [])
-	card_cash_pairs = data.get("card_cash_pairs", [])
-	
-	# Добавляем текущие данные в списки для записи
-	if crypto_data:
-		currency = crypto_data.get("currency")
-		usd_amount = crypto_data.get("usd_amount", 0)
-		xmr_number = crypto_data.get("xmr_number")
-		
-		if currency == "XMR" and xmr_number:
-			xmr_list.append({
-				"xmr_number": xmr_number,
-				"usd_amount": usd_amount
-			})
-		else:
-			crypto_list.append({
-				"currency": currency,
-				"usd_amount": usd_amount
-			})
-	
-	if card_data:
-		if card_cash_data:
-			card_cash_pairs.append({
-				"card": card_data.copy(),
-				"cash": card_cash_data.copy()
-			})
-		else:
-			card_cash_pairs.append({
-				"card": card_data.copy(),
-				"cash": None
-			})
-	
-	if cash_data:
-		cash_list.append({
-			"currency": cash_data.get("currency", "RUB"),
-			"value": cash_data.get("value", 0),
-			"cash_name": cash_data.get("cash_name")
-		})
-	
 	# Очищаем текущие данные для нового блока
+	# Списки будут пересобраны из saved_blocks в add_data_confirm
 	await state.update_data(
 		crypto_data=None,
 		cash_data=None,
 		card_data=None,
 		card_cash_data=None,
 		xmr_number=None,
-		saved_blocks=saved_blocks,
-		crypto_list=crypto_list,
-		xmr_list=xmr_list,
-		cash_list=cash_list,
-		card_cash_pairs=card_cash_pairs
+		crypto_currency=None,
+		cash_name=None,
+		saved_blocks=saved_blocks
 	)
 	
 	# Обновляем сообщение
@@ -1343,6 +1264,20 @@ async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
 @admin_router.callback_query(F.data.startswith("add_data:confirm:"))
 async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	"""Обработчик подтверждения и записи данных в Google Sheets"""
+	# Отвечаем на callback сразу, чтобы избежать таймаута
+	try:
+		await cb.answer("⏳ Запись данных...")
+	except Exception:
+		# Если callback уже устарел, продолжаем выполнение
+		pass
+	
+	# Сразу обновляем сообщение, показывая процесс записи
+	try:
+		await cb.message.edit_text("⏳ Запись данных, подождите...", reply_markup=None)
+	except Exception:
+		# Если не удалось обновить сообщение, продолжаем выполнение
+		pass
+	
 	mode = cb.data.split(":")[-1]
 	data = await state.get_data()
 	
@@ -1352,13 +1287,58 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	card_data = data.get("card_data")
 	card_cash_data = data.get("card_cash_data")  # Наличные для карты
 	
-	# Получаем списки сохраненных данных
-	crypto_list = data.get("crypto_list", [])
-	xmr_list = data.get("xmr_list", [])
-	cash_list = data.get("cash_list", [])
-	card_cash_pairs = data.get("card_cash_pairs", [])
+	# Получаем сохраненные блоки
+	saved_blocks = data.get("saved_blocks", [])
 	
-	# Добавляем текущие данные к спискам (если есть)
+	# Пересобираем списки из saved_blocks, чтобы гарантировать правильный порядок и актуальность данных
+	# Это важно, особенно после редактирования блоков
+	crypto_list = []
+	xmr_list = []
+	cash_list = []
+	card_cash_pairs = []
+	
+	# Сначала добавляем данные из всех сохраненных блоков
+	for block in saved_blocks:
+		block_crypto = block.get("crypto_data")
+		if block_crypto:
+			currency = block_crypto.get("currency")
+			usd_amount = block_crypto.get("usd_amount", 0)
+			xmr_number = block_crypto.get("xmr_number")
+			
+			if currency == "XMR" and xmr_number:
+				xmr_list.append({
+					"xmr_number": xmr_number,
+					"usd_amount": usd_amount
+				})
+			else:
+				crypto_list.append({
+					"currency": currency,
+					"usd_amount": usd_amount
+				})
+		
+		block_card = block.get("card_data")
+		block_card_cash = block.get("card_cash_data")
+		if block_card:
+			if block_card_cash:
+				card_cash_pairs.append({
+					"card": block_card.copy(),
+					"cash": block_card_cash.copy()
+				})
+			else:
+				card_cash_pairs.append({
+					"card": block_card.copy(),
+					"cash": None
+				})
+		
+		block_cash = block.get("cash_data")
+		if block_cash:
+			cash_list.append({
+				"currency": block_cash.get("currency", "RUB"),
+				"value": block_cash.get("value", 0),
+				"cash_name": block_cash.get("cash_name")
+			})
+	
+	# Затем добавляем текущие данные (если есть) - это новый блок, который еще не был сохранен
 	if crypto_data:
 		currency = crypto_data.get("currency")
 		usd_amount = crypto_data.get("usd_amount", 0)
@@ -1396,7 +1376,10 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	
 	# Проверяем, что есть хотя бы какие-то данные
 	if not crypto_list and not xmr_list and not cash_list and not card_cash_pairs:
-		await cb.answer("❌ Нет данных для записи. Добавьте хотя бы один тип данных.", show_alert=True)
+		try:
+			await cb.answer("❌ Нет данных для записи. Добавьте хотя бы один тип данных.", show_alert=True)
+		except Exception:
+			pass
 		return
 	
 	from app.config import get_settings
@@ -1404,7 +1387,10 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	
 	settings = get_settings()
 	if not settings.google_sheet_id or not settings.google_credentials_path:
-		await cb.answer("❌ Google Sheets не настроен", show_alert=True)
+		try:
+			await cb.answer("❌ Google Sheets не настроен", show_alert=True)
+		except Exception:
+			pass
 		return
 	
 	# Данные уже собраны в списки выше
@@ -1515,14 +1501,15 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				profits = profits_dict
 			
 			# Добавляем информацию о балансах и профите в отчет
-			if card_balances or profits:
+			# Профит отображаем только в режиме /add
+			if card_balances or (profits and mode == "add"):
 				report_lines.append("\n💰 Дополнительная информация:")
 				
 				if card_balances:
 					for card_name, data in card_balances.items():
 						report_lines.append(f"  💳 {card_name}: Баланс ({data['column']}{balance_row}) = {data['balance']}")
 				
-				if profits:
+				if profits and mode == "add":
 					for cell_address, profit_value in profits.items():
 						report_lines.append(f"  📈 Профит сделки ({cell_address}) = {profit_value}")
 			
@@ -1535,14 +1522,25 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			report_text = "\n".join(report_lines)
 			
-			await cb.answer()  # Просто закрываем callback без уведомления
+			# Callback уже был обработан в начале функции
 			await state.clear()
 			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
 		else:
-			await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
+			try:
+				await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
+			except Exception:
+				# Если callback устарел, просто обновляем сообщение
+				await cb.message.edit_text("❌ Ошибка записи в Google Sheets", reply_markup=admin_menu_kb())
 	except Exception as e:
 		logger.exception(f"Ошибка записи в Google Sheets: {e}")
-		await cb.answer("❌ Произошла ошибка при записи", show_alert=True)
+		try:
+			await cb.answer("❌ Произошла ошибка при записи", show_alert=True)
+		except Exception:
+			# Если callback устарел, просто обновляем сообщение
+			try:
+				await cb.message.edit_text("❌ Произошла ошибка при записи", reply_markup=admin_menu_kb())
+			except Exception:
+				pass
 
 
 @admin_router.callback_query(F.data == "admin:cards")
@@ -3432,13 +3430,19 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						)
 						return
 				else:
-					# Карт нет - показываем выбор карты для привязки
-					logger.info(f"⚠️ У пользователя '{orig_full_name}' нет привязанных карт, предлагаем выбрать")
-					rows = await db.list_cards()
-					cards = [(r[0], r[1]) for r in rows]
-					await state.set_state(ForwardBindStates.waiting_select_card)
-					await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=user_id)
-					await message.answer(f"✅ Пользователь '{orig_full_name}' найден в БД, но не привязан к карте.\n\nВыберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+					# Карт нет - показываем выбор группы карт для привязки
+					logger.info(f"⚠️ У пользователя '{orig_full_name}' нет привязанных карт, предлагаем выбрать группу")
+					groups = await db.list_card_groups()
+					if groups:
+						await state.set_state(ForwardBindStates.waiting_select_group)
+						await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=user_id)
+						await message.answer(f"✅ Пользователь '{orig_full_name}' найден в БД, но не привязан к карте.\n\nВыберите группу карт:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+					else:
+						rows = await db.list_cards()
+						cards = [(r[0], r[1]) for r in rows]
+						await state.set_state(ForwardBindStates.waiting_select_card)
+						await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=user_id)
+						await message.answer(f"✅ Пользователь '{orig_full_name}' найден в БД, но не привязан к карте.\n\nГрупп пока нет. Выберите карту:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
 					return
 		else:
 			logger.warning(f"❌ Пользователь с full_name='{orig_full_name}' не найден в БД")
@@ -3514,12 +3518,19 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
 			)
 			return
-		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать карту")
-		rows = await db.list_cards()
-		cards = [(r[0], r[1]) for r in rows]
-		await state.set_state(ForwardBindStates.waiting_select_card)
-		await state.update_data(original_tg_id=orig_tg_id)
-		await message.answer("Пользователь не привязан. Выберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать группу карт")
+		groups = await db.list_card_groups()
+		if groups:
+			await state.set_state(ForwardBindStates.waiting_select_group)
+			await state.update_data(original_tg_id=orig_tg_id)
+			await message.answer("Пользователь не привязан. Выберите группу карт:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+		else:
+			# Если групп нет, показываем все карты
+			rows = await db.list_cards()
+			cards = [(r[0], r[1]) for r in rows]
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			await state.update_data(original_tg_id=orig_tg_id)
+			await message.answer("Пользователь не привязан. Групп пока нет. Выберите карту:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
 		return
 	# Если не удалось найти пользователя, но есть username или full_name - возможно пользователь еще не в БД или все скрыто
 	if orig_tg_id is None:
@@ -3527,12 +3538,19 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		if orig_username:
 			# Пользователь не найден в БД, но есть username - возможно первый раз
 			logger.warning(f"Не удалось определить ID пользователя, но есть username={orig_username}. Возможные причины: пользователь скрыл данные в настройках приватности Telegram или еще не взаимодействовал с ботом.")
-			rows = await db.list_cards()
-			cards = [(r[0], r[1]) for r in rows]
-			await state.set_state(ForwardBindStates.waiting_select_card)
-			await state.update_data(reply_only=True)
-			warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nВыберите карту для ответа администратору:"
-			await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+			groups = await db.list_card_groups()
+			if groups:
+				await state.set_state(ForwardBindStates.waiting_select_group)
+				await state.update_data(reply_only=True)
+				warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nВыберите группу карт:"
+				await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+			else:
+				rows = await db.list_cards()
+				cards = [(r[0], r[1]) for r in rows]
+				await state.set_state(ForwardBindStates.waiting_select_card)
+				await state.update_data(reply_only=True)
+				warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nГрупп пока нет. Выберите карту:"
+				await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 			return
 		# Проверяем, есть ли full_name (MessageOriginHiddenUser)
 		elif orig_full_name:
@@ -3562,13 +3580,20 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				return
 			else:
 				# Не найдено похожих - сохраняем имя для последующей привязки
-				rows = await db.list_cards()
-				cards = [(r[0], r[1]) for r in rows]
-				await state.set_state(ForwardBindStates.waiting_select_card)
-				# Сохраняем имя скрытого пользователя в state, чтобы при выборе карты создать запись
-				await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
-				warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nВыберите карту для привязки:"
-				await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+				groups = await db.list_card_groups()
+				if groups:
+					await state.set_state(ForwardBindStates.waiting_select_group)
+					# Сохраняем имя скрытого пользователя в state, чтобы при выборе карты создать запись
+					await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
+					warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nВыберите группу карт:"
+					await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+				else:
+					rows = await db.list_cards()
+					cards = [(r[0], r[1]) for r in rows]
+					await state.set_state(ForwardBindStates.waiting_select_card)
+					await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
+					warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nГрупп пока нет. Выберите карту:"
+					await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 		return
 	# fallback by text when no origin available
 	if text:
@@ -3581,13 +3606,20 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			else:
 				await message.answer("Сообщение карты отсутствует")
 			return
-	# as last resort: show cards to reply-only
-	rows = await db.list_cards()
-	cards = [(r[0], r[1]) for r in rows]
-	await state.set_state(ForwardBindStates.waiting_select_card)
-	await state.update_data(reply_only=True)
-	warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите карту для ответа администратору:"
-	await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	# as last resort: show groups to reply-only
+	groups = await db.list_card_groups()
+	if groups:
+		await state.set_state(ForwardBindStates.waiting_select_group)
+		await state.update_data(reply_only=True)
+		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите группу карт:"
+		await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+	else:
+		rows = await db.list_cards()
+		cards = [(r[0], r[1]) for r in rows]
+		await state.set_state(ForwardBindStates.waiting_select_card)
+		await state.update_data(reply_only=True)
+		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nГрупп пока нет. Выберите карту:"
+		await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 
 
 @admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("hidden:select:"))
@@ -3647,11 +3679,18 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nУ пользователя привязано несколько карт. Выберите нужную:"
 			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back"))
 	else:
-		# Не привязан - выбираем карту для привязки
-		rows = await db.list_cards()
-		cards = [(r[0], r[1]) for r in rows]
-		text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nПользователь не привязан. Выберите карту для привязки:"
-		await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+		# Не привязан - выбираем группу карт для привязки
+		groups = await db.list_card_groups()
+		if groups:
+			await state.set_state(ForwardBindStates.waiting_select_group)
+			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nПользователь не привязан. Выберите группу карт:"
+			await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+		else:
+			rows = await db.list_cards()
+			cards = [(r[0], r[1]) for r in rows]
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nПользователь не привязан. Групп пока нет. Выберите карту:"
+			await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
 	
 	await cb.answer()
 
@@ -3664,14 +3703,162 @@ async def hidden_user_no_match(cb: CallbackQuery, state: FSMContext):
 	
 	logger.info(f"❌ Пользователь '{hidden_name}' не найден в списке похожих")
 	
-	# Показываем список карт для ответа администратору
+	# Показываем список групп карт для ответа администратору
 	db = get_db()
-	rows = await db.list_cards()
-	cards = [(r[0], r[1]) for r in rows]
-	await state.update_data(reply_only=True)
+	groups = await db.list_card_groups()
+	if groups:
+		await state.set_state(ForwardBindStates.waiting_select_group)
+		await state.update_data(reply_only=True)
+		text = f"⚠️ Пользователь '{hidden_name}' не найден в базе данных.\n\nДля работы с этим пользователем попросите его написать боту хотя бы один раз.\n\nВыберите группу карт:"
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+	else:
+		rows = await db.list_cards()
+		cards = [(r[0], r[1]) for r in rows]
+		await state.set_state(ForwardBindStates.waiting_select_card)
+		await state.update_data(reply_only=True)
+		text = f"⚠️ Пользователь '{hidden_name}' не найден в базе данных.\n\nДля работы с этим пользователем попросите его написать боту хотя бы один раз.\n\nГрупп пока нет. Выберите карту:"
+		await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	await cb.answer()
+
+
+@admin_router.callback_query(ForwardBindStates.waiting_select_group, F.data.startswith("forward:group:"))
+async def forward_select_group(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик выбора группы карт при пересылке"""
+	db = get_db()
+	group_id_str = cb.data.split(":")[-1]
+	group_id = int(group_id_str) if group_id_str != "0" else None
 	
-	text = f"⚠️ Пользователь '{hidden_name}' не найден в базе данных.\n\nДля работы с этим пользователем попросите его написать боту хотя бы один раз.\n\nВыберите карту для ответа администратору:"
-	await cb.message.edit_text(text, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	if group_id:
+		# Получаем карты из группы
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		text = f"Карты группы '{group_name}':" if cards else f"В группе '{group_name}' нет карт."
+		
+		# Преобразуем формат карт из (id, name, details) в (id, name)
+		cards_list = [(c[0], c[1]) for c in cards]
+		
+		if cards_list:
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			await state.update_data(selected_group_id=group_id)
+			await cb.message.edit_text(text, reply_markup=cards_select_kb(cards_list, back_to="admin:back"))
+		else:
+			await cb.answer(f"В группе '{group_name}' нет карт", show_alert=True)
+	else:
+		# Получаем карты без группы
+		cards = await db.get_cards_without_group()
+		text = "Карты вне групп:" if cards else "Нет карт вне групп."
+		
+		# Преобразуем формат карт из (id, name, details) в (id, name)
+		cards_list = [(c[0], c[1]) for c in cards]
+		
+		if cards_list:
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			await state.update_data(selected_group_id=None)
+			await cb.message.edit_text(text, reply_markup=cards_select_kb(cards_list, back_to="admin:back"))
+		else:
+			await cb.answer("Нет карт вне групп", show_alert=True)
+	
+	await cb.answer()
+
+
+@admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("select:card:"))
+async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора карты при пересылке"""
+	db = get_db()
+	card_id = int(cb.data.split(":")[-1])
+	
+	data = await state.get_data()
+	original_tg_id = data.get("original_tg_id")
+	hidden_user_name = data.get("hidden_user_name")
+	reply_only = data.get("reply_only", False)
+	existing_user_id = data.get("existing_user_id")
+	
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	# Если это только ответ администратору (reply_only), отправляем реквизиты и завершаем
+	if reply_only:
+		requisites = await db.list_card_requisites(card_id)
+		user_msg = card.get("user_message")
+		has_user_message = bool(user_msg)
+		
+		await state.clear()
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		await cb.answer()
+		return
+	
+	# Обрабатываем привязку карты к пользователю
+	if original_tg_id:
+		# Обычный пользователь с tg_id
+		user_id = await db.get_user_id_by_tg(original_tg_id)
+		if not user_id:
+			await cb.answer("Пользователь не найден", show_alert=True)
+			return
+		
+		# Привязываем карту к пользователю
+		await db.bind_user_to_card(user_id, card_id)
+		await db.touch_user_by_tg(original_tg_id)
+		logger.info(f"✅ Карта {card_id} привязана к пользователю tg_id={original_tg_id}")
+		
+		# Получаем реквизиты карты
+		requisites = await db.list_card_requisites(card_id)
+		user_msg = card.get("user_message")
+		has_user_message = bool(user_msg)
+		
+		# Логируем доставку
+		await db.log_card_delivery_by_tg(
+			original_tg_id,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
+		
+		# Отправляем все реквизиты админу
+		await state.clear()
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		
+	elif hidden_user_name:
+		# Скрытый пользователь (MessageOriginHiddenUser)
+		if existing_user_id:
+			# Пользователь уже существует в БД
+			user_id = existing_user_id
+			await db.bind_user_to_card(user_id, card_id)
+			await db.touch_user(user_id)
+			logger.info(f"✅ Карта {card_id} привязана к скрытому пользователю '{hidden_user_name}' (user_id={user_id})")
+		else:
+			# Ищем существующего скрытого пользователя или создаем нового
+			# Используем find_similar_users_by_name для поиска
+			similar_users = await db.find_similar_users_by_name(hidden_user_name, limit=1)
+			if similar_users and similar_users[0].get("tg_id") is None:
+				# Найден скрытый пользователь
+				user_id = similar_users[0]["id"]
+				await db.bind_user_to_card(user_id, card_id)
+				await db.touch_user(user_id)
+				logger.info(f"✅ Карта {card_id} привязана к существующему скрытому пользователю '{hidden_user_name}' (user_id={user_id})")
+			else:
+				# Создаем нового скрытого пользователя напрямую через SQL
+				import time
+				cur = await db._db.execute(
+					"INSERT INTO users(tg_id, username, full_name, last_interaction_at) VALUES(?, ?, ?, ?)",
+					(None, None, hidden_user_name, int(time.time())),
+				)
+				await db._db.commit()
+				user_id = cur.lastrowid
+				await db.bind_user_to_card(user_id, card_id)
+				logger.info(f"✅ Создан новый скрытый пользователь '{hidden_user_name}' (user_id={user_id}) и привязана карта {card_id}")
+		
+		# Логируем доставку для скрытого пользователя
+		await db.log_card_delivery(
+			user_id,
+			card_id,
+			admin_id=cb.from_user.id if cb.from_user else None,
+		)
+		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id}). Сообщение не отправлено (нет tg_id)")
+		
+		await state.clear()
+	
 	await cb.answer()
 
 

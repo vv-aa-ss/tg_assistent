@@ -567,7 +567,7 @@ def _write_to_google_sheet_sync(
 			# Получаем USD напрямую из данных (пользователь ввел USD)
 			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
-			if usd_amount > 0:
+			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
 				
 				if crypto_currency == "BTC" and btc_column:
@@ -585,7 +585,7 @@ def _write_to_google_sheet_sync(
 				elif crypto_currency in ["BTC", "LTC", "USDT"]:
 					logger.warning(f"⚠️ Не найден адрес столбца для криптовалюты {crypto_currency}")
 			else:
-				logger.warning(f"⚠️ USD сумма не указана для криптовалюты {crypto_currency}")
+				logger.warning(f"⚠️ USD сумма равна 0 для криптовалюты {crypto_currency}")
 		
 		# Обрабатываем наличные (RUB, BYN и другие валюты)
 		if cash_data and card_data:
@@ -828,13 +828,13 @@ def _write_xmr_to_google_sheet_sync(
 			# Получаем USD напрямую из данных (пользователь ввел USD)
 			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
-			if usd_amount > 0:
+			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
 				# Записываем USD в соответствующий столбец (метод update требует список списков)
 				worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
 				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
 			else:
-				logger.warning(f"⚠️ USD сумма не указана для XMR-{xmr_number}")
+				logger.warning(f"⚠️ USD сумма равна 0 для XMR-{xmr_number}")
 		
 		# Обрабатываем наличные (RUB, BYN и другие валюты)
 		if cash_data and card_data:
@@ -1431,10 +1431,14 @@ def _write_to_google_sheet_rate_mode_sync(
 			currency = crypto.get("currency")
 			usd_amount = crypto.get("usd_amount", 0.0)
 			
-			if usd_amount > 0:
+			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))
-				# В режиме rate записываем со знаком минус
-				usd_amount_negative = -usd_amount_rounded
+				# В режиме rate записываем со знаком минус (если значение положительное)
+				# Если значение уже отрицательное, оставляем как есть
+				if usd_amount_rounded > 0:
+					usd_amount_negative = -usd_amount_rounded
+				else:
+					usd_amount_negative = usd_amount_rounded  # Уже отрицательное
 				
 				# Определяем столбец и находим первую пустую ячейку
 				column = None
@@ -1461,10 +1465,14 @@ def _write_to_google_sheet_rate_mode_sync(
 			xmr_number = xmr.get("xmr_number")
 			usd_amount = xmr.get("usd_amount", 0.0)
 			
-			if usd_amount > 0:
+			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))
-				# В режиме rate записываем со знаком минус
-				usd_amount_negative = -usd_amount_rounded
+				# В режиме rate записываем со знаком минус (если значение положительное)
+				# Если значение уже отрицательное, оставляем как есть
+				if usd_amount_rounded > 0:
+					usd_amount_negative = -usd_amount_rounded
+				else:
+					usd_amount_negative = usd_amount_rounded  # Уже отрицательное
 				usd_column = xmr_columns.get(xmr_number)
 				
 				if usd_column:
