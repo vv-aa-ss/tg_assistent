@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter, Command
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from typing import Any, Awaitable, Callable, Dict, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
 import re
@@ -551,7 +551,8 @@ async def delete_second_confirmation_yes(cb: CallbackQuery, state: FSMContext):
 	try:
 		result = await delete_last_row_from_google_sheet(
 			settings.google_sheet_id,
-			settings.google_credentials_path
+			settings.google_credentials_path,
+			settings.google_sheet_name
 		)
 		
 		if result.get("success"):
@@ -1406,7 +1407,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				crypto_list,
 				xmr_list,
 				cash_list,
-				card_cash_pairs
+				card_cash_pairs,
+				settings.google_sheet_name
 			)
 		else:
 			result = await write_all_to_google_sheet_one_row(
@@ -1415,7 +1417,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				crypto_list,
 				xmr_list,
 				cash_list,
-				card_cash_pairs
+				card_cash_pairs,
+				settings.google_sheet_name
 			)
 		
 		if result.get("success"):
@@ -1470,7 +1473,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				balances = await read_card_balances_batch(
 					settings.google_sheet_id,
 					settings.google_credentials_path,
-					balance_cell_addresses
+					balance_cell_addresses,
+					settings.google_sheet_name
 				)
 				for cell_address, (card_name, column) in card_mapping.items():
 					balance = balances.get(cell_address)
@@ -1496,7 +1500,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				profits_dict = await read_profits_batch(
 					settings.google_sheet_id,
 					settings.google_credentials_path,
-					profit_cell_addresses
+					profit_cell_addresses,
+					settings.google_sheet_name
 				)
 				profits = profits_dict
 			
@@ -2765,7 +2770,8 @@ async def _update_crypto_values_in_stats(
 	sheet_id: str,
 	credentials_path: str,
 	crypto_columns: List[Dict[str, str]],
-	base_lines: List[str]
+	base_lines: List[str],
+	sheet_name: Optional[str] = None
 ):
 	"""
 	Обновляет значения криптовалют в сообщении статистики после их загрузки.
@@ -2777,7 +2783,8 @@ async def _update_crypto_values_in_stats(
 		crypto_values = await get_crypto_values_from_row_4(
 			sheet_id,
 			credentials_path,
-			crypto_columns
+			crypto_columns,
+			sheet_name
 		)
 		
 		logger.info(f"Получены значения криптовалют: {crypto_values}")
@@ -3045,7 +3052,8 @@ async def admin_stat_bk_command(msg: Message, bot: Bot):
 			balances = await read_card_balances_batch(
 				settings.google_sheet_id,
 				settings.google_credentials_path,
-				cell_addresses
+				cell_addresses,
+				settings.google_sheet_name
 			)
 		except Exception as e:
 			logger.exception(f"Ошибка batch чтения балансов: {e}")
@@ -3125,7 +3133,8 @@ async def admin_stat_k_command(msg: Message, bot: Bot):
 			settings.google_sheet_id,
 			settings.google_credentials_path,
 			crypto_columns,
-			base_lines
+			base_lines,
+			settings.google_sheet_name
 		))
 	else:
 		lines.append("❌ Google Sheets не настроен")
@@ -3855,9 +3864,12 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			card_id,
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
-		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id}). Сообщение не отправлено (нет tg_id)")
+		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id})")
 		
+		# Отправляем все реквизиты админу (даже для скрытого пользователя)
 		await state.clear()
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
 	
 	await cb.answer()
 
