@@ -1366,6 +1366,49 @@ class Database:
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('move_max_row', '406')"
 			)
+			# Диапазоны строк для дней недели в режиме /add
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_monday_start', '5')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_monday_max', '54')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_tuesday_start', '55')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_tuesday_max', '104')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_wednesday_start', '105')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_wednesday_max', '154')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_thursday_start', '155')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_thursday_max', '204')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_friday_start', '205')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_friday_max', '254')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_saturday_start', '255')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_saturday_max', '304')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_sunday_start', '305')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_sunday_max', '364')"
+			)
 			_logger.debug("Created table google_sheets_settings with default values")
 		else:
 			# Проверяем наличие всех необходимых ключей
@@ -1415,6 +1458,63 @@ class Database:
 			if 'move_max_row' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('move_max_row', '406')"
+				)
+			# Диапазоны строк для дней недели в режиме /add
+			if 'add_monday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_monday_start', '5')"
+				)
+			if 'add_monday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_monday_max', '54')"
+				)
+			if 'add_tuesday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_tuesday_start', '55')"
+				)
+			if 'add_tuesday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_tuesday_max', '104')"
+				)
+			if 'add_wednesday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_wednesday_start', '105')"
+				)
+			if 'add_wednesday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_wednesday_max', '154')"
+				)
+			if 'add_thursday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_thursday_start', '155')"
+				)
+			if 'add_thursday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_thursday_max', '204')"
+				)
+			if 'add_friday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_friday_start', '205')"
+				)
+			if 'add_friday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_friday_max', '254')"
+				)
+			if 'add_saturday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_saturday_start', '255')"
+				)
+			if 'add_saturday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_saturday_max', '304')"
+				)
+			if 'add_sunday_start' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_sunday_start', '305')"
+				)
+			if 'add_sunday_max' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_sunday_max', '364')"
 				)
 
 	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:

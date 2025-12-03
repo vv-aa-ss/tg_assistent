@@ -1459,12 +1459,61 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				max_row=move_max_row
 			)
 		else:
-			# Для режима add получаем настройки из БД
+			# Для режима add определяем диапазон строк по дню недели из БД
+			current_date = datetime.now()
+			weekday = current_date.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
+			
+			# Названия дней недели
+			day_names = {
+				0: "Понедельник",
+				1: "Вторник",
+				2: "Среда",
+				3: "Четверг",
+				4: "Пятница",
+				5: "Суббота",
+				6: "Воскресенье"
+			}
+			
+			# Ключи настроек для каждого дня недели
+			day_setting_keys = {
+				0: ("add_monday_start", "add_monday_max"),    # Понедельник
+				1: ("add_tuesday_start", "add_tuesday_max"),  # Вторник
+				2: ("add_wednesday_start", "add_wednesday_max"), # Среда
+				3: ("add_thursday_start", "add_thursday_max"), # Четверг
+				4: ("add_friday_start", "add_friday_max"),    # Пятница
+				5: ("add_saturday_start", "add_saturday_max"), # Суббота
+				6: ("add_sunday_start", "add_sunday_max")     # Воскресенье
+			}
+			
+			# Значения по умолчанию (на случай, если настройки не найдены)
+			default_ranges = {
+				0: (5, 54),    # Понедельник
+				1: (55, 104),  # Вторник
+				2: (105, 154), # Среда
+				3: (155, 204), # Четверг
+				4: (205, 254), # Пятница
+				5: (255, 304), # Суббота
+				6: (305, 364)  # Воскресенье
+			}
+			
+			# Получаем настройки из БД
 			db = get_db()
-			add_start_row_str = await db.get_google_sheets_setting("start_row", "5")
-			add_max_row_str = await db.get_google_sheets_setting("add_max_row", "374")
-			add_start_row = int(add_start_row_str) if add_start_row_str else 5
-			add_max_row = int(add_max_row_str) if add_max_row_str else 374
+			start_key, max_key = day_setting_keys.get(weekday, ("add_monday_start", "add_monday_max"))
+			default_start, default_max = default_ranges.get(weekday, (5, 54))
+			
+			start_row_str = await db.get_google_sheets_setting(start_key, str(default_start))
+			max_row_str = await db.get_google_sheets_setting(max_key, str(default_max))
+			
+			try:
+				add_start_row = int(start_row_str) if start_row_str else default_start
+				add_max_row = int(max_row_str) if max_row_str else default_max
+			except (ValueError, TypeError):
+				add_start_row, add_max_row = default_start, default_max
+				logger.warning(f"Неверные значения для дня недели {weekday}, используем значения по умолчанию")
+			
+			day_name = day_names.get(weekday, "Понедельник")
+			
+			logger.info(f"📍 Режим /add: {day_name}, диапазон строк {add_start_row}-{add_max_row}")
 			
 			result = await write_all_to_google_sheet_one_row(
 				settings.google_sheet_id,
@@ -1477,10 +1526,34 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				start_row=add_start_row,
 				max_row=add_max_row
 			)
+			
+			# Проверяем, есть ли свободная строка в диапазоне
+			if not result.get("success"):
+				error_message = result.get("message", "Неизвестная ошибка")
+				if "Нет свободных строк" in error_message or "свободных строк" in error_message.lower():
+					# Нет места в диапазоне для текущего дня недели
+					try:
+						await cb.message.edit_text(
+							f"⚠️ Нет свободных строк в диапазоне для {day_name} (строки {add_start_row}-{add_max_row}).\n\n"
+							f"Пожалуйста, освободите место в таблице или попробуйте позже.",
+							reply_markup=admin_menu_kb()
+						)
+					except Exception:
+						# Если не удалось отредактировать сообщение, отправляем новое
+						await cb.message.answer(
+							f"⚠️ Нет свободных строк в диапазоне для {day_name} (строки {add_start_row}-{add_max_row}).\n\n"
+							f"Пожалуйста, освободите место в таблице или попробуйте позже.",
+							reply_markup=admin_menu_kb()
+						)
+					await state.clear()
+					try:
+						await cb.answer()
+					except Exception:
+						pass
+					return
 		
 		if result.get("success"):
 			# Формируем отчет о записи
-			from datetime import datetime
 			from app.google_sheets import read_card_balance, read_profit
 			current_date = datetime.now().strftime("%d.%m.%Y")
 			
