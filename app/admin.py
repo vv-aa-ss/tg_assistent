@@ -490,12 +490,14 @@ async def cmd_admin(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		logger.debug(f"/admin ignored: user {message.from_user.id} is not admin")
 		return
+	# Очищаем предыдущее состояние перед показом меню
+	await state.clear()
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
 
 
 
 
-@admin_router.message(F.text == "/del")
+@admin_router.message(Command("del"))
 async def cmd_del(message: Message, state: FSMContext):
 	"""Команда для удаления последней добавленной строки из Google Sheets"""
 	logger.info(f"🔴 ОБРАБОТЧИК cmd_del ВЫЗВАН! message_id={message.message_id}, user_id={message.from_user.id if message.from_user else None}")
@@ -508,6 +510,9 @@ async def cmd_del(message: Message, state: FSMContext):
 		return
 	
 	logger.info(f"✅ /del обрабатывается для админа {message.from_user.id}")
+	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	
 	# Получаем настройки Google Sheets
 	from app.config import get_settings
@@ -668,7 +673,7 @@ def format_add_data_text(data: dict) -> str:
 	return text
 
 
-@admin_router.message(F.text == "/add")
+@admin_router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
 	"""Команда для вызова меню добавления данных в таблицу (режим add)"""
 	admin_ids = get_admin_ids()
@@ -676,6 +681,8 @@ async def cmd_add(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	await state.set_state(AddDataStates.selecting_type)
 	await state.update_data(
 		mode="add",
@@ -705,6 +712,8 @@ async def cmd_rate(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	await state.set_state(AddDataStates.selecting_type)
 	await state.update_data(
 		mode="rate",
@@ -734,6 +743,8 @@ async def cmd_move(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	await state.set_state(AddDataStates.selecting_type)
 	await state.update_data(
 		mode="move",
@@ -753,6 +764,172 @@ async def cmd_move(message: Message, state: FSMContext):
 	data = await state.get_data()
 	text = format_add_data_text(data)
 	await message.answer(text, reply_markup=add_data_type_kb(mode="move", data=data))
+
+
+# Обработчики команд статистики - регистрируем ПЕРЕД универсальным обработчиком
+@admin_router.message(Command("stat_u"))
+async def admin_stats_command(msg: Message, state: FSMContext):
+	"""Обработчик команды /stat_u - показывает меню выбора типа статистики"""
+	logger.info(f"🔵 ОБРАБОТЧИК /stat_u ВЫЗВАН! message_id={msg.message_id}, user_id={msg.from_user.id if msg.from_user else None}")
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
+	
+	db = get_db()
+	stats = await db.get_stats_summary()
+	text = (
+		"<b>📊 Статистика пользователей</b>\n"
+		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>\n"
+		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>\n\n"
+		"Выберите тип статистики:"
+	)
+	await msg.answer(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
+
+
+@admin_router.message(Command("stat_bk"))
+async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
+	"""Обработчик команды /stat_bk для отображения балансов всех карт"""
+	logger.info(f"🔵 ОБРАБОТЧИК /stat_bk ВЫЗВАН! message_id={msg.message_id}, user_id={msg.from_user.id if msg.from_user else None}")
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
+	
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import read_card_balances_batch
+	
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await msg.answer("❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Получаем balance_row из настроек
+	balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
+	balance_row = int(balance_row_str) if balance_row_str else 4
+	
+	# Получаем все карты
+	all_cards = await db.list_cards()
+	
+	if not all_cards:
+		await msg.answer("❌ Карты не найдены", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Сразу отправляем сообщение о загрузке
+	loading_msg = await msg.answer("⏳ Загрузка балансов карт...", reply_markup=simple_back_kb("admin:back"))
+	
+	# Собираем информацию о картах и их столбцах
+	cards_info = []  # [(card_id, card_name, column, cell_address)]
+	cards_without_column = []
+	cell_addresses = []
+	
+	for card_id, card_name, card_details in all_cards:
+		# Получаем столбец для карты
+		column = await db.get_card_column(card_id)
+		
+		if column:
+			cell_address = f"{column}{balance_row}"
+			cards_info.append((card_id, card_name, column, cell_address))
+			cell_addresses.append(cell_address)
+		else:
+			cards_without_column.append(card_name)
+	
+	# Читаем все балансы одним batch запросом
+	balances = {}
+	if cell_addresses:
+		try:
+			balances = await read_card_balances_batch(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				cell_addresses,
+				settings.google_sheet_name
+			)
+		except Exception as e:
+			logger.exception(f"Ошибка batch чтения балансов: {e}")
+	
+	# Формируем результат
+	lines = ["<b>💳 Балансы карт</b>"]
+	cards_with_balance = []
+	
+	for card_id, card_name, column, cell_address in cards_info:
+		balance = balances.get(cell_address)
+		if balance:
+			cards_with_balance.append((card_name, column, balance))
+		else:
+			cards_with_balance.append((card_name, column, "—"))
+	
+	# Добавляем карты с балансами
+	if cards_with_balance:
+		for card_name, column, balance in cards_with_balance:
+			lines.append(f"<code>💳 {card_name} ({column}{balance_row}) = {balance}</code>")
+	
+	# Добавляем карты без привязки
+	if cards_without_column:
+		lines.append("")
+		lines.append("<b>⚠️ Карты без привязки к столбцу:</b>")
+		for card_name in cards_without_column:
+			lines.append(f"<code>💳 {card_name}</code>")
+	
+	if not cards_with_balance and not cards_without_column:
+		lines.append("Нет данных о картах.")
+	
+	text = "\n".join(lines)
+	logger.info(f"📊 Отправка балансов карт: карт с балансом={len(cards_with_balance)}, без столбца={len(cards_without_column)}")
+	try:
+		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		logger.info("✅ Сообщение с балансами карт успешно отправлено")
+	except Exception as e:
+		logger.exception(f"❌ Ошибка отправки сообщения с балансами карт: {e}")
+		# Если не удалось обновить, отправляем новое сообщение
+		try:
+			await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		except Exception as e2:
+			logger.exception(f"❌ Ошибка отправки нового сообщения с балансами карт: {e2}")
+
+
+@admin_router.message(Command("stat_k"))
+async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
+	"""Обработчик команды /stat_k для отображения балансов крипты"""
+	logger.info(f"🔵 ОБРАБОТЧИК /stat_k ВЫЗВАН! message_id={msg.message_id}, user_id={msg.from_user.id if msg.from_user else None}")
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
+	
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import get_crypto_values_from_row_4
+	
+	settings = get_settings()
+	crypto_columns = await db.list_crypto_columns()
+	
+	if not crypto_columns:
+		await msg.answer("❌ Криптовалюты не настроены", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	lines = ["<b>₿ Балансы криптовалют</b>"]
+	
+	if settings.google_sheet_id and settings.google_credentials_path:
+		# Добавляем заглушки "Загрузка..." для каждой криптовалюты
+		for crypto in crypto_columns:
+			crypto_type = crypto.get("crypto_type", "")
+			lines.append(f"<code>{crypto_type} = Загрузка...</code>")
+		
+		text = "\n".join(lines)
+		sent_message = await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		
+		# Асинхронно загружаем значения криптовалют и обновляем сообщение
+		# Передаем только заголовок в base_lines, без строк "Загрузка..."
+		base_lines = ["<b>₿ Балансы криптовалют</b>"]
+		asyncio.create_task(_update_crypto_values_in_stats(
+			bot,
+			sent_message.chat.id,
+			sent_message.message_id,
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			crypto_columns,
+			base_lines,
+			settings.google_sheet_name
+		))
+	else:
+		lines.append("❌ Google Sheets не настроен")
+		await msg.answer("\n".join(lines), reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data == "admin:cash")
@@ -974,6 +1151,10 @@ async def add_data_select_xmr(cb: CallbackQuery, state: FSMContext):
 @admin_router.message(AddDataStates.entering_crypto)
 async def add_data_enter_crypto(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы криптовалюты"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		usd_amount = float(message.text.replace(",", "."))
 		
@@ -1049,6 +1230,10 @@ async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
 @admin_router.message(AddDataStates.entering_card_cash)
 async def add_data_enter_card_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных для карты"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		amount = int(float(message.text.replace(",", ".")))
 		
@@ -1107,6 +1292,10 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 @admin_router.message(AddDataStates.entering_cash)
 async def add_data_enter_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных (без карты)"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		amount = int(float(message.text.replace(",", ".")))
 		
@@ -1162,6 +1351,10 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 @admin_router.message(AddDataStates.selecting_type)
 async def add_data_selecting_type_message(message: Message, state: FSMContext):
 	"""Обработчик текстовых сообщений в состоянии selecting_type - игнорируем, показываем подсказку"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
 	from app.keyboards import add_data_type_kb
@@ -1664,6 +1857,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			await state.clear()
 			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
 		else:
+			await state.clear()
 			try:
 				await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
 			except Exception:
@@ -1671,6 +1865,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				await cb.message.edit_text("❌ Ошибка записи в Google Sheets", reply_markup=admin_menu_kb())
 	except Exception as e:
 		logger.exception(f"Ошибка записи в Google Sheets: {e}")
+		await state.clear()
 		try:
 			await cb.answer("❌ Произошла ошибка при записи", show_alert=True)
 		except Exception:
@@ -3088,20 +3283,6 @@ async def _build_inactivity_stats(db):
 	return "\n".join(lines)
 
 
-@admin_router.message(Command("stat_u"))
-async def admin_stats_command(msg: Message):
-	"""Обработчик команды /stat_u - показывает меню выбора типа статистики"""
-	db = get_db()
-	stats = await db.get_stats_summary()
-	text = (
-		"<b>📊 Статистика пользователей</b>\n"
-		f"<code>👥 Пользователи: {stats['total_users']:>4}</code>\n"
-		f"<code>📤 Выдачи:      {stats['total_deliveries']:>4}</code>\n\n"
-		"Выберите тип статистики:"
-	)
-	await msg.answer(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
-
-
 @admin_router.callback_query(F.data == "stat_u:activity")
 async def stat_u_activity(cb: CallbackQuery):
 	"""Обработчик кнопки 'По активности'"""
@@ -3133,145 +3314,6 @@ async def stat_u_menu(cb: CallbackQuery):
 	)
 	await cb.message.edit_text(text, reply_markup=stat_u_menu_kb(back_to="admin:back"), parse_mode="HTML")
 	await cb.answer()
-
-
-@admin_router.message(Command("stat_bk"))
-async def admin_stat_bk_command(msg: Message, bot: Bot):
-	"""Обработчик команды /stat_bk для отображения балансов всех карт"""
-	db = get_db()
-	from app.config import get_settings
-	from app.google_sheets import read_card_balances_batch
-	
-	settings = get_settings()
-	
-	if not settings.google_sheet_id or not settings.google_credentials_path:
-		await msg.answer("❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
-		return
-	
-	# Получаем balance_row из настроек
-	balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
-	balance_row = int(balance_row_str) if balance_row_str else 4
-	
-	# Получаем все карты
-	all_cards = await db.list_cards()
-	
-	if not all_cards:
-		await msg.answer("❌ Карты не найдены", reply_markup=simple_back_kb("admin:back"))
-		return
-	
-	# Сразу отправляем сообщение о загрузке
-	loading_msg = await msg.answer("⏳ Загрузка балансов карт...", reply_markup=simple_back_kb("admin:back"))
-	
-	# Собираем информацию о картах и их столбцах
-	cards_info = []  # [(card_id, card_name, column, cell_address)]
-	cards_without_column = []
-	cell_addresses = []
-	
-	for card_id, card_name, card_details in all_cards:
-		# Получаем столбец для карты
-		column = await db.get_card_column(card_id)
-		
-		if column:
-			cell_address = f"{column}{balance_row}"
-			cards_info.append((card_id, card_name, column, cell_address))
-			cell_addresses.append(cell_address)
-		else:
-			cards_without_column.append(card_name)
-	
-	# Читаем все балансы одним batch запросом
-	balances = {}
-	if cell_addresses:
-		try:
-			balances = await read_card_balances_batch(
-				settings.google_sheet_id,
-				settings.google_credentials_path,
-				cell_addresses,
-				settings.google_sheet_name
-			)
-		except Exception as e:
-			logger.exception(f"Ошибка batch чтения балансов: {e}")
-	
-	# Формируем результат
-	lines = ["<b>💳 Балансы карт</b>"]
-	cards_with_balance = []
-	
-	for card_id, card_name, column, cell_address in cards_info:
-		balance = balances.get(cell_address)
-		if balance:
-			cards_with_balance.append((card_name, column, balance))
-		else:
-			cards_with_balance.append((card_name, column, "—"))
-	
-	# Добавляем карты с балансами
-	if cards_with_balance:
-		for card_name, column, balance in cards_with_balance:
-			lines.append(f"<code>💳 {card_name} ({column}{balance_row}) = {balance}</code>")
-	
-	# Добавляем карты без привязки
-	if cards_without_column:
-		lines.append("")
-		lines.append("<b>⚠️ Карты без привязки к столбцу:</b>")
-		for card_name in cards_without_column:
-			lines.append(f"<code>💳 {card_name}</code>")
-	
-	if not cards_with_balance and not cards_without_column:
-		lines.append("Нет данных о картах.")
-	
-	text = "\n".join(lines)
-	logger.info(f"📊 Отправка балансов карт: карт с балансом={len(cards_with_balance)}, без столбца={len(cards_without_column)}")
-	try:
-		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
-		logger.info("✅ Сообщение с балансами карт успешно отправлено")
-	except Exception as e:
-		logger.exception(f"❌ Ошибка отправки сообщения с балансами карт: {e}")
-		# Если не удалось обновить, отправляем новое сообщение
-		try:
-			await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
-		except Exception as e2:
-			logger.exception(f"❌ Ошибка отправки нового сообщения с балансами карт: {e2}")
-
-
-@admin_router.message(Command("stat_k"))
-async def admin_stat_k_command(msg: Message, bot: Bot):
-	"""Обработчик команды /stat_k для отображения балансов крипты"""
-	db = get_db()
-	from app.config import get_settings
-	from app.google_sheets import get_crypto_values_from_row_4
-	
-	settings = get_settings()
-	crypto_columns = await db.list_crypto_columns()
-	
-	if not crypto_columns:
-		await msg.answer("❌ Криптовалюты не настроены", reply_markup=simple_back_kb("admin:back"))
-		return
-	
-	lines = ["<b>₿ Балансы криптовалют</b>"]
-	
-	if settings.google_sheet_id and settings.google_credentials_path:
-		# Добавляем заглушки "Загрузка..." для каждой криптовалюты
-		for crypto in crypto_columns:
-			crypto_type = crypto.get("crypto_type", "")
-			lines.append(f"<code>{crypto_type} = Загрузка...</code>")
-		
-		text = "\n".join(lines)
-		sent_message = await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
-		
-		# Асинхронно загружаем значения криптовалют и обновляем сообщение
-		# Передаем только заголовок в base_lines, без строк "Загрузка..."
-		base_lines = ["<b>₿ Балансы криптовалют</b>"]
-		asyncio.create_task(_update_crypto_values_in_stats(
-			bot,
-			sent_message.chat.id,
-			sent_message.message_id,
-			settings.google_sheet_id,
-			settings.google_credentials_path,
-			crypto_columns,
-			base_lines,
-			settings.google_sheet_name
-		))
-	else:
-		lines.append("❌ Google Sheets не настроен")
-		await msg.answer("\n".join(lines), reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))
@@ -3470,10 +3512,13 @@ async def user_bind_card(cb: CallbackQuery):
 # Handle any message and process forwarding logic for admins
 # Важно: этот обработчик должен быть ПОСЛЕ обработчика editing_crypto_amount
 # чтобы не перехватывать сообщения в состоянии редактирования
+# ВАЖНО: Используем фильтр чтобы НЕ перехватывать команды
 @admin_router.message()
 async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMContext):
 	# Пропускаем команды - они обрабатываются отдельными обработчиками
+	# Проверяем это ПЕРВЫМ делом, до любых других проверок
 	if message.text and message.text.startswith("/"):
+		logger.debug(f"⚠️ Универсальный обработчик: пропускаем команду '{message.text}'")
 		return
 	
 	# Проверяем текущее состояние FSM - если пользователь находится в процессе /add или других операциях,

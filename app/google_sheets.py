@@ -1317,27 +1317,62 @@ async def delete_last_row_from_google_sheet(
 ) -> Dict[str, Any]:
 	"""
 	Удаляет последнюю добавленную строку из Google Sheets.
-	Ищет последнюю заполненную строку построчно (проверяя все столбцы от A до BB), начиная с 5-й строки.
+	Ищет последнюю заполненную строку построчно в диапазоне текущего дня недели (как в /add).
 	Удаляет найденную строку в диапазоне, указанном в настройках (по умолчанию A:BB).
 	
 	Args:
 		sheet_id: ID Google Sheet
 		credentials_path: Путь к файлу с учетными данными
+		sheet_name: Название листа (опционально)
 		
 	Returns:
 		Словарь с результатами: {"success": bool, "deleted_row": int | None, "message": str}
 	"""
 	try:
+		# Определяем текущий день недели
+		from datetime import datetime
+		current_date = datetime.now()
+		weekday = current_date.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
+		
+		# Ключи настроек для каждого дня недели
+		day_setting_keys = {
+			0: ("add_monday_start", "add_monday_max"),    # Понедельник
+			1: ("add_tuesday_start", "add_tuesday_max"),  # Вторник
+			2: ("add_wednesday_start", "add_wednesday_max"), # Среда
+			3: ("add_thursday_start", "add_thursday_max"), # Четверг
+			4: ("add_friday_start", "add_friday_max"),    # Пятница
+			5: ("add_saturday_start", "add_saturday_max"), # Суббота
+			6: ("add_sunday_start", "add_sunday_max")     # Воскресенье
+		}
+		
+		# Значения по умолчанию (на случай, если настройки не найдены)
+		default_ranges = {
+			0: (5, 54),    # Понедельник
+			1: (55, 104),  # Вторник
+			2: (105, 154), # Среда
+			3: (155, 204), # Четверг
+			4: (205, 254), # Пятница
+			5: (255, 304), # Суббота
+			6: (305, 364)  # Воскресенье
+		}
+		
 		# Получаем настройки из базы данных
 		db = get_db()
 		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
-		start_row_str = await db.get_google_sheets_setting("start_row", "5")
+		
+		# Получаем диапазон для текущего дня недели
+		start_key, max_key = day_setting_keys.get(weekday, ("add_monday_start", "add_monday_max"))
+		default_start, default_max = default_ranges.get(weekday, (5, 54))
+		
+		start_row_str = await db.get_google_sheets_setting(start_key, str(default_start))
+		max_row_str = await db.get_google_sheets_setting(max_key, str(default_max))
 		
 		try:
-			start_row = int(start_row_str)
+			start_row = int(start_row_str) if start_row_str else default_start
+			max_row = int(max_row_str) if max_row_str else default_max
 		except (ValueError, TypeError):
-			start_row = 5
-			logger.warning(f"Неверное значение start_row: {start_row_str}, используем 5")
+			start_row, max_row = default_start, default_max
+			logger.warning(f"Неверные значения для дня недели {weekday}, используем значения по умолчанию")
 		
 		# Парсим диапазон столбцов
 		start_column = "A"
@@ -1348,6 +1383,19 @@ async def delete_last_row_from_google_sheet(
 				start_column = parts[0].strip()
 				end_column = parts[1].strip()
 		
+		# Названия дней недели для логирования
+		day_names = {
+			0: "Понедельник",
+			1: "Вторник",
+			2: "Среда",
+			3: "Четверг",
+			4: "Пятница",
+			5: "Суббота",
+			6: "Воскресенье"
+		}
+		day_name = day_names.get(weekday, "Понедельник")
+		logger.info(f"🗑️ /del: {day_name}, поиск последней строки в диапазоне {start_row}-{max_row}")
+		
 		# Выполняем синхронное удаление в отдельном потоке
 		return await asyncio.to_thread(
 			_delete_last_row_from_google_sheet_sync,
@@ -1355,6 +1403,7 @@ async def delete_last_row_from_google_sheet(
 			credentials_path,
 			delete_range,
 			start_row,
+			max_row,
 			start_column,
 			end_column,
 			sheet_name
@@ -1364,7 +1413,7 @@ async def delete_last_row_from_google_sheet(
 		return {"success": False, "deleted_row": None, "message": f"Ошибка: {str(e)}"}
 
 
-def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 5, start_column: str = "A", end_column: str = "BB", max_rows: int = 10000) -> Optional[int]:
+def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 5, start_column: str = "A", end_column: str = "BB", max_row: Optional[int] = None) -> Optional[int]:
 	"""
 	Находит последнюю заполненную строку, проверяя все столбцы от start_column до end_column.
 	Возвращает номер последней строки, которая содержит хотя бы одно непустое значение.
@@ -1374,7 +1423,7 @@ def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 
 		start_row: Номер строки, с которой начинать поиск
 		start_column: Начальный столбец для проверки
 		end_column: Конечный столбец для проверки
-		max_rows: Максимальное количество строк для проверки
+		max_row: Максимальный номер строки для проверки (включительно). Если None, проверяет до конца таблицы.
 	
 	Returns:
 		Номер последней заполненной строки или None, если не найдено
@@ -1385,10 +1434,18 @@ def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 
 		current_row = start_row
 		last_filled_row = None
 		
-		while current_row < start_row + max_rows:
+		# Определяем максимальный номер строки для проверки
+		if max_row is None:
+			# Если max_row не указан, используем большое число
+			max_row = start_row + 10000
+		
+		# Флаг для остановки при выходе за пределы таблицы
+		exceeded_limits = False
+		
+		while current_row <= max_row and not exceeded_limits:
 			try:
 				# Читаем пакет строк
-				end_row = min(current_row + batch_size - 1, start_row + max_rows)
+				end_row = min(current_row + batch_size - 1, max_row)
 				range_str = f"{start_column}{current_row}:{end_column}{end_row}"
 				values = worksheet.get(range_str)
 				
@@ -1399,6 +1456,8 @@ def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 
 				# Проверяем каждую строку в пакете
 				for i in range(len(values)):
 					row_num = current_row + i
+					if row_num > max_row:
+						break
 					row_data = values[i] if i < len(values) else []
 					
 					# Проверяем, есть ли в строке хотя бы одно непустое значение
@@ -1418,9 +1477,18 @@ def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 
 				current_row = end_row + 1
 				
 			except Exception as e:
+				error_str = str(e)
+				# Проверяем, не вышли ли мы за пределы таблицы
+				if "exceeds grid limits" in error_str or "400" in error_str:
+					logger.info(f"Достигнут предел таблицы при чтении диапазона {range_str}, прекращаем поиск")
+					exceeded_limits = True
+					break
+				
 				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}")
 				# Пробуем по одной строке
 				try:
+					if current_row > max_row:
+						break
 					row_range = f"{start_column}{current_row}:{end_column}{current_row}"
 					row_data = worksheet.get(row_range)
 					
@@ -1439,6 +1507,11 @@ def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 
 					
 					current_row += 1
 				except Exception as e2:
+					error_str2 = str(e2)
+					if "exceeds grid limits" in error_str2 or "400" in error_str2:
+						logger.info(f"Достигнут предел таблицы при чтении строки {current_row}, прекращаем поиск")
+						exceeded_limits = True
+						break
 					logger.warning(f"Ошибка чтения строки {current_row}: {e2}")
 					current_row += 1
 		
@@ -1454,13 +1527,14 @@ def _delete_last_row_from_google_sheet_sync(
 	credentials_path: str,
 	delete_range: str,
 	start_row: int,
+	max_row: int,
 	start_column: str,
 	end_column: str,
 	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для удаления последней строки из Google Sheets.
-	Ищет последнюю заполненную строку построчно и удаляет её.
+	Ищет последнюю заполненную строку построчно в указанном диапазоне и удаляет её.
 	"""
 	try:
 		# Создаем клиент
@@ -1477,16 +1551,19 @@ def _delete_last_row_from_google_sheet_sync(
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
 		
-		logger.info(f"🔍 Поиск последней заполненной строки построчно (диапазон {start_column}:{end_column}), начиная с строки {start_row}")
+		logger.info(f"🔍 Поиск последней заполненной строки построчно (диапазон {start_column}:{end_column}), в диапазоне строк {start_row}-{max_row}")
 		
-		# Ищем последнюю заполненную строку построчно
-		last_filled_row = _find_last_filled_row_by_row(worksheet, start_row=start_row, start_column=start_column, end_column=end_column)
+		# Ищем последнюю заполненную строку построчно в указанном диапазоне
+		last_filled_row = _find_last_filled_row_by_row(worksheet, start_row=start_row, max_row=max_row, start_column=start_column, end_column=end_column)
 		
 		if not last_filled_row:
 			return {"success": False, "deleted_row": None, "message": "Не найдена заполненная строка для удаления"}
 		
 		if last_filled_row < start_row:
 			return {"success": False, "deleted_row": None, "message": f"Нельзя удалить строку {last_filled_row}, она меньше начальной строки {start_row}"}
+		
+		if last_filled_row > max_row:
+			return {"success": False, "deleted_row": None, "message": f"Нельзя удалить строку {last_filled_row}, она превышает максимальную строку {max_row} для текущего дня недели"}
 		
 		# Формируем диапазон для удаления
 		delete_range_full = f"{start_column}{last_filled_row}:{end_column}{last_filled_row}"
