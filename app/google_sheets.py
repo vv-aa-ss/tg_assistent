@@ -422,19 +422,172 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 		return start_row
 
 
-def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 5) -> int:
+def _find_empty_row_by_row(sheet: gspread.Worksheet, start_row: int = 5, max_row: Optional[int] = None, start_column: str = "A", end_column: str = "BB") -> int:
+	"""
+	Находит первую полностью пустую строку, проверяя все столбцы от start_column до end_column.
+	Использует batch чтение для оптимизации (читает по несколько строк за раз).
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
+		start_column: Начальный столбец для проверки (по умолчанию "A")
+		end_column: Конечный столбец для проверки (по умолчанию "BB")
+	
+	Returns:
+		Номер первой полностью пустой строки или max_row + 1, если не найдено
+	"""
+	try:
+		# Для небольших диапазонов (например, 375-406 = 32 строки) читаем весь диапазон за раз
+		# Для больших диапазонов используем batch чтение по 10-15 строк
+		if max_row is not None:
+			total_rows = max_row - start_row + 1
+			if total_rows <= 50:
+				# Читаем весь диапазон за один запрос
+				batch_size = total_rows
+			else:
+				# Используем batch чтение
+				batch_size = 15
+			search_limit = max_row
+		else:
+			batch_size = 15
+			search_limit = start_row + 1000
+		
+		row = start_row
+		
+		while row <= search_limit:
+			# Читаем batch строк за один запрос
+			end_row = min(row + batch_size - 1, search_limit)
+			range_str = f"{start_column}{row}:{end_column}{end_row}"
+			
+			try:
+				# Читаем весь диапазон строк за один запрос
+				values = sheet.get(range_str)
+				# values - это список списков строк, например:
+				# [
+				#   [['val1', 'val2', ...], ['val3', 'val4', ...]],  # строка 1
+				#   [[], []],  # строка 2 (пустая)
+				#   ...
+				# ]
+				
+				expected_rows = end_row - row + 1
+				received_rows = len(values) if values else 0
+				
+				logger.debug(f"🔍 Прочитан диапазон {range_str}: ожидалось {expected_rows} строк, получено {received_rows} строк")
+				
+				# Если values пустой или None, значит все строки в диапазоне пустые
+				if not values or len(values) == 0:
+					logger.info(f"✅ Диапазон {range_str} полностью пустой, возвращаем первую строку {row}")
+					return row
+				
+				# Проверяем каждую строку
+				# Google Sheets API возвращает данные в формате:
+				# При чтении диапазона A375:BB406, values[i] - это список значений строки
+				# values[i] = ['val1', 'val2', ..., 'valBB'] или [] если строка пустая
+				
+				for i in range(expected_rows):
+					current_row = row + i
+					
+					# Проверяем, не превысили ли лимит
+					if max_row is not None and current_row > max_row:
+						logger.warning(f"⚠️ Достигнут лимит строки {max_row}")
+						return max_row + 1
+					
+					# Если строка не в полученных данных, значит она пустая
+					if i >= received_rows:
+						logger.info(f"✅ Найдена пустая строка {current_row} (не найдена в ответе API)")
+						return current_row
+					
+					# Получаем данные строки
+					# values[i] - это уже список значений строки (не список списков)
+					row_values = values[i] if i < len(values) else []
+					
+					# Проверяем, есть ли в строке хотя бы одно непустое значение
+					is_empty = True
+					if row_values and len(row_values) > 0:
+						for cell_value in row_values:
+							if cell_value is not None:
+								# Преобразуем в строку и проверяем, не пустая ли она
+								cell_str = str(cell_value).strip() if cell_value else ""
+								if cell_str != "":
+									# Найдено непустое значение
+									is_empty = False
+									break
+					
+					if is_empty:
+						logger.info(f"✅ Найдена полностью пустая строка {current_row}")
+						return current_row
+					else:
+						logger.debug(f"Строка {current_row} содержит данные, пропускаем")
+				
+				# Если в этом batch не нашли пустую строку, переходим к следующему
+				row = end_row + 1
+				
+			except Exception as e:
+				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной строке")
+				# Fallback: проверяем по одной строке
+				if max_row is not None and row > max_row:
+					return max_row + 1
+				
+				try:
+					# Читаем одну строку
+					row_range = f"{start_column}{row}:{end_column}{row}"
+					row_data = sheet.get(row_range)
+					
+					# Проверяем, пустая ли строка
+					# row_data - это список, содержащий один список со всеми значениями строки
+					# row_data = [['val1', 'val2', ..., 'valBB']] или [] если строка пустая
+					is_empty = True
+					if row_data and len(row_data) > 0:
+						# row_data[0] - это список всех значений в строке
+						row_values = row_data[0] if row_data[0] else []
+						for cell_value in row_values:
+							if cell_value is not None:
+								cell_str = str(cell_value).strip() if cell_value else ""
+								if cell_str != "":
+									is_empty = False
+									break
+					
+					if is_empty:
+						return row
+					row += 1
+				except Exception as e2:
+					logger.warning(f"Ошибка чтения строки {row}: {e2}")
+					row += 1
+		
+		logger.warning(f"Не найдена пустая строка в диапазоне {start_row}-{search_limit}")
+		return search_limit + 1
+		
+	except Exception as e:
+		logger.exception(f"Ошибка поиска пустой строки построчно: {e}")
+		return start_row
+
+
+def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 5, max_row: Optional[int] = None) -> int:
 	"""
 	Находит первую строку с 0 в указанном столбце, начиная с start_row.
 	Возвращает номер строки.
 	Использует batch чтение для оптимизации (читает по 50 строк за раз).
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		column: Буква столбца (например, "BC")
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
 	"""
 	try:
 		batch_size = 50
 		row = start_row
 		
-		while row <= start_row + 1000:
+		# Определяем максимальную строку для поиска
+		if max_row is not None:
+			search_limit = max_row
+		else:
+			search_limit = start_row + 1000
+		
+		while row <= search_limit:
 			# Читаем batch строк за один запрос
-			end_row = min(row + batch_size - 1, start_row + 1000)
+			end_row = min(row + batch_size - 1, search_limit)
 			range_str = f"{column}{row}:{column}{end_row}"
 			
 			try:
@@ -473,8 +626,8 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 					return row
 				row += 1
 		
-		logger.warning(f"Не найдена свободная строка в столбце {column}, начиная с {start_row}")
-		return start_row + 1000
+		logger.warning(f"Не найдена свободная строка в столбце {column}, начиная с {start_row} до {search_limit}")
+		return search_limit + 1
 		
 	except Exception as e:
 		logger.exception(f"Ошибка поиска свободной строки: {e}")
@@ -882,7 +1035,9 @@ async def write_all_to_google_sheet_one_row(
 	xmr_list: list,  # [{"xmr_number": 1, "usd_amount": 50}, ...]
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
 	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
-	sheet_name: Optional[str] = None
+	sheet_name: Optional[str] = None,
+	start_row: Optional[int] = None,
+	max_row: Optional[int] = None
 ) -> Dict[str, Any]:
 	"""
 	Записывает все данные в одну строку Google Sheets.
@@ -954,6 +1109,19 @@ async def write_all_to_google_sheet_one_row(
 			else:
 				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
 		
+		# Получаем диапазон столбцов из БД для построчной проверки
+		# Используется для /add, /move и других режимов, где нужна построчная проверка
+		db = get_db()
+		delete_range_str = await db.get_google_sheets_setting("delete_range", "A:BB")
+		start_column = "A"
+		end_column = "BB"
+		if delete_range_str and ":" in delete_range_str:
+			parts = delete_range_str.split(":")
+			if len(parts) == 2:
+				start_column = parts[0].strip()
+				end_column = parts[1].strip()
+				logger.info(f"📍 Используется диапазон столбцов из БД: {start_column}:{end_column}")
+		
 		# Выполняем синхронную запись в отдельном потоке
 		return await asyncio.to_thread(
 			_write_all_to_google_sheet_one_row_sync,
@@ -965,7 +1133,11 @@ async def write_all_to_google_sheet_one_row(
 			card_cash_pairs,
 			crypto_columns,
 			xmr_columns,
-			sheet_name
+			sheet_name,
+			start_row,
+			max_row,
+			start_column,
+			end_column
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
@@ -981,7 +1153,11 @@ def _write_all_to_google_sheet_one_row_sync(
 	card_cash_pairs: list,
 	crypto_columns: Dict[str, Optional[str]],  # {currency: column}
 	xmr_columns: Dict[int, Optional[str]],
-	sheet_name: Optional[str] = None
+	sheet_name: Optional[str] = None,
+	start_row: Optional[int] = None,
+	max_row: Optional[int] = None,
+	start_column: str = "A",
+	end_column: str = "BB"
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи всех данных в одну строку Google Sheets.
@@ -1002,7 +1178,27 @@ def _write_all_to_google_sheet_one_row_sync(
 			raise
 		
 		# Находим одну свободную строку
-		empty_row = _find_empty_row_in_column(worksheet, "BC", start_row=5)
+		# Если start_row не указан, используем значение по умолчанию 5
+		search_start_row = start_row if start_row is not None else 5
+		
+		# Используем построчную проверку для всех режимов, где запись идет в одну строку
+		# Это более надежно, чем проверка по столбцу BC, так как профит может быть 0
+		# Для /move (start_row >= 375) и /add (start_row < 375) используем построчную проверку
+		empty_row = _find_empty_row_by_row(
+			worksheet, 
+			start_row=search_start_row, 
+			max_row=max_row,
+			start_column=start_column,
+			end_column=end_column
+		)
+		mode_name = "/move" if (max_row is not None and search_start_row >= 375) else "/add"
+		logger.info(f"📍 Построчная проверка для {mode_name} (диапазон {start_column}:{end_column}): найдена свободная строка {empty_row}")
+		
+		# Проверяем, не превышен ли лимит
+		if max_row is not None and empty_row > max_row:
+			logger.warning(f"⚠️ Не найдена свободная строка в диапазоне {search_start_row}-{max_row}, найдена строка {empty_row}")
+			return {"success": False, "written_cells": [], "message": f"Нет свободных строк в диапазоне {search_start_row}-{max_row}"}
+		
 		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row}")
 		
 		written_cells = []  # Список записанных ячеек для отчета
@@ -1121,8 +1317,8 @@ async def delete_last_row_from_google_sheet(
 ) -> Dict[str, Any]:
 	"""
 	Удаляет последнюю добавленную строку из Google Sheets.
-	Ищет первую строку с нулем в столбце нулей (по умолчанию BC), начиная с 5-й строки.
-	Удаляет предыдущую строку в диапазоне, указанном в настройках (по умолчанию A:BB).
+	Ищет последнюю заполненную строку построчно (проверяя все столбцы от A до BB), начиная с 5-й строки.
+	Удаляет найденную строку в диапазоне, указанном в настройках (по умолчанию A:BB).
 	
 	Args:
 		sheet_id: ID Google Sheet
@@ -1134,7 +1330,6 @@ async def delete_last_row_from_google_sheet(
 	try:
 		# Получаем настройки из базы данных
 		db = get_db()
-		zero_column = await db.get_google_sheets_setting("zero_column", "BC")
 		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
 		start_row_str = await db.get_google_sheets_setting("start_row", "5")
 		
@@ -1144,14 +1339,24 @@ async def delete_last_row_from_google_sheet(
 			start_row = 5
 			logger.warning(f"Неверное значение start_row: {start_row_str}, используем 5")
 		
+		# Парсим диапазон столбцов
+		start_column = "A"
+		end_column = "BB"
+		if delete_range and ":" in delete_range:
+			parts = delete_range.split(":")
+			if len(parts) == 2:
+				start_column = parts[0].strip()
+				end_column = parts[1].strip()
+		
 		# Выполняем синхронное удаление в отдельном потоке
 		return await asyncio.to_thread(
 			_delete_last_row_from_google_sheet_sync,
 			sheet_id,
 			credentials_path,
-			zero_column,
 			delete_range,
 			start_row,
+			start_column,
+			end_column,
 			sheet_name
 		)
 	except Exception as e:
@@ -1159,16 +1364,103 @@ async def delete_last_row_from_google_sheet(
 		return {"success": False, "deleted_row": None, "message": f"Ошибка: {str(e)}"}
 
 
+def _find_last_filled_row_by_row(worksheet: gspread.Worksheet, start_row: int = 5, start_column: str = "A", end_column: str = "BB", max_rows: int = 10000) -> Optional[int]:
+	"""
+	Находит последнюю заполненную строку, проверяя все столбцы от start_column до end_column.
+	Возвращает номер последней строки, которая содержит хотя бы одно непустое значение.
+	
+	Args:
+		worksheet: Рабочий лист Google Sheets
+		start_row: Номер строки, с которой начинать поиск
+		start_column: Начальный столбец для проверки
+		end_column: Конечный столбец для проверки
+		max_rows: Максимальное количество строк для проверки
+	
+	Returns:
+		Номер последней заполненной строки или None, если не найдено
+	"""
+	try:
+		# Читаем значения пакетами для оптимизации
+		batch_size = 50
+		current_row = start_row
+		last_filled_row = None
+		
+		while current_row < start_row + max_rows:
+			try:
+				# Читаем пакет строк
+				end_row = min(current_row + batch_size - 1, start_row + max_rows)
+				range_str = f"{start_column}{current_row}:{end_column}{end_row}"
+				values = worksheet.get(range_str)
+				
+				if not values or len(values) == 0:
+					# Если нет значений, значит достигли конца данных
+					break
+				
+				# Проверяем каждую строку в пакете
+				for i in range(len(values)):
+					row_num = current_row + i
+					row_data = values[i] if i < len(values) else []
+					
+					# Проверяем, есть ли в строке хотя бы одно непустое значение
+					has_data = False
+					if row_data and len(row_data) > 0:
+						for cell_value in row_data:
+							if cell_value is not None:
+								cell_str = str(cell_value).strip() if cell_value else ""
+								if cell_str != "":
+									has_data = True
+									break
+					
+					if has_data:
+						last_filled_row = row_num
+				
+				# Переходим к следующему пакету
+				current_row = end_row + 1
+				
+			except Exception as e:
+				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}")
+				# Пробуем по одной строке
+				try:
+					row_range = f"{start_column}{current_row}:{end_column}{current_row}"
+					row_data = worksheet.get(row_range)
+					
+					has_data = False
+					if row_data and len(row_data) > 0:
+						row_values = row_data[0] if row_data[0] else []
+						for cell_value in row_values:
+							if cell_value is not None:
+								cell_str = str(cell_value).strip() if cell_value else ""
+								if cell_str != "":
+									has_data = True
+									break
+					
+					if has_data:
+						last_filled_row = current_row
+					
+					current_row += 1
+				except Exception as e2:
+					logger.warning(f"Ошибка чтения строки {current_row}: {e2}")
+					current_row += 1
+		
+		return last_filled_row
+		
+	except Exception as e:
+		logger.exception(f"Ошибка поиска последней заполненной строки: {e}")
+		return None
+
+
 def _delete_last_row_from_google_sheet_sync(
 	sheet_id: str,
 	credentials_path: str,
-	zero_column: str,
 	delete_range: str,
 	start_row: int,
+	start_column: str,
+	end_column: str,
 	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для удаления последней строки из Google Sheets.
+	Ищет последнюю заполненную строку построчно и удаляет её.
 	"""
 	try:
 		# Создаем клиент
@@ -1185,99 +1477,19 @@ def _delete_last_row_from_google_sheet_sync(
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
 		
-		logger.info(f"🔍 Поиск строки с нулем в столбце {zero_column}, начиная с строки {start_row}")
+		logger.info(f"🔍 Поиск последней заполненной строки построчно (диапазон {start_column}:{end_column}), начиная с строки {start_row}")
 		
-		# Ищем первую строку с нулем в столбце нулей
-		current_row = start_row
-		found_zero_row = None
+		# Ищем последнюю заполненную строку построчно
+		last_filled_row = _find_last_filled_row_by_row(worksheet, start_row=start_row, start_column=start_column, end_column=end_column)
 		
-		# Читаем значения пакетами для оптимизации
-		batch_size = 100
-		max_rows = 10000  # Максимальное количество строк для проверки
+		if not last_filled_row:
+			return {"success": False, "deleted_row": None, "message": "Не найдена заполненная строка для удаления"}
 		
-		while current_row < start_row + max_rows:
-			try:
-				# Читаем пакет значений
-				end_row = min(current_row + batch_size - 1, start_row + max_rows)
-				range_str = f"{zero_column}{current_row}:{zero_column}{end_row}"
-				values = worksheet.get(range_str)
-				
-				if not values:
-					# Если нет значений, значит достигли конца данных
-					# Последняя строка с данными - это предыдущая строка
-					if current_row > start_row:
-						found_zero_row = current_row
-						break
-					else:
-						return {"success": False, "deleted_row": None, "message": "Нет данных для удаления"}
-				
-				# Ищем первую строку с нулем
-				for i, row_values in enumerate(values):
-					if not row_values or len(row_values) == 0:
-						# Пустая ячейка - это тоже ноль
-						found_zero_row = current_row + i
-						break
-					
-					cell_value = row_values[0] if row_values else None
-					
-					# Проверяем, является ли значение нулем
-					try:
-						if cell_value is None or cell_value == "":
-							found_zero_row = current_row + i
-							break
-						num_value = float(cell_value)
-						if num_value == 0:
-							found_zero_row = current_row + i
-							break
-					except (ValueError, TypeError):
-						# Не число, пропускаем
-						pass
-				
-				if found_zero_row:
-					break
-				
-				# Переходим к следующему пакету
-				current_row = end_row + 1
-				
-			except Exception as e:
-				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной ячейке")
-				# Fallback: читаем по одной ячейке
-				try:
-					cell_value = worksheet.acell(f"{zero_column}{current_row}").value
-					if cell_value is None or cell_value == "":
-						found_zero_row = current_row
-						break
-					try:
-						num_value = float(cell_value)
-						if num_value == 0:
-							found_zero_row = current_row
-							break
-					except (ValueError, TypeError):
-						pass
-					current_row += 1
-				except Exception as e2:
-					logger.warning(f"Ошибка чтения ячейки {zero_column}{current_row}: {e2}")
-					break
+		if last_filled_row < start_row:
+			return {"success": False, "deleted_row": None, "message": f"Нельзя удалить строку {last_filled_row}, она меньше начальной строки {start_row}"}
 		
-		if not found_zero_row:
-			return {"success": False, "deleted_row": None, "message": "Не найдена строка привязки"}
-		
-		# Удаляем предыдущую строку
-		if found_zero_row <= start_row:
-			return {"success": False, "deleted_row": None, "message": "Таблица пуста"}
-		
-		row_to_delete = found_zero_row - 1
-		
-		logger.info(f"📍 Найдена строка с нулем: {zero_column}{found_zero_row}, удаляем строку {row_to_delete}")
-		
-		# Формируем диапазон для удаления (например, A8:BB8)
-		# Если delete_range = "A:BB", то диапазон будет A{row}:BB{row}
-		if ":" in delete_range:
-			start_col, end_col = delete_range.split(":")
-			delete_range_full = f"{start_col}{row_to_delete}:{end_col}{row_to_delete}"
-		else:
-			# Если формат неверный, используем весь ряд
-			delete_range_full = f"{row_to_delete}:{row_to_delete}"
+		# Формируем диапазон для удаления
+		delete_range_full = f"{start_column}{last_filled_row}:{end_column}{last_filled_row}"
 		
 		# Очищаем диапазон (удаляем значения)
 		# Используем batch_clear для очистки диапазона
@@ -1286,9 +1498,9 @@ def _delete_last_row_from_google_sheet_sync(
 		except AttributeError:
 			# Если batch_clear не поддерживается, используем clear
 			worksheet.clear(delete_range_full)
-		logger.info(f"✅ Удалена строка {row_to_delete} в диапазоне {delete_range_full}")
+		logger.info(f"✅ Удалена строка {last_filled_row} в диапазоне {delete_range_full}")
 		
-		return {"success": True, "deleted_row": row_to_delete, "message": f"Удалена строка {row_to_delete}"}
+		return {"success": True, "deleted_row": last_filled_row, "message": f"Удалена строка {last_filled_row}"}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка удаления строки из Google Sheet: {e}")
@@ -1369,13 +1581,11 @@ async def write_to_google_sheet_rate_mode(
 			elif not cash_name:
 				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
 		
-		# Получаем лимит строки из базы данных
-		rate_max_row_str = await db.get_google_sheets_setting("rate_max_row", "355")
-		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 355
-		
-		# Получаем начальную строку для режима rate (по умолчанию 348)
-		rate_last_row_str = await db.get_google_sheets_setting("rate_last_row", "348")
-		rate_start_row = int(rate_last_row_str) if rate_last_row_str else 348
+		# Получаем настройки диапазона строк для режима rate из базы данных
+		rate_start_row_str = await db.get_google_sheets_setting("rate_start_row", "407")
+		rate_max_row_str = await db.get_google_sheets_setting("rate_max_row", "419")
+		rate_start_row = int(rate_start_row_str) if rate_start_row_str else 407
+		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 419
 		
 		# Выполняем синхронную запись в отдельном потоке
 		result = await asyncio.to_thread(
@@ -1393,7 +1603,7 @@ async def write_to_google_sheet_rate_mode(
 			sheet_name
 		)
 		
-		# В режиме rate всегда начинаем с 348 строки, не сохраняем последние использованные строки
+		# В режиме rate всегда начинаем с rate_start_row (по умолчанию 407), не сохраняем последние использованные строки
 		# (убрано сохранение rate_last_row_{column} для каждого столбца)
 		
 		return result
@@ -1411,8 +1621,8 @@ def _write_to_google_sheet_rate_mode_sync(
 	card_cash_pairs: list,
 	crypto_columns: Dict[str, Optional[str]],  # {currency: column}
 	xmr_columns: Dict[int, Optional[str]],
-	rate_max_row: int = 355,
-	start_row: int = 348,
+	rate_max_row: int = 419,
+	start_row: int = 407,
 	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""

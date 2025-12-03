@@ -1343,7 +1343,13 @@ class Database:
 				"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 			)
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
@@ -1353,6 +1359,12 @@ class Database:
 			)
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('move_start_row', '375')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('move_max_row', '406')"
 			)
 			_logger.debug("Created table google_sheets_settings with default values")
 		else:
@@ -1372,9 +1384,17 @@ class Database:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
 				)
+			if 'add_max_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+				)
+			if 'rate_start_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+				)
 			if 'rate_max_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 				)
 			if 'rate_last_row' not in existing_keys:
 				await self._db.execute(
@@ -1387,6 +1407,14 @@ class Database:
 			if 'profit_column' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+				)
+			if 'move_start_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('move_start_row', '375')"
+				)
+			if 'move_max_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('move_max_row', '406')"
 				)
 
 	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:

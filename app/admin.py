@@ -726,6 +726,35 @@ async def cmd_rate(message: Message, state: FSMContext):
 	await message.answer(text, reply_markup=add_data_type_kb(mode="rate", data=data))
 
 
+@admin_router.message(Command("move"))
+async def cmd_move(message: Message, state: FSMContext):
+	"""Команда для вызова меню добавления данных в таблицу (режим move)"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	await state.set_state(AddDataStates.selecting_type)
+	await state.update_data(
+		mode="move",
+		crypto_data=None,
+		cash_data=None,
+		card_data=None,
+		card_cash_data=None,
+		xmr_number=None,
+		saved_blocks=[],
+		crypto_list=[],
+		xmr_list=[],
+		cash_list=[],
+		card_cash_pairs=[]
+	)
+	
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	await message.answer(text, reply_markup=add_data_type_kb(mode="move", data=data))
+
+
 @admin_router.callback_query(F.data == "admin:cash")
 async def admin_cash(cb: CallbackQuery):
 	"""Показывает список наличных с их адресами столбцов"""
@@ -748,7 +777,7 @@ async def admin_cash(cb: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("add_data:type:"))
 async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора типа данных в командах /add и /rate"""
+	"""Обработчик выбора типа данных в командах /add, /rate и /move"""
 	parts = cb.data.split(":")
 	data_type = parts[2]  # crypto, cash, card
 	
@@ -871,7 +900,7 @@ async def add_data_back(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data.startswith("add_data:back:") & F.data.contains(":group:"))
 async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора группы карт в командах /add и /rate"""
+	"""Обработчик выбора группы карт в командах /add, /rate и /move"""
 	# Формат: add_data:back:{mode}:group:{group_id}
 	parts = cb.data.split(":")
 	mode = parts[2]
@@ -901,7 +930,7 @@ async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data.startswith("crypto:select:"))
 async def add_data_select_crypto(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора криптовалюты в командах /add и /rate"""
+	"""Обработчик выбора криптовалюты в командах /add, /rate и /move"""
 	currency = cb.data.split(":")[-1]
 	data = await state.get_data()
 	mode = data.get("mode", "add")
@@ -1142,7 +1171,7 @@ async def add_data_selecting_type_message(message: Message, state: FSMContext):
 
 @admin_router.callback_query(AddDataStates.selecting_card, F.data.startswith("card:view:"))
 async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора карты в командах /add и /rate"""
+	"""Обработчик выбора карты в командах /add, /rate и /move"""
 	card_id = int(cb.data.split(":")[-1])
 	db = get_db()
 	card = await db.get_card_by_id(card_id)
@@ -1410,7 +1439,14 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				card_cash_pairs,
 				settings.google_sheet_name
 			)
-		else:
+		elif mode == "move":
+			# Для режима move получаем настройки из БД
+			db = get_db()
+			move_start_row_str = await db.get_google_sheets_setting("move_start_row", "375")
+			move_max_row_str = await db.get_google_sheets_setting("move_max_row", "406")
+			move_start_row = int(move_start_row_str) if move_start_row_str else 375
+			move_max_row = int(move_max_row_str) if move_max_row_str else 406
+			
 			result = await write_all_to_google_sheet_one_row(
 				settings.google_sheet_id,
 				settings.google_credentials_path,
@@ -1418,7 +1454,28 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				xmr_list,
 				cash_list,
 				card_cash_pairs,
-				settings.google_sheet_name
+				settings.google_sheet_name,
+				start_row=move_start_row,
+				max_row=move_max_row
+			)
+		else:
+			# Для режима add получаем настройки из БД
+			db = get_db()
+			add_start_row_str = await db.get_google_sheets_setting("start_row", "5")
+			add_max_row_str = await db.get_google_sheets_setting("add_max_row", "374")
+			add_start_row = int(add_start_row_str) if add_start_row_str else 5
+			add_max_row = int(add_max_row_str) if add_max_row_str else 374
+			
+			result = await write_all_to_google_sheet_one_row(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				crypto_list,
+				xmr_list,
+				cash_list,
+				card_cash_pairs,
+				settings.google_sheet_name,
+				start_row=add_start_row,
+				max_row=add_max_row
 			)
 		
 		if result.get("success"):
@@ -1433,7 +1490,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			report_lines = [f"📊 Отчет о записи данных ({current_date}):\n"]
 			
-			if mode == "add" and row:
+			if mode in ["add", "move"] and row:
 				report_lines.append(f"📍 Строка: {row}\n")
 			
 			if written_cells:
@@ -1485,8 +1542,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			profits = {}
 			profit_cell_addresses = []
 			
-			if mode == "add" and row:
-				# В режиме /add все данные в одной строке
+			if mode in ["add", "move"] and row:
+				# В режимах /add и /move все данные в одной строке
 				cell_address = f"{profit_column}{row}"
 				profit_cell_addresses.append(cell_address)
 			elif mode == "rate" and column_rows:
@@ -1520,6 +1577,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])
+			error_message = result.get("message")
+			if error_message:
+				report_lines.append(f"\n❌ Ошибка: {error_message}")
 			if failed_writes:
 				report_lines.append("\n❌ Не записано:")
 				for failed in failed_writes:
