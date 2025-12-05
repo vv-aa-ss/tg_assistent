@@ -5,7 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter, Command
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from typing import Any, Awaitable, Callable, Dict, List, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
 import re
@@ -509,12 +509,14 @@ async def cmd_admin(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		logger.debug(f"/admin ignored: user {message.from_user.id} is not admin")
 		return
+	# Очищаем предыдущее состояние перед показом меню
+	await state.clear()
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
 
 
 
 
-@admin_router.message(F.text == "/del")
+@admin_router.message(Command("del"))
 async def cmd_del(message: Message, state: FSMContext):
 	"""Команда для удаления последней добавленной строки из Google Sheets"""
 	logger.info(f"🔴 ОБРАБОТЧИК cmd_del ВЫЗВАН! message_id={message.message_id}, user_id={message.from_user.id if message.from_user else None}")
@@ -527,6 +529,9 @@ async def cmd_del(message: Message, state: FSMContext):
 		return
 	
 	logger.info(f"✅ /del обрабатывается для админа {message.from_user.id}")
+	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	
 	# Получаем настройки Google Sheets
 	from app.config import get_settings
@@ -570,7 +575,8 @@ async def delete_second_confirmation_yes(cb: CallbackQuery, state: FSMContext):
 	try:
 		result = await delete_last_row_from_google_sheet(
 			settings.google_sheet_id,
-			settings.google_credentials_path
+			settings.google_credentials_path,
+			settings.google_sheet_name
 		)
 		
 		if result.get("success"):
@@ -694,7 +700,7 @@ def format_add_data_text(data: dict) -> str:
 	return text
 
 
-@admin_router.message(F.text == "/add")
+@admin_router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
 	"""Команда для вызова меню добавления данных в таблицу (режим add)"""
 	admin_ids = get_admin_ids()
@@ -702,6 +708,8 @@ async def cmd_add(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	await state.set_state(AddDataStates.selecting_type)
 	await state.update_data(
 		mode="add",
@@ -731,6 +739,8 @@ async def cmd_rate(message: Message, state: FSMContext):
 	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
 		return
 	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
 	await state.set_state(AddDataStates.selecting_type)
 	await state.update_data(
 		mode="rate",
@@ -807,7 +817,7 @@ async def admin_cash(cb: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("add_data:type:"))
 async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора типа данных в командах /add и /rate"""
+	"""Обработчик выбора типа данных в командах /add, /rate и /move"""
 	parts = cb.data.split(":")
 	data_type = parts[2]  # crypto, cash, card
 	
@@ -940,7 +950,7 @@ async def add_data_back(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data.startswith("add_data:back:") & F.data.contains(":group:"))
 async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора группы карт в командах /add и /rate"""
+	"""Обработчик выбора группы карт в командах /add, /rate и /move"""
 	# Формат: add_data:back:{mode}:group:{group_id}
 	parts = cb.data.split(":")
 	mode = parts[2]
@@ -974,7 +984,7 @@ async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
 
 @admin_router.callback_query(F.data.startswith("crypto:select:"))
 async def add_data_select_crypto(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора криптовалюты в командах /add и /rate"""
+	"""Обработчик выбора криптовалюты в командах /add, /rate и /move"""
 	currency = cb.data.split(":")[-1]
 	data = await state.get_data()
 	mode = data.get("mode", "add")
@@ -1018,6 +1028,10 @@ async def add_data_select_xmr(cb: CallbackQuery, state: FSMContext):
 @admin_router.message(AddDataStates.entering_crypto)
 async def add_data_enter_crypto(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы криптовалюты"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		usd_amount = float(message.text.replace(",", "."))
 		
@@ -1099,6 +1113,10 @@ async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
 @admin_router.message(AddDataStates.entering_card_cash)
 async def add_data_enter_card_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных для карты"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		amount = int(float(message.text.replace(",", ".")))
 		
@@ -1157,6 +1175,10 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 @admin_router.message(AddDataStates.entering_cash)
 async def add_data_enter_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных (без карты)"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	try:
 		amount = int(float(message.text.replace(",", ".")))
 		
@@ -1217,6 +1239,10 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 @admin_router.message(AddDataStates.selecting_type, ~F.text.startswith("/"))
 async def add_data_selecting_type_message(message: Message, state: FSMContext):
 	"""Обработчик текстовых сообщений в состоянии selecting_type - игнорируем, показываем подсказку"""
+	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
+	if message.text and message.text.startswith("/"):
+		return
+	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
 	from app.keyboards import add_data_type_kb
@@ -1226,7 +1252,7 @@ async def add_data_selecting_type_message(message: Message, state: FSMContext):
 
 @admin_router.callback_query(AddDataStates.selecting_card, F.data.startswith("card:view:"))
 async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
-	"""Обработчик выбора карты в командах /add и /rate"""
+	"""Обработчик выбора карты в командах /add, /rate и /move"""
 	card_id = int(cb.data.split(":")[-1])
 	db = get_db()
 	card = await db.get_card_by_id(card_id)
@@ -1584,9 +1610,17 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				crypto_list,
 				xmr_list,
 				cash_list,
-				card_cash_pairs
+				card_cash_pairs,
+				settings.google_sheet_name
 			)
-		else:
+		elif mode == "move":
+			# Для режима move получаем настройки из БД
+			db = get_db()
+			move_start_row_str = await db.get_google_sheets_setting("move_start_row", "375")
+			move_max_row_str = await db.get_google_sheets_setting("move_max_row", "406")
+			move_start_row = int(move_start_row_str) if move_start_row_str else 375
+			move_max_row = int(move_max_row_str) if move_max_row_str else 406
+			
 			result = await write_all_to_google_sheet_one_row(
 				settings.google_sheet_id,
 				settings.google_credentials_path,
@@ -1596,10 +1630,102 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				card_cash_pairs,
 				mode=mode
 			)
+		else:
+			# Для режима add определяем диапазон строк по дню недели из БД
+			current_date = datetime.now()
+			weekday = current_date.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
+			
+			# Названия дней недели
+			day_names = {
+				0: "Понедельник",
+				1: "Вторник",
+				2: "Среда",
+				3: "Четверг",
+				4: "Пятница",
+				5: "Суббота",
+				6: "Воскресенье"
+			}
+			
+			# Ключи настроек для каждого дня недели
+			day_setting_keys = {
+				0: ("add_monday_start", "add_monday_max"),    # Понедельник
+				1: ("add_tuesday_start", "add_tuesday_max"),  # Вторник
+				2: ("add_wednesday_start", "add_wednesday_max"), # Среда
+				3: ("add_thursday_start", "add_thursday_max"), # Четверг
+				4: ("add_friday_start", "add_friday_max"),    # Пятница
+				5: ("add_saturday_start", "add_saturday_max"), # Суббота
+				6: ("add_sunday_start", "add_sunday_max")     # Воскресенье
+			}
+			
+			# Значения по умолчанию (на случай, если настройки не найдены)
+			default_ranges = {
+				0: (5, 54),    # Понедельник
+				1: (55, 104),  # Вторник
+				2: (105, 154), # Среда
+				3: (155, 204), # Четверг
+				4: (205, 254), # Пятница
+				5: (255, 304), # Суббота
+				6: (305, 364)  # Воскресенье
+			}
+			
+			# Получаем настройки из БД
+			db = get_db()
+			start_key, max_key = day_setting_keys.get(weekday, ("add_monday_start", "add_monday_max"))
+			default_start, default_max = default_ranges.get(weekday, (5, 54))
+			
+			start_row_str = await db.get_google_sheets_setting(start_key, str(default_start))
+			max_row_str = await db.get_google_sheets_setting(max_key, str(default_max))
+			
+			try:
+				add_start_row = int(start_row_str) if start_row_str else default_start
+				add_max_row = int(max_row_str) if max_row_str else default_max
+			except (ValueError, TypeError):
+				add_start_row, add_max_row = default_start, default_max
+				logger.warning(f"Неверные значения для дня недели {weekday}, используем значения по умолчанию")
+			
+			day_name = day_names.get(weekday, "Понедельник")
+			
+			logger.info(f"📍 Режим /add: {day_name}, диапазон строк {add_start_row}-{add_max_row}")
+			
+			result = await write_all_to_google_sheet_one_row(
+				settings.google_sheet_id,
+				settings.google_credentials_path,
+				crypto_list,
+				xmr_list,
+				cash_list,
+				card_cash_pairs,
+				settings.google_sheet_name,
+				start_row=add_start_row,
+				max_row=add_max_row
+			)
+			
+			# Проверяем, есть ли свободная строка в диапазоне
+			if not result.get("success"):
+				error_message = result.get("message", "Неизвестная ошибка")
+				if "Нет свободных строк" in error_message or "свободных строк" in error_message.lower():
+					# Нет места в диапазоне для текущего дня недели
+					try:
+						await cb.message.edit_text(
+							f"⚠️ Нет свободных строк в диапазоне для {day_name} (строки {add_start_row}-{add_max_row}).\n\n"
+							f"Пожалуйста, освободите место в таблице или попробуйте позже.",
+							reply_markup=admin_menu_kb()
+						)
+					except Exception:
+						# Если не удалось отредактировать сообщение, отправляем новое
+						await cb.message.answer(
+							f"⚠️ Нет свободных строк в диапазоне для {day_name} (строки {add_start_row}-{add_max_row}).\n\n"
+							f"Пожалуйста, освободите место в таблице или попробуйте позже.",
+							reply_markup=admin_menu_kb()
+						)
+					await state.clear()
+					try:
+						await cb.answer()
+					except Exception:
+						pass
+					return
 		
 		if result.get("success"):
 			# Формируем отчет о записи
-			from datetime import datetime
 			from app.google_sheets import read_card_balance, read_profit
 			current_date = datetime.now().strftime("%d.%m.%Y")
 			
@@ -1665,7 +1791,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				balances = await read_card_balances_batch(
 					settings.google_sheet_id,
 					settings.google_credentials_path,
-					balance_cell_addresses
+					balance_cell_addresses,
+					settings.google_sheet_name
 				)
 				for cell_address, (card_name, column, card_id) in card_mapping.items():
 					balance = balances.get(cell_address)
@@ -1681,8 +1808,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			profits = {}
 			profit_cell_addresses = []
 			
-			if mode == "add" and row:
-				# В режиме /add все данные в одной строке
+			if mode in ["add", "move"] and row:
+				# В режимах /add и /move все данные в одной строке
 				cell_address = f"{profit_column}{row}"
 				profit_cell_addresses.append(cell_address)
 			elif mode == "rate" and column_rows:
@@ -1696,7 +1823,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				profits_dict = await read_profits_batch(
 					settings.google_sheet_id,
 					settings.google_credentials_path,
-					profit_cell_addresses
+					profit_cell_addresses,
+					settings.google_sheet_name
 				)
 				profits = profits_dict
 			
@@ -1796,6 +1924,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])
+			error_message = result.get("message")
+			if error_message:
+				report_lines.append(f"\n❌ Ошибка: {error_message}")
 			if failed_writes:
 				report_lines.append("\n❌ Не записано:")
 				for failed in failed_writes:
@@ -1807,6 +1938,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			await state.clear()
 			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
 		else:
+			await state.clear()
 			try:
 				await cb.answer("❌ Ошибка записи в Google Sheets", show_alert=True)
 			except Exception:
@@ -1814,6 +1946,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				await cb.message.edit_text("❌ Ошибка записи в Google Sheets", reply_markup=admin_menu_kb())
 	except Exception as e:
 		logger.exception(f"Ошибка записи в Google Sheets: {e}")
+		await state.clear()
 		try:
 			await cb.answer("❌ Произошла ошибка при записи", show_alert=True)
 		except Exception:
@@ -3218,7 +3351,8 @@ async def _update_crypto_values_in_stats(
 	sheet_id: str,
 	credentials_path: str,
 	crypto_columns: List[Dict[str, str]],
-	base_lines: List[str]
+	base_lines: List[str],
+	sheet_name: Optional[str] = None
 ):
 	"""
 	Обновляет значения криптовалют в сообщении статистики после их загрузки.
@@ -3231,7 +3365,8 @@ async def _update_crypto_values_in_stats(
 		crypto_values = await get_crypto_values_from_row_4(
 			sheet_id,
 			credentials_path,
-			crypto_columns
+			crypto_columns,
+			sheet_name
 		)
 		
 		logger.info(f"Получены значения криптовалют: {crypto_values}")
@@ -3901,10 +4036,13 @@ async def user_bind_card(cb: CallbackQuery):
 # Handle any message and process forwarding logic for admins
 # Важно: этот обработчик должен быть ПОСЛЕ обработчика editing_crypto_amount
 # чтобы не перехватывать сообщения в состоянии редактирования
+# ВАЖНО: Используем фильтр чтобы НЕ перехватывать команды
 @admin_router.message()
 async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMContext):
 	# Пропускаем команды - они обрабатываются отдельными обработчиками
+	# Проверяем это ПЕРВЫМ делом, до любых других проверок
 	if message.text and message.text.startswith("/"):
+		logger.debug(f"⚠️ Универсальный обработчик: пропускаем команду '{message.text}'")
 		return
 	
 	# Проверяем текущее состояние FSM - если пользователь находится в процессе /add или других операциях,
@@ -4439,9 +4577,12 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			card_id,
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
-		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id}). Сообщение не отправлено (нет tg_id)")
+		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id})")
 		
+		# Отправляем все реквизиты админу (даже для скрытого пользователя)
 		await state.clear()
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
 	
 	await cb.answer()
 

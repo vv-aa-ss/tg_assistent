@@ -29,6 +29,30 @@ def _get_google_sheets_client(credentials_path: str) -> Optional[gspread.Client]
 		return None
 
 
+def _get_worksheet(spreadsheet: gspread.Spreadsheet, sheet_name: Optional[str] = None) -> gspread.Worksheet:
+	"""
+	Получает лист из таблицы по имени или первый лист по умолчанию.
+	
+	Args:
+		spreadsheet: Объект таблицы Google Sheets
+		sheet_name: Название листа (если None или пустое, используется первый лист)
+	
+	Returns:
+		Объект листа Google Sheets
+	"""
+	if sheet_name and sheet_name.strip():
+		try:
+			worksheet = spreadsheet.worksheet(sheet_name.strip())
+			logger.debug(f"✅ Используется лист '{sheet_name}'")
+			return worksheet
+		except gspread.exceptions.WorksheetNotFound:
+			logger.warning(f"⚠️ Лист '{sheet_name}' не найден, используется первый лист")
+			return spreadsheet.sheet1
+	else:
+		logger.debug("✅ Используется первый лист (по умолчанию)")
+		return spreadsheet.sheet1
+
+
 async def _get_btc_from_binance() -> Optional[float]:
 	"""Получает курс BTC/USDT с Binance API"""
 	try:
@@ -508,14 +532,26 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 	Находит первую строку с 0 в указанном столбце, начиная с start_row.
 	Возвращает номер строки.
 	Использует batch чтение для оптимизации (читает по 50 строк за раз).
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		column: Буква столбца (например, "BC")
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
 	"""
 	try:
 		batch_size = 50
 		row = start_row
 		
-		while row <= start_row + 1000:
+		# Определяем максимальную строку для поиска
+		if max_row is not None:
+			search_limit = max_row
+		else:
+			search_limit = start_row + 1000
+		
+		while row <= search_limit:
 			# Читаем batch строк за один запрос
-			end_row = min(row + batch_size - 1, start_row + 1000)
+			end_row = min(row + batch_size - 1, search_limit)
 			range_str = f"{column}{row}:{column}{end_row}"
 			
 			try:
@@ -554,8 +590,8 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 					return row
 				row += 1
 		
-		logger.warning(f"Не найдена свободная строка в столбце {column}, начиная с {start_row}")
-		return start_row + 1000
+		logger.warning(f"Не найдена свободная строка в столбце {column}, начиная с {start_row} до {search_limit}")
+		return search_limit + 1
 		
 	except Exception as e:
 		logger.exception(f"Ошибка поиска свободной строки: {e}")
@@ -616,9 +652,8 @@ def _write_to_google_sheet_sync(
 	card_data: Optional[Dict],
 	btc_price: Optional[float],
 	ltc_price: Optional[float],
-	btc_column: Optional[str] = None,
-	ltc_column: Optional[str] = None,
-	usdt_column: Optional[str] = None
+	crypto_column: Optional[str] = None,
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных в Google Sheet.
@@ -652,7 +687,7 @@ def _write_to_google_sheet_sync(
 		# Открываем таблицу
 		try:
 			spreadsheet = client.open_by_key(sheet_id)
-			worksheet = spreadsheet.sheet1  # Используем первый лист
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
 		except PermissionError as e:
 			logger.error(f"Ошибка доступа к таблице. Убедитесь, что сервисный аккаунт {service_account_email} добавлен в список пользователей с доступом к таблице.")
 			raise
@@ -675,19 +710,11 @@ def _write_to_google_sheet_sync(
 			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
 				
-				if crypto_currency == "BTC" and btc_column:
+				if crypto_column:
 					# Записываем USD в столбец из базы данных (метод update требует список списков)
-					worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
-				elif crypto_currency == "LTC" and ltc_column:
-					# Записываем USD в столбец из базы данных (метод update требует список списков)
-					worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
-				elif crypto_currency == "USDT" and usdt_column:
-					# Записываем USD в столбец из базы данных (метод update требует список списков)
-					worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
-				elif crypto_currency in ["BTC", "LTC", "USDT"]:
+					worksheet.update(f"{crypto_column}{empty_row}", [[usd_amount_rounded]])
+					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {crypto_column}{empty_row} ({crypto_currency})")
+				else:
 					logger.warning(f"⚠️ Не найден адрес столбца для криптовалюты {crypto_currency}")
 			else:
 				logger.warning(f"⚠️ USD сумма равна 0 для криптовалюты {crypto_currency}")
@@ -720,7 +747,8 @@ async def write_to_google_sheet(
 	credentials_path: str,
 	crypto_data: Optional[Dict],
 	cash_data: Optional[Dict],
-	card_data: Optional[Dict]
+	card_data: Optional[Dict],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Асинхронная функция для записи данных в Google Sheet.
@@ -760,18 +788,16 @@ async def write_to_google_sheet(
 				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_name='{card_name}', user_name='{user_name}'")
 		
 		# Получаем адреса столбцов для криптовалют из базы данных
-		btc_column = None
-		ltc_column = None
-		usdt_column = None
+		crypto_column = None
 		if crypto_data:
 			db = get_db()
 			crypto_currency = crypto_data.get("currency")
-			if crypto_currency == "BTC":
-				btc_column = await db.get_crypto_column("BTC")
-			elif crypto_currency == "LTC":
-				ltc_column = await db.get_crypto_column("LTC")
-			elif crypto_currency == "USDT":
-				usdt_column = await db.get_crypto_column("USDT")
+			if crypto_currency:
+				crypto_column = await db.get_crypto_column(crypto_currency)
+				if crypto_column:
+					logger.info(f"✅ Получен столбец для криптовалюты '{crypto_currency}': {crypto_column}")
+				else:
+					logger.warning(f"⚠️ Не найден столбец для криптовалюты '{crypto_currency}'")
 		
 		# Выполняем синхронную запись в отдельном потоке
 		return await asyncio.to_thread(
@@ -783,9 +809,8 @@ async def write_to_google_sheet(
 			card_data,
 			btc_price,
 			ltc_price,
-			btc_column,
-			ltc_column,
-			usdt_column
+			crypto_column,
+			sheet_name
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи в Google Sheet: {e}")
@@ -822,7 +847,8 @@ async def write_xmr_to_google_sheet(
 	crypto_data: Optional[Dict],
 	cash_data: Optional[Dict],
 	card_data: Optional[Dict],
-	xmr_number: int
+	xmr_number: int,
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Асинхронная функция для записи данных XMR в Google Sheet.
@@ -871,7 +897,8 @@ async def write_xmr_to_google_sheet(
 			card_data,
 			xmr_number,
 			usd_column,
-			None  # xmr_price больше не нужен
+			None,  # xmr_price больше не нужен
+			sheet_name
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи XMR в Google Sheet: {e}")
@@ -886,7 +913,8 @@ def _write_xmr_to_google_sheet_sync(
 	card_data: Optional[Dict],
 	xmr_number: int,
 	usd_column: str,
-	xmr_price: Optional[float]  # Оставлено для обратной совместимости, но не используется
+	xmr_price: Optional[float],  # Оставлено для обратной совместимости, но не используется
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных XMR в Google Sheet.
@@ -915,7 +943,7 @@ def _write_xmr_to_google_sheet_sync(
 		# Открываем таблицу
 		try:
 			spreadsheet = client.open_by_key(sheet_id)
-			worksheet = spreadsheet.sheet1
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
 		except PermissionError as e:
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
@@ -1122,7 +1150,7 @@ def _write_all_to_google_sheet_one_row_sync(
 		# Открываем таблицу
 		try:
 			spreadsheet = client.open_by_key(sheet_id)
-			worksheet = spreadsheet.sheet1
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
 		except PermissionError as e:
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
@@ -1244,7 +1272,8 @@ def _write_all_to_google_sheet_one_row_sync(
 
 async def delete_last_row_from_google_sheet(
 	sheet_id: str,
-	credentials_path: str
+	credentials_path: str,
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Удаляет последнюю заполненную строку из Google Sheets.
@@ -1254,11 +1283,39 @@ async def delete_last_row_from_google_sheet(
 	Args:
 		sheet_id: ID Google Sheet
 		credentials_path: Путь к файлу с учетными данными
+		sheet_name: Название листа (опционально)
 		
 	Returns:
 		Словарь с результатами: {"success": bool, "deleted_row": int | None, "message": str}
 	"""
 	try:
+		# Определяем текущий день недели
+		from datetime import datetime
+		current_date = datetime.now()
+		weekday = current_date.weekday()  # 0=Monday, 1=Tuesday, ..., 6=Sunday
+		
+		# Ключи настроек для каждого дня недели
+		day_setting_keys = {
+			0: ("add_monday_start", "add_monday_max"),    # Понедельник
+			1: ("add_tuesday_start", "add_tuesday_max"),  # Вторник
+			2: ("add_wednesday_start", "add_wednesday_max"), # Среда
+			3: ("add_thursday_start", "add_thursday_max"), # Четверг
+			4: ("add_friday_start", "add_friday_max"),    # Пятница
+			5: ("add_saturday_start", "add_saturday_max"), # Суббота
+			6: ("add_sunday_start", "add_sunday_max")     # Воскресенье
+		}
+		
+		# Значения по умолчанию (на случай, если настройки не найдены)
+		default_ranges = {
+			0: (5, 54),    # Понедельник
+			1: (55, 104),  # Вторник
+			2: (105, 154), # Среда
+			3: (155, 204), # Четверг
+			4: (205, 254), # Пятница
+			5: (255, 304), # Суббота
+			6: (305, 364)  # Воскресенье
+		}
+		
 		# Получаем настройки из базы данных
 		db = get_db()
 		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
@@ -1417,7 +1474,7 @@ def _delete_last_row_from_google_sheet_sync(
 		# Открываем таблицу
 		try:
 			spreadsheet = client.open_by_key(sheet_id)
-			worksheet = spreadsheet.sheet1
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
 		except PermissionError as e:
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
@@ -1466,7 +1523,8 @@ async def write_to_google_sheet_rate_mode(
 	crypto_list: list,  # [{"currency": "BTC", "usd_amount": 100}, ...]
 	xmr_list: list,  # [{"xmr_number": 1, "usd_amount": 50}, ...]
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
-	card_cash_pairs: list  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
+	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Записывает данные в режиме rate: каждая запись идет в первую пустую ячейку соответствующего столбца,
@@ -1556,10 +1614,11 @@ async def write_to_google_sheet_rate_mode(
 			crypto_columns,
 			xmr_columns,
 			rate_max_row,
-			rate_start_row
+			rate_start_row,
+			sheet_name
 		)
 		
-		# В режиме rate всегда начинаем с 348 строки, не сохраняем последние использованные строки
+		# В режиме rate всегда начинаем с rate_start_row (по умолчанию 407), не сохраняем последние использованные строки
 		# (убрано сохранение rate_last_row_{column} для каждого столбца)
 		
 		return result
@@ -1577,8 +1636,9 @@ def _write_to_google_sheet_rate_mode_sync(
 	card_cash_pairs: list,
 	crypto_columns: Dict[str, Optional[str]],  # {currency: column}
 	xmr_columns: Dict[int, Optional[str]],
-	rate_max_row: int = 355,
-	start_row: int = 348
+	rate_max_row: int = 419,
+	start_row: int = 407,
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи данных в режиме rate.
@@ -1595,7 +1655,7 @@ def _write_to_google_sheet_rate_mode_sync(
 		# Открываем таблицу
 		try:
 			spreadsheet = client.open_by_key(sheet_id)
-			worksheet = spreadsheet.sheet1
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
 		except PermissionError as e:
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
@@ -1739,7 +1799,8 @@ def _write_to_google_sheet_rate_mode_sync(
 def _get_crypto_values_from_row_4_sync(
 	sheet_id: str,
 	credentials_path: str,
-	crypto_columns: List[Dict[str, str]]
+	crypto_columns: List[Dict[str, str]],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Синхронная функция для чтения значений криптовалют из строки 4 Google Sheets.
@@ -1768,7 +1829,7 @@ def _get_crypto_values_from_row_4_sync(
 		
 		# Открываем таблицу
 		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = spreadsheet.sheet1
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		# Собираем адреса ячеек для batch чтения
 		cell_addresses = []
@@ -1837,7 +1898,8 @@ def _get_crypto_values_from_row_4_sync(
 async def get_crypto_values_from_row_4(
 	sheet_id: str,
 	credentials_path: str,
-	crypto_columns: List[Dict[str, str]]
+	crypto_columns: List[Dict[str, str]],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Читает значения криптовалют из строки 4 Google Sheets.
@@ -1856,7 +1918,8 @@ async def get_crypto_values_from_row_4(
 		_get_crypto_values_from_row_4_sync,
 		sheet_id,
 		credentials_path,
-		crypto_columns
+		crypto_columns,
+		sheet_name
 	)
 
 
@@ -1864,7 +1927,8 @@ def _read_card_balance_sync(
 	sheet_id: str,
 	credentials_path: str,
 	column: str,
-	balance_row: int = 4
+	balance_row: int = 4,
+	sheet_name: Optional[str] = None
 ) -> Optional[str]:
 	"""
 	Синхронная функция для чтения баланса карты из указанной строки.
@@ -1886,7 +1950,7 @@ def _read_card_balance_sync(
 			return None
 		
 		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = spreadsheet.sheet1
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		logger.info(f"🔍 Чтение баланса карты из ячейки {cell_address}")
 		
@@ -1907,7 +1971,8 @@ async def read_card_balance(
 	sheet_id: str,
 	credentials_path: str,
 	column: str,
-	balance_row: int = 4
+	balance_row: int = 4,
+	sheet_name: Optional[str] = None
 ) -> Optional[str]:
 	"""
 	Читает баланс карты из указанной строки.
@@ -1928,14 +1993,16 @@ async def read_card_balance(
 		sheet_id,
 		credentials_path,
 		column,
-		balance_row
+		balance_row,
+		sheet_name
 	)
 
 
 def _read_card_balances_batch_sync(
 	sheet_id: str,
 	credentials_path: str,
-	cell_addresses: List[str]
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Синхронная функция для чтения балансов нескольких карт за один запрос.
@@ -1955,7 +2022,7 @@ def _read_card_balances_batch_sync(
 			return {}
 		
 		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = spreadsheet.sheet1
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		logger.info(f"🔍 Batch чтение балансов из {len(cell_addresses)} ячеек")
 		
@@ -1995,7 +2062,8 @@ def _read_card_balances_batch_sync(
 async def read_card_balances_batch(
 	sheet_id: str,
 	credentials_path: str,
-	cell_addresses: List[str]
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Читает балансы нескольких карт за один запрос.
@@ -2014,7 +2082,8 @@ async def read_card_balances_batch(
 		_read_card_balances_batch_sync,
 		sheet_id,
 		credentials_path,
-		cell_addresses
+		cell_addresses,
+		sheet_name
 	)
 
 
@@ -2022,7 +2091,8 @@ def _read_profit_sync(
 	sheet_id: str,
 	credentials_path: str,
 	row: int,
-	profit_column: str = "BC"
+	profit_column: str = "BC",
+	sheet_name: Optional[str] = None
 ) -> Optional[str]:
 	"""
 	Синхронная функция для чтения профита из указанного столбца.
@@ -2043,7 +2113,7 @@ def _read_profit_sync(
 			return None
 		
 		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = spreadsheet.sheet1
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		cell_address = f"{profit_column}{row}"
 		logger.info(f"🔍 Чтение профита из ячейки {cell_address}")
@@ -2065,7 +2135,8 @@ async def read_profit(
 	sheet_id: str,
 	credentials_path: str,
 	row: int,
-	profit_column: str = "BC"
+	profit_column: str = "BC",
+	sheet_name: Optional[str] = None
 ) -> Optional[str]:
 	"""
 	Читает профит из указанного столбца.
@@ -2086,14 +2157,16 @@ async def read_profit(
 		sheet_id,
 		credentials_path,
 		row,
-		profit_column
+		profit_column,
+		sheet_name
 	)
 
 
 def _read_profits_batch_sync(
 	sheet_id: str,
 	credentials_path: str,
-	cell_addresses: List[str]
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Синхронная функция для чтения профитов из нескольких ячеек за один запрос.
@@ -2113,7 +2186,7 @@ def _read_profits_batch_sync(
 			return {}
 		
 		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = spreadsheet.sheet1
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		logger.info(f"🔍 Batch чтение профитов из {len(cell_addresses)} ячеек")
 		
@@ -2152,7 +2225,8 @@ def _read_profits_batch_sync(
 async def read_profits_batch(
 	sheet_id: str,
 	credentials_path: str,
-	cell_addresses: List[str]
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Optional[str]]:
 	"""
 	Читает профиты из нескольких ячеек за один запрос.
@@ -2171,5 +2245,6 @@ async def read_profits_batch(
 		_read_profits_batch_sync,
 		sheet_id,
 		credentials_path,
-		cell_addresses
+		cell_addresses,
+		sheet_name
 	)

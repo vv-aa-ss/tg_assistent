@@ -1409,7 +1409,13 @@ class Database:
 				"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+				"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 			)
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '348')"
@@ -1460,9 +1466,17 @@ class Database:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
 				)
+			if 'add_max_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+				)
+			if 'rate_start_row' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+				)
 			if 'rate_max_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 				)
 			if 'rate_start_row' not in existing_keys:
 				await self._db.execute(
