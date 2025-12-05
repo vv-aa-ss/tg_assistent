@@ -45,11 +45,26 @@ def cards_groups_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKe
 	return kb.as_markup()
 
 
-def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: str = "admin:cards", group_id: Optional[int] = None) -> InlineKeyboardMarkup:
+def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: str = "admin:cards", group_id: Optional[int] = None, card_groups: Optional[Dict[int, str]] = None) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для списка карт.
+	
+	Args:
+		cards: Список кортежей (card_id, card_name)
+		with_add: Показывать ли кнопку "Добавить карту"
+		back_to: Callback data для кнопки "Назад"
+		group_id: ID группы (для отображения кнопки "Удалить группу")
+		card_groups: Словарь {card_id: group_name} для отображения группы в скобках
+	"""
 	kb = InlineKeyboardBuilder()
 	# Добавляем все кнопки карт
 	for cid, name in cards:
-		kb.button(text=f"💳 {name}", callback_data=f"card:view:{cid}")
+		# Если есть информация о группе, добавляем её в скобках
+		if card_groups and cid in card_groups:
+			group_name = card_groups[cid]
+			kb.button(text=f"💳 {name} ({group_name})", callback_data=f"card:view:{cid}")
+		else:
+			kb.button(text=f"💳 {name}", callback_data=f"card:view:{cid}")
 	
 	# Добавляем остальные кнопки
 	if with_add:
@@ -145,7 +160,7 @@ def cards_select_kb(cards: List[Tuple[int, str]], back_to: str) -> InlineKeyboar
 	return kb.as_markup()
 
 
-def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recent_cards: Optional[List[Tuple[int, str]]] = None, forward_mode: bool = False) -> InlineKeyboardMarkup:
+def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recent_cards: Optional[List[Tuple[int, str]]] = None, forward_mode: bool = False, recent_cards_groups: Optional[Dict[int, str]] = None) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора группы карт.
 	
@@ -154,6 +169,7 @@ def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recen
 		back_to: Callback data для кнопки "Назад"
 		recent_cards: Список кортежей (card_id, card_name) последних используемых карт (максимум 4)
 		forward_mode: Если True, используется callback для пересылки (forward:group:)
+		recent_cards_groups: Словарь {card_id: group_name} для отображения группы последних карт
 	"""
 	kb = InlineKeyboardBuilder()
 	for group in groups:
@@ -181,7 +197,12 @@ def card_groups_select_kb(groups: List[Dict], back_to: str = "admin:back", recen
 	if recent_cards and back_to.startswith("add_data:back:"):
 		# Добавляем только если используется в /add или /rate
 		for card_id, card_name in recent_cards[:4]:  # Ограничиваем до 4 карт
-			kb.button(text=f"💳 {card_name}", callback_data=f"card:view:{card_id}")
+			# Если есть информация о группе, добавляем её в скобках
+			if recent_cards_groups and card_id in recent_cards_groups:
+				group_name = recent_cards_groups[card_id]
+				kb.button(text=f"💳 {card_name} ({group_name})", callback_data=f"card:view:{card_id}")
+			else:
+				kb.button(text=f"💳 {card_name}", callback_data=f"card:view:{card_id}")
 	
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
@@ -377,18 +398,63 @@ def cash_list_kb(cash_columns: List[Dict], back_to: str = "admin:back") -> Inlin
 	Создает клавиатуру для списка наличных с их адресами столбцов.
 	
 	Args:
-		cash_columns: Список словарей с ключами cash_name и column
+		cash_columns: Список словарей с ключами cash_name, column, currency, display_name
 		back_to: Callback data для кнопки "Назад"
 	"""
 	kb = InlineKeyboardBuilder()
 	for cash in cash_columns:
 		cash_name = cash.get("cash_name", "")
 		column = cash.get("column", "")
-		kb.button(text=f"{cash_name} → {column}", callback_data=f"cash:edit:{cash_name}")
+		display_name = cash.get("display_name", "")
+		currency = cash.get("currency", "RUB")
+		# Показываем имя валюты, если оно есть, иначе название
+		display = display_name if display_name else cash_name
+		kb.button(text=f"{display} → {column} ({currency})", callback_data=f"cash:edit:{cash_name}")
 	kb.button(text="➕ Новая", callback_data="cash:new")
 	kb.button(text="🗑️ Удалить", callback_data="cash:delete_list")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
+	return kb.as_markup()
+
+
+def cash_edit_menu_kb(cash_name: str) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для меню редактирования валюты.
+	
+	Args:
+		cash_name: Название валюты
+	"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="📍 Ячейка", callback_data=f"cash:edit_column:{cash_name}")
+	kb.button(text="💵 Имя валюты", callback_data=f"cash:edit_display_name:{cash_name}")
+	kb.button(text="💰 Номинал валюты", callback_data=f"cash:edit_currency:{cash_name}")
+	kb.button(text="⬅️ Назад", callback_data="admin:cash")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def cash_currency_select_kb(cash_name: str, current_currency: str) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора номинала валюты.
+	
+	Args:
+		cash_name: Название валюты
+		current_currency: Текущий номинал валюты
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# Кнопки валют
+	currencies = ["RUB", "BYN", "USD"]
+	for currency in currencies:
+		# Выделяем текущую валюту
+		text = f"✅ {currency}" if currency == current_currency else currency
+		kb.button(text=text, callback_data=f"cash:set_currency:{cash_name}:{currency}")
+	
+	# Кнопка "Назад"
+	kb.button(text="⬅️ Назад", callback_data=f"cash:edit:{cash_name}")
+	
+	# Первый ряд - три валюты, второй ряд - назад
+	kb.adjust(3, 1)
 	return kb.as_markup()
 
 
@@ -414,14 +480,17 @@ def cash_select_kb(cash_columns: List[Dict], mode: str = "add", back_to: str = "
 	Создает клавиатуру для выбора названия наличных в командах /add и /rate.
 	
 	Args:
-		cash_columns: Список словарей с ключами cash_name и column
+		cash_columns: Список словарей с ключами cash_name, column, currency, display_name
 		mode: Режим работы ("add" или "rate")
 		back_to: Callback data для кнопки "Назад"
 	"""
 	kb = InlineKeyboardBuilder()
 	for cash in cash_columns:
 		cash_name = cash.get("cash_name", "")
-		kb.button(text=cash_name, callback_data=f"add_data:cash_select:{cash_name}:{mode}")
+		display_name = cash.get("display_name", "")
+		# Показываем имя валюты, если оно есть, иначе название
+		display = display_name if display_name else cash_name
+		kb.button(text=display, callback_data=f"add_data:cash_select:{cash_name}:{mode}")
 	kb.button(text="⬅️ Назад", callback_data=f"{back_to}:{mode}")
 	kb.adjust(1)
 	return kb.as_markup()

@@ -186,11 +186,30 @@ class CashColumnEditStates(StatesGroup):
 	waiting_column = State()
 	waiting_cash_name = State()
 	waiting_cash_column = State()
+	waiting_cash_display_name = State()
 
 
 class DeleteRowStates(StatesGroup):
 	first_confirmation = State()
 	second_confirmation = State()
+
+
+async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None):
+	"""
+	Безопасно редактирует текст сообщения, игнорируя ошибку "message is not modified".
+	
+	Args:
+		message: Объект сообщения (Message или CallbackQuery.message)
+		text: Текст для установки
+		reply_markup: Клавиатура (опционально)
+		parse_mode: Режим парсинга (опционально)
+	"""
+	try:
+		await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+	except Exception as e:
+		# Игнорируем ошибку "message is not modified", если содержимое не изменилось
+		if "message is not modified" not in str(e).lower():
+			raise
 
 
 def is_admin(user_id: int | None, username: str | None, admin_ids: list[int], admin_usernames: list[str] = None) -> bool:
@@ -584,8 +603,16 @@ async def admin_back(cb: CallbackQuery, state: FSMContext):
 
 
 def format_add_data_text(data: dict) -> str:
-	"""Форматирует текст с выбранными данными для меню /add"""
-	text = "📋 Добавление данных\n\n"
+	"""Форматирует текст с выбранными данными для меню /add, /rate, /move"""
+	mode = data.get("mode", "add")
+	
+	# Выбираем заголовок в зависимости от режима
+	if mode == "move":
+		text = "📋 Перемещение средств\n\n"
+	elif mode == "rate":
+		text = "📋 Расход\n\n"
+	else:
+		text = "📋 Добавление операции\n\n"
 	
 	# Показываем все сохраненные блоки данных
 	selected_items = []
@@ -725,6 +752,35 @@ async def cmd_rate(message: Message, state: FSMContext):
 	await message.answer(text, reply_markup=add_data_type_kb(mode="rate", data=data))
 
 
+@admin_router.message(Command("move"))
+async def cmd_move(message: Message, state: FSMContext):
+	"""Команда для вызова меню перемещения средств (режим move)"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	await state.set_state(AddDataStates.selecting_type)
+	await state.update_data(
+		mode="move",
+		crypto_data=None,
+		cash_data=None,
+		card_data=None,
+		card_cash_data=None,
+		xmr_number=None,
+		saved_blocks=[],
+		crypto_list=[],
+		xmr_list=[],
+		cash_list=[],
+		card_cash_pairs=[]
+	)
+	
+	from app.keyboards import add_data_type_kb
+	data = await state.get_data()
+	text = format_add_data_text(data)
+	await message.answer(text, reply_markup=add_data_type_kb(mode="move", data=data))
+
+
 @admin_router.callback_query(F.data == "admin:cash")
 async def admin_cash(cb: CallbackQuery):
 	"""Показывает список наличных с их адресами столбцов"""
@@ -739,8 +795,12 @@ async def admin_cash(cb: CallbackQuery):
 		for cash in cash_columns:
 			cash_name = cash.get("cash_name", "")
 			column = cash.get("column", "")
-			text += f"{cash_name} → {column}\n"
+			display_name = cash.get("display_name", "")
+			currency = cash.get("currency", "RUB")
+			display = display_name if display_name else cash_name
+			text += f"{display} → {column} ({currency})\n"
 	
+	from app.keyboards import cash_list_kb
 	await cb.message.edit_text(text, reply_markup=cash_list_kb(cash_columns))
 	await cb.answer()
 
@@ -835,7 +895,8 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 		
 		from app.keyboards import cash_select_kb
 		await state.set_state(AddDataStates.selecting_cash_name)
-		await cb.message.edit_text(
+		await safe_edit_text(
+			cb.message,
 			"💵 Выберите название наличных:",
 			reply_markup=cash_select_kb(cash_columns, mode=mode, back_to=f"add_data:back")
 		)
@@ -847,10 +908,19 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 		# Получаем последние используемые карты для текущего админа
 		admin_id = cb.from_user.id
 		recent_cards = await db.get_recent_cards_by_admin(admin_id, limit=4)
+		# Получаем информацию о группах для последних карт
+		recent_cards_groups = {}
+		for card_id, _ in recent_cards:
+			card = await db.get_card_by_id(card_id)
+			if card and card.get("group_id"):
+				group = await db.get_card_group(card.get("group_id"))
+				if group:
+					recent_cards_groups[card_id] = group.get("name", "")
+		
 		from app.keyboards import card_groups_select_kb
 		await state.set_state(AddDataStates.selecting_card)
 		text = "💳 Выберите группу карт:" if groups else "💳 Групп пока нет. Выберите карты без группы:"
-		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"add_data:back:{mode}", recent_cards=recent_cards))
+		await cb.message.edit_text(text, reply_markup=card_groups_select_kb(groups, back_to=f"add_data:back:{mode}", recent_cards=recent_cards, recent_cards_groups=recent_cards_groups))
 		await cb.answer()
 
 
@@ -883,9 +953,13 @@ async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
 		group = await db.get_card_group(group_id)
 		group_name = group.get("name", "Группа") if group else "Группа"
 		text = f"💳 Карты группы '{group_name}':"
+		# Создаем словарь с группами для всех карт (все в одной группе)
+		card_groups = {c[0]: group_name for c in cards}
 	else:
 		cards = await db.get_cards_without_group()
 		text = "💳 Карты вне групп:"
+		# Для карт без группы не добавляем информацию о группе
+		card_groups = {}
 	
 	if not cards:
 		await cb.answer("В этой группе нет карт", show_alert=True)
@@ -894,7 +968,7 @@ async def add_data_select_group(cb: CallbackQuery, state: FSMContext):
 	cards_list = [(c[0], c[1]) for c in cards]
 	from app.keyboards import cards_list_kb
 	await state.set_state(AddDataStates.selecting_card)
-	await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, with_add=False, back_to=f"add_data:back:{mode}"))
+	await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, with_add=False, back_to=f"add_data:back:{mode}", card_groups=card_groups))
 	await cb.answer()
 
 
@@ -1005,12 +1079,18 @@ async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
 	cash_name = parts[2]
 	mode = parts[3]
 	
+	# Получаем информацию о валюте из БД
+	db = get_db()
+	cash_info = await db.get_cash_column(cash_name)
+	display_name = cash_info.get("display_name", "") if cash_info else ""
+	display = display_name if display_name else cash_name
+	
 	# Сохраняем название наличных
 	await state.update_data(cash_name=cash_name)
 	await state.set_state(AddDataStates.entering_cash)
 	
 	await cb.message.edit_text(
-		f"💵 Введите сумму наличных для '{cash_name}' (число):",
+		f"💵 Введите сумму наличных для '{display}' (число):",
 		reply_markup=simple_back_kb(f"add_data:back:{mode}")
 	)
 	await cb.answer()
@@ -1084,10 +1164,15 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 		cash_name = data.get("cash_name", "Наличные")
 		editing_block_idx = data.get("editing_block_idx")
 		
+		# Получаем валюту из БД
+		db = get_db()
+		cash_info = await db.get_cash_column(cash_name)
+		currency = cash_info.get("currency", "RUB") if cash_info else "RUB"
+		
 		cash_data = {
-			"currency": "RUB",
+			"currency": currency,
 			"value": amount,
-			"display": f"{amount} RUB",
+			"display": f"{amount} {currency}",
 			"cash_name": cash_name  # Сохраняем название для режима rate
 		}
 		
@@ -1129,7 +1214,7 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
 
 
-@admin_router.message(AddDataStates.selecting_type)
+@admin_router.message(AddDataStates.selecting_type, ~F.text.startswith("/"))
 async def add_data_selecting_type_message(message: Message, state: FSMContext):
 	"""Обработчик текстовых сообщений в состоянии selecting_type - игнорируем, показываем подсказку"""
 	data = await state.get_data()
@@ -1382,6 +1467,99 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			pass
 		return
 	
+	# В режиме rate суммируем значения для одинаковых карт
+	if mode == "rate" and card_cash_pairs:
+		# Группируем пары по карте (card_id или card_name + user_name)
+		card_sums = {}  # {(card_id или f"{card_name}_{user_name}"): {"card": {...}, "cash": {"value": сумма, "currency": ...}}}
+		
+		for pair in card_cash_pairs:
+			card_data = pair.get("card", {})
+			cash_data = pair.get("cash")
+			
+			# Создаем уникальный ключ для карты
+			card_id = card_data.get("card_id")
+			card_name = card_data.get("card_name", "")
+			user_name = card_data.get("user_name", "")
+			
+			if card_id:
+				key = f"card_id_{card_id}"
+			else:
+				key = f"{card_name}_{user_name}"
+			
+			if key not in card_sums:
+				# Первая запись для этой карты
+				card_sums[key] = {
+					"card": card_data.copy(),
+					"cash": cash_data.copy() if cash_data else None
+				}
+			else:
+				# Суммируем значения
+				if cash_data and card_sums[key]["cash"]:
+					# Суммируем значения, если валюта совпадает
+					existing_currency = card_sums[key]["cash"].get("currency", "RUB")
+					new_currency = cash_data.get("currency", "RUB")
+					
+					if existing_currency == new_currency:
+						existing_value = card_sums[key]["cash"].get("value", 0)
+						new_value = cash_data.get("value", 0)
+						card_sums[key]["cash"]["value"] = existing_value + new_value
+						logger.info(f"🔍 Суммирование для карты {key}: {existing_value} + {new_value} = {card_sums[key]['cash']['value']}")
+					else:
+						# Если валюта не совпадает, оставляем как есть (не суммируем)
+						logger.warning(f"⚠️ Разные валюты для одной карты {key}: {existing_currency} и {new_currency}")
+				elif cash_data and not card_sums[key]["cash"]:
+					# Если раньше не было cash, добавляем
+					card_sums[key]["cash"] = cash_data.copy()
+				# Если cash_data нет, ничего не делаем
+		
+		# Преобразуем обратно в список
+		card_cash_pairs = list(card_sums.values())
+		logger.info(f"🔍 После суммирования card_cash_pairs: {len(card_cash_pairs)} записей")
+	
+	# В режиме rate суммируем значения для одинаковых криптовалют
+	if mode == "rate" and crypto_list:
+		crypto_sums = {}  # {currency: usd_amount}
+		
+		for crypto in crypto_list:
+			currency = crypto.get("currency")
+			usd_amount = crypto.get("usd_amount", 0)
+			
+			if currency:
+				if currency in crypto_sums:
+					crypto_sums[currency] += usd_amount
+					logger.info(f"🔍 Суммирование криптовалюты {currency}: {crypto_sums[currency] - usd_amount} + {usd_amount} = {crypto_sums[currency]}")
+				else:
+					crypto_sums[currency] = usd_amount
+		
+		# Преобразуем обратно в список
+		crypto_list = [{"currency": currency, "usd_amount": amount} for currency, amount in crypto_sums.items()]
+		logger.info(f"🔍 После суммирования crypto_list: {len(crypto_list)} записей")
+	
+	# В режиме rate суммируем значения для одинаковых наличных без карты
+	if mode == "rate" and cash_list:
+		cash_sums = {}  # {cash_name: {"value": сумма, "currency": валюта}}
+		
+		for cash in cash_list:
+			cash_name = cash.get("cash_name", "")
+			currency = cash.get("currency", "RUB")
+			value = cash.get("value", 0)
+			
+			if cash_name:
+				key = f"{cash_name}_{currency}"
+				if key in cash_sums:
+					cash_sums[key]["value"] += value
+					logger.info(f"🔍 Суммирование наличных {cash_name} ({currency}): {cash_sums[key]['value'] - value} + {value} = {cash_sums[key]['value']}")
+				else:
+					cash_sums[key] = {
+						"cash_name": cash_name,
+						"currency": currency,
+						"value": value
+					}
+		
+		# Преобразуем обратно в список
+		cash_list = list(cash_sums.values())
+		logger.info(f"🔍 После суммирования cash_list: {len(cash_list)} записей")
+	
 	from app.config import get_settings
 	from app.google_sheets import write_all_to_google_sheet_one_row, write_to_google_sheet_rate_mode
 	
@@ -1415,7 +1593,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				crypto_list,
 				xmr_list,
 				cash_list,
-				card_cash_pairs
+				card_cash_pairs,
+				mode=mode
 			)
 		
 		if result.get("success"):
@@ -1428,10 +1607,10 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			row = result.get("row")
 			column_rows = result.get("column_rows", {})  # Для режима rate: {column: row}
 			
-			report_lines = [f"📊 Отчет о записи данных ({current_date}):\n"]
+			report_lines = ["📊 Отчет:"]
 			
 			if mode == "add" and row:
-				report_lines.append(f"📍 Строка: {row}\n")
+				report_lines.append(f"📍 Строка: {row}")
 			
 			if written_cells:
 				report_lines.append("✅ Записано:")
@@ -1453,17 +1632,33 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			card_balances = {}
 			balance_cell_addresses = []
-			card_mapping = {}  # {cell_address: (card_name, column)}
+			card_mapping = {}  # {cell_address: (card_name, column, card_id)}
 			
 			for pair in card_cash_pairs:
 				card_data = pair.get("card")
 				if card_data:
 					card_name = card_data.get("card_name", "")
+					card_id = card_data.get("card_id")
 					column = card_data.get("column")
 					if column:
 						cell_address = f"{column}{balance_row}"
 						balance_cell_addresses.append(cell_address)
-						card_mapping[cell_address] = (card_name, column)
+						card_mapping[cell_address] = (card_name, column, card_id)
+			
+			# Получаем информацию о группах для всех карт
+			card_groups_info = {}  # {card_id: group_name}
+			for pair in card_cash_pairs:
+				card_data = pair.get("card")
+				if card_data:
+					card_id = card_data.get("card_id")
+					if card_id and card_id not in card_groups_info:
+						card_info = await db.get_card_by_id(card_id)
+						if card_info:
+							group_id = card_info.get("group_id")
+							if group_id:
+								group_info = await db.get_card_group(group_id)
+								if group_info:
+									card_groups_info[card_id] = group_info.get("name", "")
 			
 			# Читаем все балансы одним batch запросом
 			if balance_cell_addresses:
@@ -1472,10 +1667,15 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					settings.google_credentials_path,
 					balance_cell_addresses
 				)
-				for cell_address, (card_name, column) in card_mapping.items():
+				for cell_address, (card_name, column, card_id) in card_mapping.items():
 					balance = balances.get(cell_address)
 					if balance:
-						card_balances[card_name] = {"balance": balance, "column": column}
+						group_name = card_groups_info.get(card_id, "") if card_id else ""
+						card_balances[card_name] = {
+							"balance": balance,
+							"column": column,
+							"group_name": group_name
+						}
 			
 			# Читаем профиты (batch чтение)
 			profits = {}
@@ -1500,18 +1700,99 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				)
 				profits = profits_dict
 			
+			# Читаем балансы для наличных
+			cash_balances = {}
+			cash_balance_cell_addresses = []
+			cash_mapping = {}  # {cell_address: (cash_name, column)}
+			
+			for cash in cash_list:
+				cash_name = cash.get("cash_name", "")
+				# Получаем столбец для наличных из базы данных
+				cash_column_info = await db.get_cash_column(cash_name)
+				if cash_column_info:
+					column = cash_column_info.get("column")
+					if column:
+						cell_address = f"{column}{balance_row}"
+						cash_balance_cell_addresses.append(cell_address)
+						cash_mapping[cell_address] = (cash_name, column)
+			
+			# Читаем все балансы наличных одним batch запросом
+			if cash_balance_cell_addresses:
+				cash_balances_dict = await read_card_balances_batch(
+					settings.google_sheet_id,
+					settings.google_credentials_path,
+					cash_balance_cell_addresses
+				)
+				for cell_address, (cash_name, column) in cash_mapping.items():
+					balance = cash_balances_dict.get(cell_address)
+					if balance:
+						cash_balances[cash_name] = balance
+			
+			# Читаем балансы для криптовалют
+			crypto_balances = {}
+			crypto_balance_cell_addresses = []
+			crypto_mapping = {}  # {cell_address: (crypto_type, column)}
+			
+			# Обрабатываем обычные криптовалюты (BTC, LTC и т.д.)
+			for crypto in crypto_list:
+				crypto_type = crypto.get("currency", "")
+				if crypto_type:
+					# Получаем столбец для криптовалюты из базы данных
+					column = await db.get_crypto_column(crypto_type)
+					if column:
+						cell_address = f"{column}{balance_row}"
+						crypto_balance_cell_addresses.append(cell_address)
+						crypto_mapping[cell_address] = (crypto_type, column)
+			
+			# Обрабатываем XMR (формат XMR-1, XMR-2, XMR-3)
+			for xmr in xmr_list:
+				xmr_number = xmr.get("xmr_number")
+				if xmr_number:
+					crypto_type = f"XMR-{xmr_number}"
+					# Получаем столбец для XMR из базы данных
+					column = await db.get_crypto_column(crypto_type)
+					if column:
+						cell_address = f"{column}{balance_row}"
+						crypto_balance_cell_addresses.append(cell_address)
+						crypto_mapping[cell_address] = (crypto_type, column)
+			
+			# Читаем все балансы криптовалют одним batch запросом
+			if crypto_balance_cell_addresses:
+				crypto_balances_dict = await read_card_balances_batch(
+					settings.google_sheet_id,
+					settings.google_credentials_path,
+					crypto_balance_cell_addresses
+				)
+				for cell_address, (crypto_type, column) in crypto_mapping.items():
+					balance = crypto_balances_dict.get(cell_address)
+					if balance:
+						crypto_balances[crypto_type] = balance
+			
 			# Добавляем информацию о балансах и профите в отчет
 			# Профит отображаем только в режиме /add
-			if card_balances or (profits and mode == "add"):
-				report_lines.append("\n💰 Дополнительная информация:")
+			if card_balances or cash_balances or crypto_balances or (profits and mode == "add"):
+				report_lines.append("")
+				report_lines.append("💰 Дополнительная информация:")
 				
 				if card_balances:
 					for card_name, data in card_balances.items():
-						report_lines.append(f"  💳 {card_name}: Баланс ({data['column']}{balance_row}) = {data['balance']}")
+						group_name = data.get("group_name", "")
+						if group_name:
+							report_lines.append(f"  💳 Баланс {card_name} ({group_name}) = {data['balance']}")
+						else:
+							report_lines.append(f"  💳 Баланс {card_name} = {data['balance']}")
+				
+				if cash_balances:
+					for cash_name, balance in cash_balances.items():
+						report_lines.append(f"  💳 Баланс {cash_name} = {balance}")
+				
+				if crypto_balances:
+					for crypto_type, balance in crypto_balances.items():
+						report_lines.append(f"  💳 Баланс {crypto_type} = {balance}")
 				
 				if profits and mode == "add":
 					for cell_address, profit_value in profits.items():
-						report_lines.append(f"  📈 Профит сделки ({cell_address}) = {profit_value}")
+						report_lines.append(f"  📈 Профит сделки ({cell_address}) = {profit_value} USD")
 			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])
@@ -1551,7 +1832,7 @@ async def admin_cards(cb: CallbackQuery):
 	logger.debug(f"Show card groups: count={len(groups)}")
 	
 	text = "Выберите группу карт:" if groups else "Групп пока нет."
-	await cb.message.edit_text(text, reply_markup=cards_groups_kb(groups))
+	await safe_edit_text(cb.message, text, reply_markup=cards_groups_kb(groups))
 	await cb.answer()
 
 
@@ -1877,7 +2158,10 @@ async def cash_delete(cb: CallbackQuery):
 			for cash in cash_columns:
 				cash_name_item = cash.get("cash_name", "")
 				column = cash.get("column", "")
-				text += f"{cash_name_item} → {column}\n"
+				display_name = cash.get("display_name", "")
+				currency = cash.get("currency", "RUB")
+				display = display_name if display_name else cash_name_item
+				text += f"{display} → {column} ({currency})\n"
 		
 		await cb.message.edit_text(text, reply_markup=cash_list_kb(cash_columns))
 	except Exception as e:
@@ -1887,28 +2171,65 @@ async def cash_delete(cb: CallbackQuery):
 
 @admin_router.callback_query(F.data.startswith("cash:edit:"))
 async def cash_edit(cb: CallbackQuery, state: FSMContext):
+	"""Показывает меню редактирования валюты"""
+	db = get_db()
+	cash_name = cb.data.split(":")[-1]
+	
+	# Получаем текущую информацию о валюте
+	cash_info = await db.get_cash_column(cash_name)
+	
+	if not cash_info:
+		await cb.answer("❌ Валюта не найдена", show_alert=True)
+		return
+	
+	# Сохраняем название наличных в state
+	await state.update_data(cash_name=cash_name)
+	
+	from app.keyboards import cash_edit_menu_kb
+	current_column = cash_info.get("column", "")
+	current_currency = cash_info.get("currency", "RUB")
+	current_display_name = cash_info.get("display_name", "")
+	# Если display_name пустое, используем cash_name как имя валюты
+	display_name_for_show = current_display_name if current_display_name else cash_name
+	
+	text = f"Что вы хотите изменить для '{cash_name}'?\n\n"
+	text += f"Текущие значения:\n"
+	text += f"📍 Ячейка: {current_column or 'не указана'}\n"
+	text += f"💵 Имя валюты: {display_name_for_show}\n"
+	text += f"💰 Номинал валюты: {current_currency}"
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=cash_edit_menu_kb(cash_name)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cash:edit_column:"))
+async def cash_edit_column(cb: CallbackQuery, state: FSMContext):
 	"""Начинает редактирование адреса столбца для наличных"""
 	db = get_db()
 	cash_name = cb.data.split(":")[-1]
 	
-	# Получаем текущий адрес столбца
-	current_column = await db.get_cash_column(cash_name)
+	# Получаем текущую информацию
+	cash_info = await db.get_cash_column(cash_name)
 	
 	# Сохраняем название наличных в state
 	await state.update_data(cash_name=cash_name)
-	await state.set_state(CashColumnEditStates.waiting_column)
+	await state.set_state(CashColumnEditStates.waiting_cash_column)
 	
+	current_column = cash_info.get("column", "") if cash_info else ""
 	current_text = f" (текущий: {current_column})" if current_column else ""
 	await cb.message.edit_text(
 		f"Редактирование адреса столбца для {cash_name}{current_text}\n\n"
 		"Введите новый адрес столбца (только латинские буквы):\n"
 		"Например: A, B, C, D, E, AS, AY",
-		reply_markup=simple_back_kb("admin:cash")
+		reply_markup=simple_back_kb(f"cash:edit:{cash_name}")
 	)
 	await cb.answer()
 
 
-@admin_router.message(CashColumnEditStates.waiting_column)
+@admin_router.message(CashColumnEditStates.waiting_cash_column)
 async def cash_column_waiting_column(message: Message, state: FSMContext):
 	"""Обрабатывает ввод адреса столбца для наличных"""
 	db = get_db()
@@ -1952,8 +2273,12 @@ async def cash_column_waiting_column(message: Message, state: FSMContext):
 			for cash in cash_columns:
 				cash_name_item = cash.get("cash_name", "")
 				column = cash.get("column", "")
-				text += f"{cash_name_item} → {column}\n"
+				display_name = cash.get("display_name", "")
+				currency = cash.get("currency", "RUB")
+				display = display_name if display_name else cash_name_item
+				text += f"{display} → {column} ({currency})\n"
 		
+		from app.keyboards import cash_list_kb
 		await message.answer(
 			f"✅ Адрес столбца для '{cash_name}' обновлен на '{column_input}'",
 			reply_markup=cash_list_kb(cash_columns)
@@ -1961,6 +2286,134 @@ async def cash_column_waiting_column(message: Message, state: FSMContext):
 	except Exception as e:
 		logger.exception(f"Ошибка при сохранении адреса столбца для наличных: {e}")
 		await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(F.data.startswith("cash:edit_display_name:"))
+async def cash_edit_display_name(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование имени валюты (emoji) для наличных"""
+	db = get_db()
+	cash_name = cb.data.split(":")[-1]
+	
+	# Получаем текущую информацию
+	cash_info = await db.get_cash_column(cash_name)
+	
+	# Сохраняем название наличных в state
+	await state.update_data(cash_name=cash_name)
+	await state.set_state(CashColumnEditStates.waiting_cash_display_name)
+	
+	current_display_name = cash_info.get("display_name", "") if cash_info else ""
+	current_text = f" (текущий: {current_display_name})" if current_display_name else ""
+	await cb.message.edit_text(
+		f"Редактирование имени валюты для {cash_name}{current_text}\n\n"
+		"Введите новое имя валюты (например, 🐿, 💵):",
+		reply_markup=simple_back_kb(f"cash:edit:{cash_name}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CashColumnEditStates.waiting_cash_display_name)
+async def cash_display_name_waiting(message: Message, state: FSMContext):
+	"""Обрабатывает ввод имени валюты для наличных"""
+	db = get_db()
+	display_name_input = message.text.strip()
+	
+	# Получаем данные из state
+	data = await state.get_data()
+	cash_name = data.get("cash_name")
+	
+	if not cash_name:
+		await message.answer("❌ Ошибка: название наличных не найдено. Попробуйте начать заново.")
+		await state.clear()
+		return
+	
+	# Сохраняем имя валюты
+	try:
+		await db.update_cash_display_name(cash_name, display_name_input)
+		await state.clear()
+		
+		# Обновляем список
+		cash_columns = await db.list_cash_columns()
+		if not cash_columns:
+			text = "Список наличных пуст."
+		else:
+			text = "Список наличных и их адресов столбцов:\n\n"
+			for cash in cash_columns:
+				cash_name_item = cash.get("cash_name", "")
+				column = cash.get("column", "")
+				display_name = cash.get("display_name", "")
+				currency = cash.get("currency", "RUB")
+				display = display_name if display_name else cash_name_item
+				text += f"{display} → {column} ({currency})\n"
+		
+		from app.keyboards import cash_list_kb
+		await message.answer(
+			f"✅ Имя валюты для '{cash_name}' обновлено на '{display_name_input}'",
+			reply_markup=cash_list_kb(cash_columns)
+		)
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении имени валюты для наличных: {e}")
+		await message.answer("❌ Произошла ошибка при сохранении. Попробуйте еще раз.")
+
+
+@admin_router.callback_query(F.data.startswith("cash:edit_currency:"))
+async def cash_edit_currency(cb: CallbackQuery, state: FSMContext):
+	"""Показывает выбор номинала валюты для наличных"""
+	db = get_db()
+	cash_name = cb.data.split(":")[-1]
+	
+	# Получаем текущую информацию
+	cash_info = await db.get_cash_column(cash_name)
+	
+	# Сохраняем название наличных в state
+	await state.update_data(cash_name=cash_name)
+	
+	current_currency = cash_info.get("currency", "RUB") if cash_info else "RUB"
+	
+	from app.keyboards import cash_currency_select_kb
+	await cb.message.edit_text(
+		f"Редактирование номинала валюты для {cash_name}\n\n"
+		f"Текущий номинал: {current_currency}\n\n"
+		"Выберите новый номинал валюты:",
+		reply_markup=cash_currency_select_kb(cash_name, current_currency)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cash:set_currency:"))
+async def cash_set_currency(cb: CallbackQuery, state: FSMContext):
+	"""Обрабатывает выбор номинала валюты для наличных"""
+	db = get_db()
+	parts = cb.data.split(":")
+	cash_name = parts[2]
+	currency = parts[3]
+	
+	# Сохраняем номинал валюты
+	try:
+		await db.update_cash_currency(cash_name, currency)
+		
+		# Обновляем список
+		cash_columns = await db.list_cash_columns()
+		if not cash_columns:
+			text = "Список наличных пуст."
+		else:
+			text = "Список наличных и их адресов столбцов:\n\n"
+			for cash in cash_columns:
+				cash_name_item = cash.get("cash_name", "")
+				column = cash.get("column", "")
+				display_name = cash.get("display_name", "")
+				currency_item = cash.get("currency", "RUB")
+				display = display_name if display_name else cash_name_item
+				text += f"{display} → {column} ({currency_item})\n"
+		
+		from app.keyboards import cash_list_kb
+		await cb.message.edit_text(
+			f"✅ Номинал валюты для '{cash_name}' обновлен на '{currency}'",
+			reply_markup=cash_list_kb(cash_columns)
+		)
+		await cb.answer()
+	except Exception as e:
+		logger.exception(f"Ошибка при сохранении номинала валюты для наличных: {e}")
+		await cb.answer("❌ Произошла ошибка при сохранении", show_alert=True)
 
 
 @admin_router.callback_query(F.data.startswith("crypto:edit:"))
@@ -2770,7 +3223,8 @@ async def _update_crypto_values_in_stats(
 	"""
 	Обновляет значения криптовалют в сообщении статистики после их загрузки.
 	"""
-	from app.google_sheets import get_crypto_values_from_row_4
+	from app.google_sheets import get_crypto_values_from_row_4, read_card_balance
+	from app.di import get_db
 	
 	try:
 		logger.info(f"Начинаем загрузку значений криптовалют из строки 4. Криптовалют: {len(crypto_columns)}")
@@ -2812,8 +3266,94 @@ async def _update_crypto_values_in_stats(
 				logger.warning(f"Значение для {crypto_type} пустое или None (column={column})")
 				crypto_lines.append(f"<code>{crypto_type} = —</code>")
 		
-		# Объединяем базовые строки и строки с криптовалютами
+		# Читаем профит за день и средний профит со вторника
+		profit_lines = []
+		db = get_db()
+		
+		# Определяем текущий день недели
+		from datetime import datetime
+		today = datetime.now()
+		weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+		
+		day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+		day_name = day_names[weekday]
+		day_name_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"][weekday]
+		
+		# Получаем ячейку профита за текущий день
+		profit_cell_key = f"profit_{day_name}"
+		profit_cell = await db.get_google_sheets_setting(profit_cell_key)
+		
+		if profit_cell:
+			try:
+				# profit_cell уже содержит полный адрес ячейки (например, BD225)
+				# Используем функцию для чтения по полному адресу
+				from app.google_sheets import _read_card_balance_sync
+				import asyncio
+				# Парсим адрес ячейки: извлекаем столбец и строку
+				import re
+				match = re.match(r'([A-Z]+)(\d+)', profit_cell)
+				if match:
+					column = match.group(1)
+					row = int(match.group(2))
+					profit_today = await asyncio.to_thread(
+						_read_card_balance_sync,
+						sheet_id,
+						credentials_path,
+						column,
+						row
+					)
+					if profit_today:
+						try:
+							profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
+							formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
+							profit_lines.append(f"<code>📈 Профит за сегодня: {formatted_profit} USD</code>")
+						except (ValueError, AttributeError):
+							profit_lines.append(f"<code>📈 Профит за сегодня: {profit_today} USD</code>")
+			except Exception as e:
+				logger.warning(f"Ошибка чтения профита за день: {e}")
+		
+		# Читаем средний профит с начала недели (с понедельника)
+		# Если сегодня понедельник, не отображаем средний профит, так как он будет равен профиту за сегодня
+		if weekday != 0:  # 0 = понедельник
+			profit_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+			profit_values = []
+			
+			for day in profit_days:
+				profit_cell_key = f"profit_{day}"
+				profit_cell = await db.get_google_sheets_setting(profit_cell_key)
+				if profit_cell:
+					try:
+						# Парсим адрес ячейки: извлекаем столбец и строку
+						match = re.match(r'([A-Z]+)(\d+)', profit_cell)
+						if match:
+							column = match.group(1)
+							row = int(match.group(2))
+							profit_value = await asyncio.to_thread(
+								_read_card_balance_sync,
+								sheet_id,
+								credentials_path,
+								column,
+								row
+							)
+							if profit_value:
+								try:
+									value = float(str(profit_value).replace(",", ".").replace(" ", ""))
+									profit_values.append(value)
+								except (ValueError, AttributeError):
+									pass
+					except Exception as e:
+						logger.warning(f"Ошибка чтения профита за {day}: {e}")
+			
+			if profit_values:
+				avg_profit = sum(profit_values) / len(profit_values)
+				formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
+				profit_lines.append(f"<code>📊 Средний профит с начала недели: {formatted_avg} USD</code>")
+		
+		# Объединяем базовые строки, строки с криптовалютами и профитом
 		all_lines = base_lines + crypto_lines
+		if profit_lines:
+			all_lines.append("")  # Пустая строка перед профитом
+			all_lines.extend(profit_lines)
 		text = "\n".join(all_lines)
 		
 		# Обновляем сообщение
@@ -2949,8 +3489,11 @@ async def _build_inactivity_stats(db):
 
 
 @admin_router.message(Command("stat_u"))
-async def admin_stats_command(msg: Message):
+async def admin_stats_command(msg: Message, state: FSMContext):
 	"""Обработчик команды /stat_u - показывает меню выбора типа статистики"""
+	# Очищаем состояние FSM, чтобы не мешало другим командам
+	await state.clear()
+	
 	db = get_db()
 	stats = await db.get_stats_summary()
 	text = (
@@ -2996,8 +3539,11 @@ async def stat_u_menu(cb: CallbackQuery):
 
 
 @admin_router.message(Command("stat_bk"))
-async def admin_stat_bk_command(msg: Message, bot: Bot):
+async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	"""Обработчик команды /stat_bk для отображения балансов всех карт"""
+	# Очищаем состояние FSM, чтобы не мешало другим командам
+	await state.clear()
+	
 	db = get_db()
 	from app.config import get_settings
 	from app.google_sheets import read_card_balances_batch
@@ -3022,10 +3568,15 @@ async def admin_stat_bk_command(msg: Message, bot: Bot):
 	# Сразу отправляем сообщение о загрузке
 	loading_msg = await msg.answer("⏳ Загрузка балансов карт...", reply_markup=simple_back_kb("admin:back"))
 	
-	# Собираем информацию о картах и их столбцах
-	cards_info = []  # [(card_id, card_name, column, cell_address)]
+	# Собираем информацию о картах и их столбцах, группируя по группам
+	cards_by_group = {}  # {group_id: [(card_id, card_name, column, cell_address)]}
+	cards_without_group = []  # [(card_id, card_name, column, cell_address)]
 	cards_without_column = []
 	cell_addresses = []
+	
+	# Получаем все группы
+	all_groups = await db.list_card_groups()
+	group_names = {group["id"]: group["name"] for group in all_groups}
 	
 	for card_id, card_name, card_details in all_cards:
 		# Получаем столбец для карты
@@ -3033,7 +3584,17 @@ async def admin_stat_bk_command(msg: Message, bot: Bot):
 		
 		if column:
 			cell_address = f"{column}{balance_row}"
-			cards_info.append((card_id, card_name, column, cell_address))
+			# Получаем информацию о карте, чтобы узнать группу
+			card = await db.get_card_by_id(card_id)
+			group_id = card.get("group_id") if card else None
+			
+			if group_id:
+				if group_id not in cards_by_group:
+					cards_by_group[group_id] = []
+				cards_by_group[group_id].append((card_id, card_name, column, cell_address))
+			else:
+				cards_without_group.append((card_id, card_name, column, cell_address))
+			
 			cell_addresses.append(cell_address)
 		else:
 			cards_without_column.append(card_name)
@@ -3050,34 +3611,43 @@ async def admin_stat_bk_command(msg: Message, bot: Bot):
 		except Exception as e:
 			logger.exception(f"Ошибка batch чтения балансов: {e}")
 	
-	# Формируем результат
+	# Формируем результат с группировкой
 	lines = ["<b>💳 Балансы карт</b>"]
-	cards_with_balance = []
 	
-	for card_id, card_name, column, cell_address in cards_info:
-		balance = balances.get(cell_address)
-		if balance:
-			cards_with_balance.append((card_name, column, balance))
-		else:
-			cards_with_balance.append((card_name, column, "—"))
+	# Добавляем карты по группам (сортируем по названию группы)
+	sorted_groups = sorted(cards_by_group.keys(), key=lambda gid: group_names.get(gid, f"Группа {gid}"))
+	for group_id in sorted_groups:
+		group_name = group_names.get(group_id, f"Группа {group_id}")
+		lines.append("")
+		lines.append(f"<b>{group_name}:</b>")
+		
+		for card_id, card_name, column, cell_address in cards_by_group[group_id]:
+			balance = balances.get(cell_address)
+			balance_str = balance if balance else "—"
+			lines.append(f"<code> {card_name} ({column}{balance_row}) = {balance_str}</code>")
 	
-	# Добавляем карты с балансами
-	if cards_with_balance:
-		for card_name, column, balance in cards_with_balance:
-			lines.append(f"<code>💳 {card_name} ({column}{balance_row}) = {balance}</code>")
+	# Добавляем карты без группы
+	if cards_without_group:
+		lines.append("")
+		lines.append("<b>Без группы:</b>")
+		for card_id, card_name, column, cell_address in cards_without_group:
+			balance = balances.get(cell_address)
+			balance_str = balance if balance else "—"
+			lines.append(f"<code> {card_name} ({column}{balance_row}) = {balance_str}</code>")
 	
-	# Добавляем карты без привязки
+	# Добавляем карты без привязки к столбцу
 	if cards_without_column:
 		lines.append("")
 		lines.append("<b>⚠️ Карты без привязки к столбцу:</b>")
 		for card_name in cards_without_column:
 			lines.append(f"<code>💳 {card_name}</code>")
 	
-	if not cards_with_balance and not cards_without_column:
+	if not cards_by_group and not cards_without_group and not cards_without_column:
 		lines.append("Нет данных о картах.")
 	
 	text = "\n".join(lines)
-	logger.info(f"📊 Отправка балансов карт: карт с балансом={len(cards_with_balance)}, без столбца={len(cards_without_column)}")
+	total_cards_with_balance = sum(len(cards) for cards in cards_by_group.values()) + len(cards_without_group)
+	logger.info(f"📊 Отправка балансов карт: групп={len(cards_by_group)}, карт с балансом={total_cards_with_balance}, без столбца={len(cards_without_column)}")
 	try:
 		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
 		logger.info("✅ Сообщение с балансами карт успешно отправлено")
@@ -3091,8 +3661,11 @@ async def admin_stat_bk_command(msg: Message, bot: Bot):
 
 
 @admin_router.message(Command("stat_k"))
-async def admin_stat_k_command(msg: Message, bot: Bot):
+async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
 	"""Обработчик команды /stat_k для отображения балансов крипты"""
+	# Очищаем состояние FSM, чтобы не мешало другим командам
+	await state.clear()
+	
 	db = get_db()
 	from app.config import get_settings
 	from app.google_sheets import get_crypto_values_from_row_4
@@ -3338,6 +3911,17 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	# не обрабатываем пересылки (они должны обрабатываться соответствующими обработчиками состояний)
 	current_state = await state.get_state()
 	if current_state:
+		# Если состояние относится к AddDataStates, CardUserMessageStates, CardRequisiteStates и т.д.,
+		# пропускаем обработку - эти состояния имеют свои обработчики
+		state_str = str(current_state) if current_state else ""
+		if any(state_group in state_str for state_group in [
+			"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
+			"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates"
+		]):
+			# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
+			logger.debug(f"⚠️ Пропуск обработки пересылки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
+			return
+		
 		# Если есть активное состояние, проверяем, не является ли это состоянием для пересылок
 		# Состояния ForwardBindStates - это состояния для обработки пересылок
 		if current_state not in [ForwardBindStates.waiting_select_card.state, 

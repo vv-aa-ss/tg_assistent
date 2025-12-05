@@ -290,7 +290,9 @@ class Database:
 				CREATE TABLE cash_columns (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					cash_name TEXT NOT NULL UNIQUE,
-					column TEXT NOT NULL
+					column TEXT NOT NULL,
+					currency TEXT DEFAULT 'RUB',
+					display_name TEXT DEFAULT ''
 				)
 				"""
 			)
@@ -298,6 +300,16 @@ class Database:
 				"CREATE INDEX IF NOT EXISTS idx_cash_columns_name ON cash_columns(cash_name)"
 			)
 			_logger.debug("Created table cash_columns")
+		else:
+			# Миграция: добавляем поля currency и display_name, если их нет
+			cur = await self._db.execute("PRAGMA table_info(cash_columns)")
+			cols = [r[1] for r in await cur.fetchall()]
+			if "currency" not in cols:
+				await self._db.execute("ALTER TABLE cash_columns ADD COLUMN currency TEXT DEFAULT 'RUB'")
+				_logger.debug("Added column 'currency' to cash_columns")
+			if "display_name" not in cols:
+				await self._db.execute("ALTER TABLE cash_columns ADD COLUMN display_name TEXT DEFAULT ''")
+				_logger.debug("Added column 'display_name' to cash_columns")
 
 	async def _ensure_card_groups(self) -> None:
 		"""Создает таблицы для группировки карт"""
@@ -1091,64 +1103,118 @@ class Database:
 		await self._db.commit()
 		_logger.debug(f"Crypto column deleted: crypto_type='{crypto_type}'")
 
-	async def get_cash_column(self, cash_name: str) -> Optional[str]:
+	async def get_cash_column(self, cash_name: str) -> Optional[Dict[str, Any]]:
 		"""
-		Получает адрес столбца для наличных.
+		Получает полную информацию о наличных.
 		
 		Args:
 			cash_name: Название наличных
 		
 		Returns:
-			Адрес столбца (например, "AS", "AY", "AU") или None, если не найдено
+			Словарь с ключами: column, currency, display_name или None, если не найдено
 		"""
 		assert self._db
 		cur = await self._db.execute(
-			"SELECT column FROM cash_columns WHERE cash_name = ?",
+			"SELECT column, currency, display_name FROM cash_columns WHERE cash_name = ?",
 			(cash_name,)
 		)
 		row = await cur.fetchone()
 		if row:
-			return row[0]
+			return {
+				"column": row[0],
+				"currency": row[1] or "RUB",
+				"display_name": row[2] or ""
+			}
 		_logger.debug(f"Cash column not found for cash_name='{cash_name}'")
 		return None
 
-	async def set_cash_column(self, cash_name: str, column: str) -> int:
+	async def set_cash_column(self, cash_name: str, column: str, currency: Optional[str] = None, display_name: Optional[str] = None) -> int:
 		"""
 		Устанавливает адрес столбца для наличных.
 		
 		Args:
 			cash_name: Название наличных
 			column: Адрес столбца (например, "AS", "AY", "AU")
+			currency: Номинал валюты (например, "BYN", "RUB", "$") - опционально
+			display_name: Имя валюты (например, "🐿", "💵") - опционально
 		
 		Returns:
 			ID созданной или обновленной записи
 		"""
 		assert self._db
+		# Если currency или display_name не указаны, получаем текущие значения
+		if currency is None or display_name is None:
+			current = await self.get_cash_column(cash_name)
+			if current:
+				if currency is None:
+					currency = current.get("currency", "RUB")
+				if display_name is None:
+					display_name = current.get("display_name", "")
+			else:
+				if currency is None:
+					currency = "RUB"
+				if display_name is None:
+					display_name = ""
+		
 		# Используем INSERT OR REPLACE для обновления существующей записи
 		cur = await self._db.execute(
-			"INSERT OR REPLACE INTO cash_columns (cash_name, column) VALUES (?, ?)",
-			(cash_name, column)
+			"INSERT OR REPLACE INTO cash_columns (cash_name, column, currency, display_name) VALUES (?, ?, ?, ?)",
+			(cash_name, column, currency, display_name)
 		)
 		await self._db.commit()
-		_logger.debug(f"Cash column set: cash_name='{cash_name}', column='{column}'")
+		_logger.debug(f"Cash column set: cash_name='{cash_name}', column='{column}', currency='{currency}', display_name='{display_name}'")
 		return cur.lastrowid
+	
+	async def update_cash_currency(self, cash_name: str, currency: str) -> None:
+		"""
+		Обновляет номинал валюты для наличных.
+		
+		Args:
+			cash_name: Название наличных
+			currency: Номинал валюты (например, "BYN", "RUB", "$")
+		"""
+		assert self._db
+		await self._db.execute(
+			"UPDATE cash_columns SET currency = ? WHERE cash_name = ?",
+			(currency, cash_name)
+		)
+		await self._db.commit()
+		_logger.debug(f"Cash currency updated: cash_name='{cash_name}', currency='{currency}'")
+	
+	async def update_cash_display_name(self, cash_name: str, display_name: str) -> None:
+		"""
+		Обновляет имя валюты (emoji) для наличных.
+		
+		Args:
+			cash_name: Название наличных
+			display_name: Имя валюты (например, "🐿", "💵")
+		"""
+		assert self._db
+		await self._db.execute(
+			"UPDATE cash_columns SET display_name = ? WHERE cash_name = ?",
+			(display_name, cash_name)
+		)
+		await self._db.commit()
+		_logger.debug(f"Cash display_name updated: cash_name='{cash_name}', display_name='{display_name}'")
 
 	async def list_cash_columns(self) -> List[Dict[str, Any]]:
 		"""
 		Получает список всех адресов столбцов наличных.
 		
 		Returns:
-			Список словарей с ключами: cash_name, column
+			Список словарей с ключами: cash_name, column, currency, display_name
 		"""
 		assert self._db
 		cur = await self._db.execute(
-			"SELECT cash_name, column FROM cash_columns ORDER BY cash_name"
+			"SELECT cash_name, column, currency, display_name FROM cash_columns ORDER BY cash_name"
 		)
 		rows = await cur.fetchall()
 		return [
 			{
 				"cash_name": row[0],
 				"column": row[1],
+				"currency": row[2] or "RUB",
+				"display_name": row[3] or ""
 			}
 			for row in rows
 		]
@@ -1346,7 +1412,7 @@ class Database:
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
+				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '348')"
 			)
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
@@ -1354,6 +1420,28 @@ class Database:
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
 			)
+			# Добавляем настройки дней недели
+			day_settings = [
+				('add_monday_start', '5'), ('add_monday_max', '54'),
+				('add_tuesday_start', '55'), ('add_tuesday_max', '104'),
+				('add_wednesday_start', '105'), ('add_wednesday_max', '154'),
+				('add_thursday_start', '155'), ('add_thursday_max', '204'),
+				('add_friday_start', '205'), ('add_friday_max', '254'),
+				('add_saturday_start', '255'), ('add_saturday_max', '304'),
+				('add_sunday_start', '305'), ('add_sunday_max', '364'),
+				('move_start_row', '375'), ('move_max_row', '406'),
+				('profit_monday', 'BD25'),
+				('profit_tuesday', 'BD75'),
+				('profit_wednesday', 'BD125'),
+				('profit_thursday', 'BD175'),
+				('profit_friday', 'BD225'),
+				('profit_saturday', 'BD275'),
+				('profit_sunday', 'BD325'),
+			]
+			for key, value in day_settings:
+				await self._db.execute(
+					f"INSERT INTO google_sheets_settings(key, value) VALUES('{key}', '{value}')"
+				)
 			_logger.debug("Created table google_sheets_settings with default values")
 		else:
 			# Проверяем наличие всех необходимых ключей
@@ -1376,10 +1464,15 @@ class Database:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '355')"
 				)
-			if 'rate_last_row' not in existing_keys:
+			if 'rate_start_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_last_row', '348')"
+					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '348')"
 				)
+				# Миграция: если есть старый ключ rate_last_row, удаляем его
+				if 'rate_last_row' in existing_keys:
+					await self._db.execute(
+						"DELETE FROM google_sheets_settings WHERE key = 'rate_last_row'"
+					)
 			if 'balance_row' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
@@ -1388,6 +1481,30 @@ class Database:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
 				)
+			
+			# Добавляем настройки дней недели, если их нет
+			day_settings = [
+				('add_monday_start', '5'), ('add_monday_max', '54'),
+				('add_tuesday_start', '55'), ('add_tuesday_max', '104'),
+				('add_wednesday_start', '105'), ('add_wednesday_max', '154'),
+				('add_thursday_start', '155'), ('add_thursday_max', '204'),
+				('add_friday_start', '205'), ('add_friday_max', '254'),
+				('add_saturday_start', '255'), ('add_saturday_max', '304'),
+				('add_sunday_start', '305'), ('add_sunday_max', '364'),
+				('move_start_row', '375'), ('move_max_row', '406'),
+				('profit_monday', 'BD25'),
+				('profit_tuesday', 'BD75'),
+				('profit_wednesday', 'BD125'),
+				('profit_thursday', 'BD175'),
+				('profit_friday', 'BD225'),
+				('profit_saturday', 'BD275'),
+				('profit_sunday', 'BD325'),
+			]
+			for key, default_value in day_settings:
+				if key not in existing_keys:
+					await self._db.execute(
+						f"INSERT INTO google_sheets_settings(key, value) VALUES('{key}', '{default_value}')"
+					)
 
 	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
 		"""

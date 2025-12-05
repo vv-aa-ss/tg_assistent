@@ -398,6 +398,111 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 		return start_row
 
 
+def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row: int, max_row: int) -> Optional[int]:
+	"""
+	Находит первую полностью пустую строку в указанном диапазоне.
+	Проверяет, что вся строка в диапазоне пустая.
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		range_str: Диапазон столбцов (например, "A:BB")
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска
+		
+	Returns:
+		Номер первой пустой строки или None, если не найдена
+	"""
+	try:
+		# Извлекаем начальный и конечный столбцы из диапазона (например, "A:BB" -> "A" и "BB")
+		parts = range_str.split(":")
+		if len(parts) != 2:
+			logger.error(f"❌ Неверный формат диапазона: {range_str}")
+			return None
+		
+		start_col = parts[0].strip()
+		end_col = parts[1].strip()
+		
+		batch_size = 50
+		row = start_row
+		
+		while row <= max_row:
+			# Читаем batch строк за один запрос
+			end_row = min(row + batch_size - 1, max_row)
+			range_to_check = f"{start_col}{row}:{end_col}{end_row}"
+			
+			try:
+				values = sheet.get(range_to_check)
+				logger.info(f"🔍 Проверка диапазона {range_to_check}: получено {len(values) if values else 0} строк")
+				
+				# Если values пустой или None, значит все строки в диапазоне пустые
+				if not values or len(values) == 0:
+					logger.info(f"✅ Диапазон {range_to_check} полностью пустой, возвращаем первую строку {row}")
+					return row
+				
+				# Проверяем каждую строку в batch
+				for i in range(end_row - row + 1):
+					current_row = row + i
+					
+					if current_row > max_row:
+						logger.warning(f"⚠️ Достигнут лимит строки {max_row}")
+						return None
+					
+					# Проверяем, есть ли данные для этой строки
+					# values - это список списков, где каждый внутренний список - это строка
+					# Если строка полностью пустая, то либо её нет в values, либо все ячейки пустые
+					row_is_empty = True
+					
+					if i < len(values):
+						row_data = values[i]
+						# Проверяем, есть ли хотя бы одна непустая ячейка в строке
+						if row_data:
+							for cell_value in row_data:
+								if cell_value is not None and str(cell_value).strip() != "":
+									row_is_empty = False
+									break
+					
+					if row_is_empty:
+						logger.info(f"✅ Найдена пустая строка {current_row} в диапазоне {range_str}")
+						return current_row
+				
+				# Если в этом batch не нашли пустую, переходим к следующему
+				row = end_row + 1
+				
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка чтения диапазона {range_to_check}: {e}, пробуем по одной строке")
+				# Fallback: проверяем по одной строке
+				for check_row in range(row, min(row + batch_size, max_row + 1)):
+					try:
+						row_range = f"{start_col}{check_row}:{end_col}{check_row}"
+						row_values = sheet.get(row_range)
+						
+						# Проверяем, пуста ли строка
+						is_empty = True
+						if row_values and len(row_values) > 0:
+							row_data = row_values[0] if row_values else []
+							if row_data:
+								for cell_value in row_data:
+									if cell_value is not None and str(cell_value).strip() != "":
+										is_empty = False
+										break
+						
+						if is_empty:
+							logger.info(f"✅ Найдена пустая строка {check_row} в диапазоне {range_str}")
+							return check_row
+					except Exception as e2:
+						logger.warning(f"⚠️ Ошибка проверки строки {check_row}: {e2}")
+						continue
+				
+				row += batch_size
+		
+		logger.warning(f"⚠️ Не найдена пустая строка в диапазоне {range_str}, строки {start_row}-{max_row}")
+		return None
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка поиска пустой строки в диапазоне {range_str}: {e}")
+		return None
+
+
 def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 5) -> int:
 	"""
 	Находит первую строку с 0 в указанном столбце, начиная с start_row.
@@ -865,7 +970,8 @@ async def write_all_to_google_sheet_one_row(
 	crypto_list: list,  # [{"currency": "BTC", "usd_amount": 100}, ...]
 	xmr_list: list,  # [{"xmr_number": 1, "usd_amount": 50}, ...]
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
-	card_cash_pairs: list  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
+	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
+	mode: str = "add"  # Режим: "add" или "move"
 ) -> Dict[str, Any]:
 	"""
 	Записывает все данные в одну строку Google Sheets.
@@ -885,19 +991,18 @@ async def write_all_to_google_sheet_one_row(
 	try:
 		# Получаем адреса столбцов для криптовалют из базы данных
 		db = get_db()
-		btc_column = None
-		ltc_column = None
-		usdt_column = None
+		crypto_columns = {}  # {currency: column}
 		
 		# Получаем адреса столбцов для всех используемых криптовалют
 		for crypto in crypto_list:
 			currency = crypto.get("currency")
-			if currency == "BTC" and not btc_column:
-				btc_column = await db.get_crypto_column("BTC")
-			elif currency == "LTC" and not ltc_column:
-				ltc_column = await db.get_crypto_column("LTC")
-			elif currency == "USDT" and not usdt_column:
-				usdt_column = await db.get_crypto_column("USDT")
+			if currency and currency not in crypto_columns:
+				column = await db.get_crypto_column(currency)
+				if column:
+					crypto_columns[currency] = column
+					logger.debug(f"✅ Найден адрес столбца: crypto_type='{currency}' -> column='{column}'")
+				else:
+					logger.warning(f"⚠️ Не найден адрес столбца для криптовалюты: {currency}")
 		
 		# Получаем адреса столбцов для XMR
 		xmr_columns = {}
@@ -929,13 +1034,47 @@ async def write_all_to_google_sheet_one_row(
 			logger.info(f"🔍 Обработка наличных: cash_name={cash_name}, cash={cash}")
 			if cash_name:
 				if cash_name not in cash_columns:
-					cash_column = await db.get_cash_column(cash_name)
-					cash_columns[cash_name] = cash_column
-					logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+					cash_info = await db.get_cash_column(cash_name)
+					if cash_info:
+						cash_columns[cash_name] = cash_info.get("column")
+						# Добавляем валюту из БД, если она не указана
+						if "currency" not in cash or not cash.get("currency"):
+							cash["currency"] = cash_info.get("currency", "RUB")
+						logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_info.get('column')}, currency={cash_info.get('currency')}")
+					else:
+						cash_columns[cash_name] = None
 				# Всегда добавляем адрес столбца в данные наличных (даже если уже был получен ранее)
 				cash["column"] = cash_columns[cash_name]
 			else:
 				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
+		
+		# Получаем настройки дней недели из БД (для режима add) или настройки move
+		from datetime import datetime
+		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
+		
+		if mode == "move":
+			# Для режима move используем настройки move_start_row и move_max_row
+			start_row_str = await db.get_google_sheets_setting("move_start_row", "375")
+			max_row_str = await db.get_google_sheets_setting("move_max_row", "406")
+			start_row = int(start_row_str) if start_row_str else 375
+			max_row = int(max_row_str) if max_row_str else 406
+			logger.info(f"📅 Режим move: start_row={start_row}, max_row={max_row}, delete_range={delete_range}")
+		else:
+			# Для режима add используем настройки дней недели
+			today = datetime.now()
+			weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+			day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+			day_name = day_names[weekday]
+			
+			start_row_key = f"add_{day_name}_start"
+			max_row_key = f"add_{day_name}_max"
+			
+			start_row_str = await db.get_google_sheets_setting(start_row_key, "5")
+			max_row_str = await db.get_google_sheets_setting(max_row_key, "374")
+			start_row = int(start_row_str) if start_row_str else 5
+			max_row = int(max_row_str) if max_row_str else 374
+			
+			logger.info(f"📅 День недели: {day_name}, start_row={start_row}, max_row={max_row}, delete_range={delete_range}")
 		
 		# Выполняем синхронную запись в отдельном потоке
 		return await asyncio.to_thread(
@@ -946,10 +1085,11 @@ async def write_all_to_google_sheet_one_row(
 			xmr_list,
 			cash_list,
 			card_cash_pairs,
-			btc_column,
-			ltc_column,
-			usdt_column,
-			xmr_columns
+			crypto_columns,
+			xmr_columns,
+			start_row,
+			max_row,
+			delete_range
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
@@ -963,10 +1103,11 @@ def _write_all_to_google_sheet_one_row_sync(
 	xmr_list: list,
 	cash_list: list,
 	card_cash_pairs: list,
-	btc_column: Optional[str],
-	ltc_column: Optional[str],
-	usdt_column: Optional[str],
-	xmr_columns: Dict[int, Optional[str]]
+	crypto_columns: Dict[str, Optional[str]],  # {currency: column}
+	xmr_columns: Dict[int, Optional[str]],
+	start_row: int = 5,
+	max_row: int = 374,
+	delete_range: str = "A:BB"
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи всех данных в одну строку Google Sheets.
@@ -986,9 +1127,12 @@ def _write_all_to_google_sheet_one_row_sync(
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
 		
-		# Находим одну свободную строку
-		empty_row = _find_empty_row_in_column(worksheet, "BC", start_row=5)
-		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row}")
+		# Находим одну свободную строку во всем диапазоне delete_range
+		empty_row = _find_empty_row_in_range(worksheet, delete_range, start_row=start_row, max_row=max_row)
+		if empty_row is None or empty_row > max_row:
+			logger.error(f"❌ Не найдена свободная строка в диапазоне {start_row}-{max_row} для диапазона {delete_range}")
+			return {"success": False, "written_cells": []}
+		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row} (диапазон: {start_row}-{max_row}, проверяемый диапазон: {delete_range})")
 		
 		written_cells = []  # Список записанных ячеек для отчета
 		
@@ -1002,23 +1146,18 @@ def _write_all_to_google_sheet_one_row_sync(
 					crypto_sum[currency] = 0.0
 				crypto_sum[currency] += usd_amount
 		
-		# Записываем суммированные криптовалюты (BTC, LTC, USDT)
+		# Записываем суммированные криптовалюты (все валюты из crypto_columns)
 		for currency, total_amount in crypto_sum.items():
 			usd_amount_rounded = int(round(total_amount))
+			column = crypto_columns.get(currency)
 			
 			# Записываем в соответствующий столбец
-			if currency == "BTC" and btc_column:
-				worksheet.update(f"{btc_column}{empty_row}", [[usd_amount_rounded]])
-				written_cells.append(f"{btc_column}{empty_row} (BTC: {usd_amount_rounded} USD)")
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {btc_column}{empty_row} (BTC)")
-			elif currency == "LTC" and ltc_column:
-				worksheet.update(f"{ltc_column}{empty_row}", [[usd_amount_rounded]])
-				written_cells.append(f"{ltc_column}{empty_row} (LTC: {usd_amount_rounded} USD)")
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {ltc_column}{empty_row} (LTC)")
-			elif currency == "USDT" and usdt_column:
-				worksheet.update(f"{usdt_column}{empty_row}", [[usd_amount_rounded]])
-				written_cells.append(f"{usdt_column}{empty_row} (USDT: {usd_amount_rounded} USD)")
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usdt_column}{empty_row} (USDT)")
+			if column:
+				worksheet.update(f"{column}{empty_row}", [[usd_amount_rounded]])
+				written_cells.append(f"{column}{empty_row} ({currency}: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {column}{empty_row} ({currency})")
+			else:
+				logger.warning(f"⚠️ Не найден столбец для криптовалюты {currency}, пропускаем запись")
 		
 		# Суммируем XMR с одинаковым номером
 		xmr_sum = {}  # {xmr_number: total_amount}
@@ -1108,9 +1247,9 @@ async def delete_last_row_from_google_sheet(
 	credentials_path: str
 ) -> Dict[str, Any]:
 	"""
-	Удаляет последнюю добавленную строку из Google Sheets.
-	Ищет первую строку с нулем в столбце нулей (по умолчанию BC), начиная с 5-й строки.
-	Удаляет предыдущую строку в диапазоне, указанном в настройках (по умолчанию A:BB).
+	Удаляет последнюю заполненную строку из Google Sheets.
+	Ищет последнюю заполненную строку в диапазоне для текущего дня недели (как в /add).
+	Удаляет эту строку в диапазоне, указанном в настройках (по умолчанию A:BB).
 	
 	Args:
 		sheet_id: ID Google Sheet
@@ -1122,39 +1261,151 @@ async def delete_last_row_from_google_sheet(
 	try:
 		# Получаем настройки из базы данных
 		db = get_db()
-		zero_column = await db.get_google_sheets_setting("zero_column", "BC")
 		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
-		start_row_str = await db.get_google_sheets_setting("start_row", "5")
 		
-		try:
-			start_row = int(start_row_str)
-		except (ValueError, TypeError):
-			start_row = 5
-			logger.warning(f"Неверное значение start_row: {start_row_str}, используем 5")
+		# Получаем настройки дня недели (как в /add)
+		from datetime import datetime
+		today = datetime.now()
+		weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+		
+		day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+		day_name = day_names[weekday]
+		
+		start_row_key = f"add_{day_name}_start"
+		max_row_key = f"add_{day_name}_max"
+		
+		start_row_str = await db.get_google_sheets_setting(start_row_key, "5")
+		max_row_str = await db.get_google_sheets_setting(max_row_key, "374")
+		
+		start_row = int(start_row_str) if start_row_str else 5
+		max_row = int(max_row_str) if max_row_str else 374
+		
+		logger.info(f"📅 Удаление строки: день недели={day_name}, start_row={start_row}, max_row={max_row}, delete_range={delete_range}")
 		
 		# Выполняем синхронное удаление в отдельном потоке
 		return await asyncio.to_thread(
 			_delete_last_row_from_google_sheet_sync,
 			sheet_id,
 			credentials_path,
-			zero_column,
 			delete_range,
-			start_row
+			start_row,
+			max_row
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка удаления последней строки из Google Sheet: {e}")
 		return {"success": False, "deleted_row": None, "message": f"Ошибка: {str(e)}"}
 
 
+def _find_last_filled_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row: int, max_row: int) -> Optional[int]:
+	"""
+	Находит последнюю заполненную строку в указанном диапазоне.
+	Проверяет, что в строке есть хотя бы одна непустая ячейка.
+	
+	Args:
+		sheet: Рабочий лист Google Sheets
+		range_str: Диапазон столбцов (например, "A:BB")
+		start_row: Номер строки, с которой начинать поиск
+		max_row: Максимальный номер строки для поиска
+		
+	Returns:
+		Номер последней заполненной строки или None, если не найдена
+	"""
+	try:
+		# Извлекаем начальный и конечный столбцы из диапазона (например, "A:BB" -> "A" и "BB")
+		parts = range_str.split(":")
+		if len(parts) != 2:
+			logger.error(f"❌ Неверный формат диапазона: {range_str}")
+			return None
+		
+		start_col = parts[0].strip()
+		end_col = parts[1].strip()
+		
+		# Ищем последнюю заполненную строку, начиная с max_row и идя вниз к start_row
+		batch_size = 50
+		row = max_row
+		
+		while row >= start_row:
+			# Читаем batch строк за один запрос (идем снизу вверх)
+			begin_row = max(row - batch_size + 1, start_row)
+			range_to_check = f"{start_col}{begin_row}:{end_col}{row}"
+			
+			try:
+				values = sheet.get(range_to_check)
+				logger.info(f"🔍 Проверка диапазона {range_to_check}: получено {len(values) if values else 0} строк")
+				
+				if not values or len(values) == 0:
+					# Если нет значений, переходим к предыдущему batch
+					row = begin_row - 1
+					continue
+				
+				# Проверяем каждую строку в batch (снизу вверх)
+				for i in range(len(values) - 1, -1, -1):
+					current_row = begin_row + i
+					
+					if current_row < start_row:
+						break
+					
+					# Проверяем, заполнена ли строка
+					row_data = values[i] if i < len(values) else []
+					row_is_filled = False
+					
+					if row_data:
+						for cell_value in row_data:
+							if cell_value is not None and str(cell_value).strip() != "":
+								row_is_filled = True
+								break
+					
+					if row_is_filled:
+						logger.info(f"✅ Найдена последняя заполненная строка {current_row} в диапазоне {range_str}")
+						return current_row
+				
+				# Если в этом batch не нашли заполненную, переходим к предыдущему
+				row = begin_row - 1
+				
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка чтения диапазона {range_to_check}: {e}, пробуем по одной строке")
+				# Fallback: проверяем по одной строке
+				for check_row in range(row, max(start_row - 1, begin_row - 1), -1):
+					try:
+						row_range = f"{start_col}{check_row}:{end_col}{check_row}"
+						row_values = sheet.get(row_range)
+						
+						# Проверяем, заполнена ли строка
+						is_filled = False
+						if row_values and len(row_values) > 0:
+							row_data = row_values[0] if row_values else []
+							if row_data:
+								for cell_value in row_data:
+									if cell_value is not None and str(cell_value).strip() != "":
+										is_filled = True
+										break
+						
+						if is_filled:
+							logger.info(f"✅ Найдена последняя заполненная строка {check_row} в диапазоне {range_str}")
+							return check_row
+					except Exception as e2:
+						logger.warning(f"⚠️ Ошибка проверки строки {check_row}: {e2}")
+						continue
+				
+				row = begin_row - 1
+		
+		logger.warning(f"⚠️ Не найдена заполненная строка в диапазоне {range_str}, строки {start_row}-{max_row}")
+		return None
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка поиска последней заполненной строки в диапазоне {range_str}: {e}")
+		return None
+
+
 def _delete_last_row_from_google_sheet_sync(
 	sheet_id: str,
 	credentials_path: str,
-	zero_column: str,
 	delete_range: str,
-	start_row: int
+	start_row: int,
+	max_row: int
 ) -> Dict[str, Any]:
 	"""
-	Синхронная функция для удаления последней строки из Google Sheets.
+	Синхронная функция для удаления последней заполненной строки из Google Sheets.
 	"""
 	try:
 		# Создаем клиент
@@ -1171,110 +1422,38 @@ def _delete_last_row_from_google_sheet_sync(
 			logger.error(f"Ошибка доступа к таблице: {e}")
 			raise
 		
-		logger.info(f"🔍 Поиск строки с нулем в столбце {zero_column}, начиная с строки {start_row}")
+		logger.info(f"🔍 Поиск последней заполненной строки в диапазоне {delete_range}, строки {start_row}-{max_row}")
 		
-		# Ищем первую строку с нулем в столбце нулей
-		current_row = start_row
-		found_zero_row = None
+		# Ищем последнюю заполненную строку в диапазоне
+		last_filled_row = _find_last_filled_row_in_range(worksheet, delete_range, start_row, max_row)
 		
-		# Читаем значения пакетами для оптимизации
-		batch_size = 100
-		max_rows = 10000  # Максимальное количество строк для проверки
+		if last_filled_row is None:
+			return {"success": False, "deleted_row": None, "message": f"Не найдена заполненная строка в диапазоне {start_row}-{max_row}"}
 		
-		while current_row < start_row + max_rows:
-			try:
-				# Читаем пакет значений
-				end_row = min(current_row + batch_size - 1, start_row + max_rows)
-				range_str = f"{zero_column}{current_row}:{zero_column}{end_row}"
-				values = worksheet.get(range_str)
-				
-				if not values:
-					# Если нет значений, значит достигли конца данных
-					# Последняя строка с данными - это предыдущая строка
-					if current_row > start_row:
-						found_zero_row = current_row
-						break
-					else:
-						return {"success": False, "deleted_row": None, "message": "Нет данных для удаления"}
-				
-				# Ищем первую строку с нулем
-				for i, row_values in enumerate(values):
-					if not row_values or len(row_values) == 0:
-						# Пустая ячейка - это тоже ноль
-						found_zero_row = current_row + i
-						break
-					
-					cell_value = row_values[0] if row_values else None
-					
-					# Проверяем, является ли значение нулем
-					try:
-						if cell_value is None or cell_value == "":
-							found_zero_row = current_row + i
-							break
-						num_value = float(cell_value)
-						if num_value == 0:
-							found_zero_row = current_row + i
-							break
-					except (ValueError, TypeError):
-						# Не число, пропускаем
-						pass
-				
-				if found_zero_row:
-					break
-				
-				# Переходим к следующему пакету
-				current_row = end_row + 1
-				
-			except Exception as e:
-				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной ячейке")
-				# Fallback: читаем по одной ячейке
-				try:
-					cell_value = worksheet.acell(f"{zero_column}{current_row}").value
-					if cell_value is None or cell_value == "":
-						found_zero_row = current_row
-						break
-					try:
-						num_value = float(cell_value)
-						if num_value == 0:
-							found_zero_row = current_row
-							break
-					except (ValueError, TypeError):
-						pass
-					current_row += 1
-				except Exception as e2:
-					logger.warning(f"Ошибка чтения ячейки {zero_column}{current_row}: {e2}")
-					break
+		logger.info(f"✅ Найдена последняя заполненная строка: {last_filled_row}")
 		
-		if not found_zero_row:
-			return {"success": False, "deleted_row": None, "message": "Не найдена строка привязки"}
+		# Извлекаем начальный и конечный столбцы из диапазона
+		parts = delete_range.split(":")
+		if len(parts) != 2:
+			logger.error(f"❌ Неверный формат диапазона: {delete_range}")
+			return {"success": False, "deleted_row": None, "message": f"Неверный формат диапазона: {delete_range}"}
 		
-		# Удаляем предыдущую строку
-		if found_zero_row <= start_row:
-			return {"success": False, "deleted_row": None, "message": "Таблица пуста"}
+		start_col = parts[0].strip()
+		end_col = parts[1].strip()
 		
-		row_to_delete = found_zero_row - 1
+		# Удаляем строку в указанном диапазоне
+		range_to_delete = f"{start_col}{last_filled_row}:{end_col}{last_filled_row}"
+		logger.info(f"🗑️ Удаление строки {last_filled_row} в диапазоне {range_to_delete}")
 		
-		logger.info(f"📍 Найдена строка с нулем: {zero_column}{found_zero_row}, удаляем строку {row_to_delete}")
-		
-		# Формируем диапазон для удаления (например, A8:BB8)
-		# Если delete_range = "A:BB", то диапазон будет A{row}:BB{row}
-		if ":" in delete_range:
-			start_col, end_col = delete_range.split(":")
-			delete_range_full = f"{start_col}{row_to_delete}:{end_col}{row_to_delete}"
-		else:
-			# Если формат неверный, используем весь ряд
-			delete_range_full = f"{row_to_delete}:{row_to_delete}"
-		
-		# Очищаем диапазон (удаляем значения)
-		# Используем batch_clear для очистки диапазона
+		# Очищаем ячейки в диапазоне (удаляем содержимое)
 		try:
-			worksheet.batch_clear([delete_range_full])
+			worksheet.batch_clear([range_to_delete])
 		except AttributeError:
 			# Если batch_clear не поддерживается, используем clear
-			worksheet.clear(delete_range_full)
-		logger.info(f"✅ Удалена строка {row_to_delete} в диапазоне {delete_range_full}")
+			worksheet.clear(range_to_delete)
 		
-		return {"success": True, "deleted_row": row_to_delete, "message": f"Удалена строка {row_to_delete}"}
+		logger.info(f"✅ Успешно удалена строка {last_filled_row}")
+		return {"success": True, "deleted_row": last_filled_row, "message": f"Успешно удалена строка {last_filled_row}"}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка удаления строки из Google Sheet: {e}")
@@ -1306,19 +1485,17 @@ async def write_to_google_sheet_rate_mode(
 	"""
 	try:
 		db = get_db()
-		btc_column = None
-		ltc_column = None
-		usdt_column = None
-		
 		# Получаем адреса столбцов для всех используемых криптовалют
+		crypto_columns = {}  # {currency: column}
 		for crypto in crypto_list:
 			currency = crypto.get("currency")
-			if currency == "BTC" and not btc_column:
-				btc_column = await db.get_crypto_column("BTC")
-			elif currency == "LTC" and not ltc_column:
-				ltc_column = await db.get_crypto_column("LTC")
-			elif currency == "USDT" and not usdt_column:
-				usdt_column = await db.get_crypto_column("USDT")
+			if currency and currency not in crypto_columns:
+				column = await db.get_crypto_column(currency)
+				if column:
+					crypto_columns[currency] = column
+					logger.info(f"✅ Найден столбец для {currency}: {column}")
+				else:
+					logger.warning(f"⚠️ Не найден столбец для криптовалюты {currency}")
 		
 		# Получаем адреса столбцов для XMR
 		xmr_columns = {}
@@ -1346,11 +1523,16 @@ async def write_to_google_sheet_rate_mode(
 			cash_name = cash.get("cash_name")
 			logger.info(f"🔍 Обработка наличных: cash_name={cash_name}, cash={cash}")
 			if cash_name and cash_name not in cash_columns:
-				cash_column = await db.get_cash_column(cash_name)
-				cash_columns[cash_name] = cash_column
-				# Добавляем адрес столбца в данные наличных
-				cash["column"] = cash_column
-				logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+				cash_column_info = await db.get_cash_column(cash_name)
+				# get_cash_column возвращает словарь, извлекаем column
+				if cash_column_info and isinstance(cash_column_info, dict):
+					cash_column = cash_column_info.get("column")
+					cash_columns[cash_name] = cash_column
+					# Добавляем адрес столбца в данные наличных (только строку, не словарь)
+					cash["column"] = cash_column
+					logger.info(f"🔍 Получен адрес столбца для наличных: cash_name={cash_name}, column={cash_column}")
+				else:
+					logger.warning(f"⚠️ Не найден столбец для наличных: cash_name={cash_name}")
 			elif not cash_name:
 				logger.warning(f"⚠️ Наличные без названия: cash={cash}")
 		
@@ -1359,8 +1541,8 @@ async def write_to_google_sheet_rate_mode(
 		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 355
 		
 		# Получаем начальную строку для режима rate (по умолчанию 348)
-		rate_last_row_str = await db.get_google_sheets_setting("rate_last_row", "348")
-		rate_start_row = int(rate_last_row_str) if rate_last_row_str else 348
+		rate_start_row_str = await db.get_google_sheets_setting("rate_start_row", "348")
+		rate_start_row = int(rate_start_row_str) if rate_start_row_str else 348
 		
 		# Выполняем синхронную запись в отдельном потоке
 		result = await asyncio.to_thread(
@@ -1371,9 +1553,7 @@ async def write_to_google_sheet_rate_mode(
 			xmr_list,
 			cash_list,
 			card_cash_pairs,
-			btc_column,
-			ltc_column,
-			usdt_column,
+			crypto_columns,
 			xmr_columns,
 			rate_max_row,
 			rate_start_row
@@ -1395,9 +1575,7 @@ def _write_to_google_sheet_rate_mode_sync(
 	xmr_list: list,
 	cash_list: list,
 	card_cash_pairs: list,
-	btc_column: Optional[str],
-	ltc_column: Optional[str],
-	usdt_column: Optional[str],
+	crypto_columns: Dict[str, Optional[str]],  # {currency: column}
 	xmr_columns: Dict[int, Optional[str]],
 	rate_max_row: int = 355,
 	start_row: int = 348
@@ -1426,7 +1604,7 @@ def _write_to_google_sheet_rate_mode_sync(
 		failed_writes = []  # Список данных, которые не удалось записать из-за лимита
 		column_rows = {}  # Словарь {column: row} для обновления последних строк (не используется, но оставлен для совместимости)
 		
-		# Записываем криптовалюты (BTC, LTC, USDT)
+		# Записываем криптовалюты (любые типы из базы данных)
 		for crypto in crypto_list:
 			currency = crypto.get("currency")
 			usd_amount = crypto.get("usd_amount", 0.0)
@@ -1440,14 +1618,8 @@ def _write_to_google_sheet_rate_mode_sync(
 				else:
 					usd_amount_negative = usd_amount_rounded  # Уже отрицательное
 				
-				# Определяем столбец и находим первую пустую ячейку
-				column = None
-				if currency == "BTC" and btc_column:
-					column = btc_column
-				elif currency == "LTC" and ltc_column:
-					column = ltc_column
-				elif currency == "USDT" and usdt_column:
-					column = usdt_column
+				# Получаем столбец из словаря crypto_columns
+				column = crypto_columns.get(currency) if currency else None
 				
 				if column:
 					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
@@ -1459,6 +1631,9 @@ def _write_to_google_sheet_rate_mode_sync(
 						written_cells.append(f"{column}{empty_row} ({currency}: {usd_amount_negative} USD)")
 						column_rows[column] = empty_row
 						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {column}{empty_row} ({currency})")
+				else:
+					failed_writes.append(f"{currency}: {usd_amount_rounded} USD (не указан адрес столбца)")
+					logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - не указан адрес столбца")
 		
 		# Записываем XMR
 		for xmr in xmr_list:
@@ -1520,7 +1695,12 @@ def _write_to_google_sheet_rate_mode_sync(
 			cash_name = cash.get("cash_name", "")
 			cash_currency = cash.get("currency", "RUB")
 			cash_amount = cash.get("value", 0)
-			column = cash.get("column")
+			# column может быть строкой или словарем, извлекаем строку
+			column_raw = cash.get("column")
+			if isinstance(column_raw, dict):
+				column = column_raw.get("column")
+			else:
+				column = column_raw
 			
 			if column and cash_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				# В режиме rate записываем со знаком минус (если значение положительное)
