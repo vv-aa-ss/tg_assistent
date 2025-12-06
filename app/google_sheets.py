@@ -2246,6 +2246,115 @@ def _read_card_balance_sync(
 		return None
 
 
+def _read_profits_batch_sync(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
+) -> Dict[str, Optional[str]]:
+	"""
+	Синхронная функция для batch чтения профитов из Google Sheets.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["BD225", "BD275"])
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Словарь {cell_address: value} с значениями из ячеек
+	"""
+	result = {}
+	
+	if not sheet_id or not credentials_path or not cell_addresses:
+		return result
+	
+	try:
+		# Создаем клиент Google Sheets
+		client = _get_google_sheets_client(credentials_path)
+		
+		if not client:
+			logger.warning("Не удалось создать клиент Google Sheets")
+			return result
+		
+		# Открываем таблицу
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
+		
+		# Читаем все значения одним batch запросом
+		logger.info(f"Начинаем batch чтение профитов. Всего ячеек: {len(cell_addresses)}")
+		
+		try:
+			# Используем batch_get для чтения всех ячеек за один запрос
+			values = worksheet.batch_get(cell_addresses)
+			
+			# Обрабатываем результаты
+			for i, cell_address in enumerate(cell_addresses):
+				try:
+					# values[i] - это список строк для данной ячейки (обычно одна строка)
+					# values[i][0] - первая строка
+					# values[i][0][0] - первое значение в строке
+					if i < len(values) and values[i] and len(values[i]) > 0:
+						row = values[i][0]
+						if row and len(row) > 0:
+							value = str(row[0]).strip()
+							# Если значение пустое после strip, считаем его None
+							if not value:
+								value = None
+							logger.debug(f"Прочитано значение из {cell_address}: '{value}'")
+						else:
+							value = None
+							logger.debug(f"Ячейка {cell_address} пустая")
+					else:
+						value = None
+						logger.debug(f"Ячейка {cell_address} не найдена в ответе")
+					
+					result[cell_address] = value
+					
+				except (IndexError, TypeError) as e:
+					logger.warning(f"Ошибка обработки ячейки {cell_address}: {e}")
+					result[cell_address] = None
+		except Exception as e:
+			logger.exception(f"Ошибка batch чтения профитов: {e}")
+			# В случае ошибки batch чтения, помечаем все как None
+			for cell_address in cell_addresses:
+				result[cell_address] = None
+		
+	except Exception as e:
+		logger.exception(f"Ошибка чтения профитов: {e}")
+	
+	return result
+
+
+async def read_profits_batch(
+	sheet_id: str,
+	credentials_path: str,
+	cell_addresses: List[str],
+	sheet_name: Optional[str] = None
+) -> Dict[str, Optional[str]]:
+	"""
+	Читает профиты из Google Sheets batch запросом.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_addresses: Список адресов ячеек (например, ["BD225", "BD275"])
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Словарь {cell_address: value} с значениями из ячеек
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_profits_batch_sync,
+		sheet_id,
+		credentials_path,
+		cell_addresses,
+		sheet_name
+	)
+
+
 async def read_card_balance(
 	sheet_id: str,
 	credentials_path: str,

@@ -3805,77 +3805,78 @@ async def _update_crypto_values_in_stats(
 		day_name = day_names[weekday]
 		day_name_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"][weekday]
 		
+		# Собираем все адреса ячеек для профитов для batch чтения
+		profit_cells_to_read = {}  # {cell_address: day_name}
+		import re
+		
 		# Получаем ячейку профита за текущий день
 		profit_cell_key = f"profit_{day_name}"
 		profit_cell = await db.get_google_sheets_setting(profit_cell_key)
-		
 		if profit_cell:
-			try:
-				# profit_cell уже содержит полный адрес ячейки (например, BD225)
-				# Используем функцию для чтения по полному адресу
-				from app.google_sheets import _read_card_balance_sync
-				import asyncio
-				# Парсим адрес ячейки: извлекаем столбец и строку
-				import re
-				match = re.match(r'([A-Z]+)(\d+)', profit_cell)
-				if match:
-					column = match.group(1)
-					row = int(match.group(2))
-					profit_today = await asyncio.to_thread(
-						_read_card_balance_sync,
-						sheet_id,
-						credentials_path,
-						column,
-						row
-					)
-					if profit_today:
-						try:
-							profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
-							formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
-							profit_lines.append(f"<code>📈 Профит за сегодня: {formatted_profit} USD</code>")
-						except (ValueError, AttributeError):
-							profit_lines.append(f"<code>📈 Профит за сегодня: {profit_today} USD</code>")
-			except Exception as e:
-				logger.warning(f"Ошибка чтения профита за день: {e}")
+			profit_cells_to_read[profit_cell] = day_name
 		
-		# Читаем средний профит с начала недели (с понедельника)
-		# Если сегодня понедельник, не отображаем средний профит, так как он будет равен профиту за сегодня
+		# Собираем адреса ячеек для среднего профита (если не понедельник)
 		if weekday != 0:  # 0 = понедельник
 			profit_days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 			# Берем только дни с понедельника до текущего дня включительно
 			profit_days = profit_days_all[:weekday + 1]
-			profit_values = []
 			
 			for day in profit_days:
 				profit_cell_key = f"profit_{day}"
 				profit_cell = await db.get_google_sheets_setting(profit_cell_key)
-				if profit_cell:
-					try:
-						# Парсим адрес ячейки: извлекаем столбец и строку
-						match = re.match(r'([A-Z]+)(\d+)', profit_cell)
-						if match:
-							column = match.group(1)
-							row = int(match.group(2))
-							profit_value = await asyncio.to_thread(
-								_read_card_balance_sync,
-								sheet_id,
-								credentials_path,
-								column,
-								row
-							)
+				if profit_cell and profit_cell not in profit_cells_to_read:
+					profit_cells_to_read[profit_cell] = day
+		
+		# Читаем все профиты одним batch запросом
+		if profit_cells_to_read:
+			try:
+				from app.google_sheets import read_profits_batch
+				cell_addresses = list(profit_cells_to_read.keys())
+				profits_data = await read_profits_batch(
+					sheet_id,
+					credentials_path,
+					cell_addresses,
+					sheet_name
+				)
+				
+				# Обрабатываем профит за сегодня
+				if day_name in profit_cells_to_read.values():
+					# Находим ячейку для сегодняшнего дня
+					today_cell = None
+					for cell, day in profit_cells_to_read.items():
+						if day == day_name:
+							today_cell = cell
+							break
+					
+					if today_cell and today_cell in profits_data:
+						profit_today = profits_data[today_cell]
+						if profit_today:
+							try:
+								profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
+								formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
+								profit_lines.append(f"<code>📈 Профит за сегодня: {formatted_profit} USD</code>")
+							except (ValueError, AttributeError):
+								profit_lines.append(f"<code>📈 Профит за сегодня: {profit_today} USD</code>")
+				
+				# Обрабатываем средний профит (если не понедельник)
+				if weekday != 0:
+					profit_values = []
+					for cell_address, day in profit_cells_to_read.items():
+						if cell_address in profits_data:
+							profit_value = profits_data[cell_address]
 							if profit_value:
 								try:
 									value = float(str(profit_value).replace(",", ".").replace(" ", ""))
 									profit_values.append(value)
 								except (ValueError, AttributeError):
 									pass
-					except Exception as e:
-						logger.warning(f"Ошибка чтения профита за {day}: {e}")
-			
-			if profit_values:
-				avg_profit = sum(profit_values) / len(profit_values)
-				formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
-				profit_lines.append(f"<code>📊 Средний профит с начала недели: {formatted_avg} USD</code>")
+					
+					if profit_values:
+						avg_profit = sum(profit_values) / len(profit_values)
+						formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
+						profit_lines.append(f"<code>📊 Средний профит с начала недели: {formatted_avg} USD</code>")
+			except Exception as e:
+				logger.warning(f"Ошибка batch чтения профитов: {e}")
 		
 		# Объединяем базовые строки, строки с криптовалютами и профитом
 		all_lines = base_lines + crypto_lines
@@ -4086,10 +4087,10 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
 	balance_row = int(balance_row_str) if balance_row_str else 4
 	
-	# Получаем все карты
-	all_cards = await db.list_cards()
+	# Получаем все карты с их столбцами и группами одним запросом (оптимизация)
+	all_cards_data = await db.get_all_cards_with_columns_and_groups()
 	
-	if not all_cards:
+	if not all_cards_data:
 		await msg.answer("❌ Карты не найдены", reply_markup=simple_back_kb("admin:back"))
 		return
 	
@@ -4106,15 +4107,15 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	all_groups = await db.list_card_groups()
 	group_names = {group["id"]: group["name"] for group in all_groups}
 	
-	for card_id, card_name, card_details in all_cards:
-		# Получаем столбец для карты
-		column = await db.get_card_column(card_id)
+	# Обрабатываем карты (данные уже получены одним запросом)
+	for card_data in all_cards_data:
+		card_id = card_data["card_id"]
+		card_name = card_data["name"]
+		column = card_data["column"]
+		group_id = card_data["group_id"]
 		
 		if column:
 			cell_address = f"{column}{balance_row}"
-			# Получаем информацию о карте, чтобы узнать группу
-			card = await db.get_card_by_id(card_id)
-			group_id = card.get("group_id") if card else None
 			
 			if group_id:
 				if group_id not in cards_by_group:

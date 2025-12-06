@@ -79,6 +79,7 @@ class Database:
 		await self._ensure_card_groups()
 		await self._ensure_google_sheets_settings()
 		await self._ensure_card_requisites()
+		await self._ensure_rate_history()
 		await self._ensure_menu_user()
 		await self._db.commit()
 
@@ -931,6 +932,36 @@ class Database:
 		await self._db.commit()
 		_logger.debug(f"User deleted: id={user_id}")
 
+	async def get_all_cards_with_columns_and_groups(self) -> List[Dict[str, Any]]:
+		"""
+		Получает все карты с их столбцами и группами одним запросом.
+		Оптимизированная версия для команды /stat_bk.
+		
+		Returns:
+			Список словарей с ключами: card_id, name, column, group_id
+		"""
+		assert self._db
+		cur = await self._db.execute("""
+			SELECT 
+				c.id as card_id,
+				c.name,
+				cc.column,
+				c.group_id
+			FROM cards c
+			LEFT JOIN card_columns cc ON c.id = cc.card_id
+			ORDER BY c.id DESC
+		""")
+		rows = await cur.fetchall()
+		result = []
+		for row in rows:
+			result.append({
+				"card_id": row[0],
+				"name": row[1],
+				"column": row[2],
+				"group_id": row[3] if len(row) > 3 else None
+			})
+		return result
+
 	async def get_card_column(self, card_id: int, user_name: Optional[str] = None) -> Optional[str]:
 		"""
 		Получает адрес столбца для карты.
@@ -1381,6 +1412,88 @@ class Database:
 				"CREATE INDEX IF NOT EXISTS idx_card_requisites_card_id ON card_requisites(card_id)"
 			)
 			_logger.debug("Created table card_requisites")
+
+	async def _ensure_rate_history(self) -> None:
+		"""Создает таблицу для хранения истории операций /rate"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='rate_history'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE rate_history (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					created_at INTEGER NOT NULL,
+					note TEXT,
+					operations TEXT NOT NULL
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_rate_history_created_at ON rate_history(created_at DESC)"
+			)
+			_logger.debug("Created table rate_history")
+	
+	async def add_rate_history(self, operations: str, note: str = None) -> int:
+		"""
+		Добавляет запись в историю операций /rate.
+		
+		Args:
+			operations: JSON строка с информацией о записанных ячейках и значениях
+			note: Примечание (опционально)
+		
+		Returns:
+			ID созданной записи
+		"""
+		assert self._db
+		import time
+		created_at = int(time.time())
+		cur = await self._db.execute(
+			"INSERT INTO rate_history(created_at, note, operations) VALUES(?, ?, ?)",
+			(created_at, note, operations)
+		)
+		await self._db.commit()
+		return cur.lastrowid
+	
+	async def get_last_rate_history(self) -> Optional[Dict[str, Any]]:
+		"""
+		Получает последнюю запись из истории операций /rate.
+		
+		Returns:
+			Словарь с данными записи или None, если записей нет
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, created_at, note, operations FROM rate_history ORDER BY created_at DESC LIMIT 1"
+		)
+		row = await cur.fetchone()
+		if row:
+			return {
+				"id": row[0],
+				"created_at": row[1],
+				"note": row[2],
+				"operations": row[3]
+			}
+		return None
+	
+	async def delete_rate_history(self, history_id: int) -> bool:
+		"""
+		Удаляет запись из истории операций /rate.
+		
+		Args:
+			history_id: ID записи для удаления
+		
+		Returns:
+			True если запись удалена, False если не найдена
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"DELETE FROM rate_history WHERE id = ?",
+			(history_id,)
+		)
+		await self._db.commit()
+		return cur.rowcount > 0
 
 	async def _ensure_google_sheets_settings(self) -> None:
 		"""Создает таблицу для хранения настроек Google Sheets"""
