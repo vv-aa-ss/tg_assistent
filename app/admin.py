@@ -916,6 +916,155 @@ async def delete_rate_second_confirmation_yes(cb: CallbackQuery, state: FSMConte
 				else:
 					report_lines.append(f"  • {cell_address} ({value_str})")
 			
+			# Получаем новый баланс после удаления
+			from app.google_sheets import get_crypto_values_from_row_4, read_card_balances_batch
+			
+			# Получаем balance_row из настроек
+			balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
+			balance_row = int(balance_row_str) if balance_row_str else 4
+			
+			# Собираем уникальные карты, криптовалюты и наличку из удаленных ячеек
+			cards_to_check = set()  # {card_name}
+			crypto_to_check = set()  # {crypto_type}
+			cash_to_check = set()  # {cash_name}
+			
+			for cell_info in deleted_cells_info:
+				cell_type = cell_info.get("type", "")
+				if cell_type == "card":
+					card_name = cell_info.get("card_name", "")
+					if card_name:
+						cards_to_check.add(card_name)
+				elif cell_type == "crypto":
+					crypto_type = cell_info.get("crypto_type", "")
+					if crypto_type:
+						crypto_to_check.add(crypto_type)
+				elif cell_type == "cash":
+					cash_name = cell_info.get("cash_name", "")
+					if cash_name:
+						cash_to_check.add(cash_name)
+			
+			# Получаем балансы карт
+			card_balances = {}
+			if cards_to_check:
+				card_balance_cell_addresses = []
+				card_mapping = {}  # {cell_address: card_name}
+				
+				# Получаем все карты с их столбцами
+				all_cards_data = await db.get_all_cards_with_columns_and_groups()
+				
+				for card_name in cards_to_check:
+					# Ищем карту по имени
+					card_info = None
+					for card_data in all_cards_data:
+						if card_data.get("name") == card_name:
+							card_info = card_data
+							break
+					
+					if card_info and card_info.get("column"):
+						column = card_info.get("column")
+						cell_address = f"{column}{balance_row}"
+						card_balance_cell_addresses.append(cell_address)
+						card_mapping[cell_address] = card_name
+				
+				# Читаем все балансы карт одним batch запросом
+				if card_balance_cell_addresses:
+					try:
+						card_balances_dict = await read_card_balances_batch(
+							settings.google_sheet_id,
+							settings.google_credentials_path,
+							card_balance_cell_addresses,
+							settings.google_sheet_name
+						)
+						for cell_address, card_name in card_mapping.items():
+							balance = card_balances_dict.get(cell_address)
+							if balance:
+								card_balances[card_name] = balance
+					except Exception as e:
+						logger.warning(f"Ошибка чтения балансов карт: {e}")
+			
+			# Получаем балансы криптовалют
+			crypto_balances = {}
+			if crypto_to_check:
+				try:
+					# Получаем все криптовалюты из БД
+					all_crypto_columns = await db.list_crypto_columns()
+					# Фильтруем только те, которые были в удаленных ячейках
+					crypto_columns_to_read = [
+						crypto for crypto in all_crypto_columns
+						if crypto.get("crypto_type") in crypto_to_check
+					]
+					
+					if crypto_columns_to_read:
+						crypto_values = await get_crypto_values_from_row_4(
+							settings.google_sheet_id,
+							settings.google_credentials_path,
+							crypto_columns_to_read,
+							settings.google_sheet_name
+						)
+						for crypto_type in crypto_to_check:
+							value = crypto_values.get(crypto_type)
+							if value:
+								crypto_balances[crypto_type] = value
+				except Exception as e:
+					logger.warning(f"Ошибка чтения балансов криптовалют: {e}")
+			
+			# Получаем балансы налички
+			cash_balances = {}
+			if cash_to_check:
+				cash_balance_cell_addresses = []
+				cash_mapping = {}  # {cell_address: cash_name}
+				
+				for cash_name in cash_to_check:
+					# Получаем столбец налички из БД
+					cash_column_info = await db.get_cash_column(cash_name)
+					if cash_column_info and cash_column_info.get("column"):
+						column = cash_column_info.get("column")
+						cell_address = f"{column}{balance_row}"
+						cash_balance_cell_addresses.append(cell_address)
+						cash_mapping[cell_address] = cash_name
+				
+				# Читаем все балансы налички одним batch запросом
+				if cash_balance_cell_addresses:
+					try:
+						cash_balances_dict = await read_card_balances_batch(
+							settings.google_sheet_id,
+							settings.google_credentials_path,
+							cash_balance_cell_addresses,
+							settings.google_sheet_name
+						)
+						for cell_address, cash_name in cash_mapping.items():
+							balance = cash_balances_dict.get(cell_address)
+							if balance:
+								cash_balances[cash_name] = balance
+					except Exception as e:
+						logger.warning(f"Ошибка чтения балансов налички: {e}")
+			
+			# Добавляем новый баланс в отчет
+			if card_balances or crypto_balances or cash_balances:
+				report_lines.append("")
+				report_lines.append("💰 Новый баланс после удаления:")
+				
+				# Добавляем балансы карт
+				if card_balances:
+					for card_name, balance in sorted(card_balances.items()):
+						report_lines.append(f"  💳 Карта {card_name} = {balance}")
+				
+				# Добавляем балансы криптовалют
+				if crypto_balances:
+					for crypto_type, balance in sorted(crypto_balances.items()):
+						# Форматируем значение
+						try:
+							balance_float = float(str(balance).replace(",", ".").replace(" ", ""))
+							formatted_balance = f"{int(round(balance_float)):,}".replace(",", " ")
+							report_lines.append(f"  ₿ {crypto_type} = {formatted_balance} USD")
+						except (ValueError, TypeError):
+							report_lines.append(f"  ₿ {crypto_type} = {balance} USD")
+				
+				# Добавляем балансы налички
+				if cash_balances:
+					for cash_name, balance in sorted(cash_balances.items()):
+						report_lines.append(f"  💵 Наличные {cash_name} = {balance}")
+			
 			report_text = "\n".join(report_lines)
 			await cb.message.edit_text(report_text)
 		else:
@@ -1281,6 +1430,24 @@ async def add_data_back(cb: CallbackQuery, state: FSMContext):
 	"""Возврат к меню выбора типа данных"""
 	parts = cb.data.split(":")
 	mode = parts[2]
+	
+	data = await state.get_data()
+	editing_block_idx = data.get("editing_block_idx")
+	
+	# Если редактировался сохраненный блок, но пользователь нажал "Назад" без сохранения изменений,
+	# нужно очистить текущий блок и сбросить editing_block_idx, чтобы не создавать дубликат
+	if editing_block_idx is not None:
+		# Очищаем текущий блок, так как изменения не были сохранены
+		await state.update_data(
+			crypto_data=None,
+			cash_data=None,
+			card_data=None,
+			card_cash_data=None,
+			xmr_number=None,
+			crypto_currency=None,
+			cash_name=None,
+			editing_block_idx=None
+		)
 	
 	await state.set_state(AddDataStates.selecting_type)
 	from app.keyboards import add_data_type_kb
@@ -4640,6 +4807,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				else:
 					# Карт нет - показываем выбор группы карт для привязки
 					logger.info(f"⚠️ У пользователя '{orig_full_name}' нет привязанных карт, предлагаем выбрать группу")
+					# Сначала отправляем ссылку на mempool, если есть BTC адреса
+					if text:
+						await check_and_send_btc_address_links(bot, message.chat.id, text)
+					# Затем показываем выбор карты
 					groups = await db.list_card_groups()
 					if groups:
 						await state.set_state(ForwardBindStates.waiting_select_group)
@@ -4731,6 +4902,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			)
 			return
 		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать группу карт")
+		# Сначала отправляем ссылку на mempool, если есть BTC адреса
+		if text:
+			await check_and_send_btc_address_links(bot, message.chat.id, text)
+		# Затем показываем выбор карты
 		groups = await db.list_card_groups()
 		if groups:
 			await state.set_state(ForwardBindStates.waiting_select_group)
@@ -4750,6 +4925,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		if orig_username:
 			# Пользователь не найден в БД, но есть username - возможно первый раз
 			logger.warning(f"Не удалось определить ID пользователя, но есть username={orig_username}. Возможные причины: пользователь скрыл данные в настройках приватности Telegram или еще не взаимодействовал с ботом.")
+			# Сначала отправляем ссылку на mempool, если есть BTC адреса
+			if text:
+				await check_and_send_btc_address_links(bot, message.chat.id, text)
+			# Затем показываем выбор карты
 			groups = await db.list_card_groups()
 			if groups:
 				await state.set_state(ForwardBindStates.waiting_select_group)
@@ -4792,6 +4971,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				return
 			else:
 				# Не найдено похожих - сохраняем имя для последующей привязки
+				# Сначала отправляем ссылку на mempool, если есть BTC адреса
+				if text:
+					await check_and_send_btc_address_links(bot, message.chat.id, text)
+				# Затем показываем выбор карты
 				groups = await db.list_card_groups()
 				if groups:
 					await state.set_state(ForwardBindStates.waiting_select_group)
@@ -4819,6 +5002,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				await message.answer("Сообщение карты отсутствует")
 			return
 	# as last resort: show groups to reply-only
+	# Сначала отправляем ссылку на mempool, если есть BTC адреса
+	if text:
+		await check_and_send_btc_address_links(bot, message.chat.id, text)
+	# Затем показываем выбор карты
 	groups = await db.list_card_groups()
 	if groups:
 		await state.set_state(ForwardBindStates.waiting_select_group)
@@ -4892,6 +5079,11 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back"))
 	else:
 		# Не привязан - выбираем группу карт для привязки
+		# Сначала отправляем ссылку на mempool, если есть BTC адреса
+		forwarded_text = data.get("forwarded_message_text", "")
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+		# Затем показываем выбор карты
 		groups = await db.list_card_groups()
 		if groups:
 			await state.set_state(ForwardBindStates.waiting_select_group)
