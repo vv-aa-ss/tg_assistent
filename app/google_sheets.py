@@ -776,16 +776,33 @@ async def write_to_google_sheet(
 		
 		# Вычисляем адрес столбца для наличных, если есть карта
 		if cash_data and card_data:
+			card_id = card_data.get("card_id")
 			card_name = card_data.get("card_name", "")
 			user_name = card_data.get("user_name", "")
-			column = await get_card_column(card_name, user_name)
+			
+			# Используем уже имеющийся column, если он есть
+			column = card_data.get("column")
+			
+			if not column and card_id:
+				# Если column нет, но есть card_id, получаем его из базы данных
+				db = get_db()
+				column = await db.get_card_column(card_id)
+				if column:
+					logger.debug(f"✅ Получен столбец по card_id={card_id}: column='{column}'")
+			
+			if not column:
+				# Только если нет ни column, ни card_id, используем поиск по имени (fallback)
+				column = await get_card_column(card_name, user_name)
+				if column:
+					logger.warning(f"⚠️ Использован поиск по имени для card_name='{card_name}', найден column='{column}'")
+			
 			if column:
 				# Добавляем адрес столбца в данные карты
 				card_data = card_data.copy()
 				card_data["column"] = column
-				logger.debug(f"✅ Адрес столбца вычислен: card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
+				logger.debug(f"✅ Адрес столбца вычислен: card_id={card_id}, card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
 			else:
-				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_name='{card_name}', user_name='{user_name}'")
+				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_id={card_id}, card_name='{card_name}', user_name='{user_name}'")
 		
 		# Получаем адреса столбцов для криптовалют из базы данных
 		crypto_column = None
@@ -875,16 +892,33 @@ async def write_xmr_to_google_sheet(
 		
 		# Вычисляем адрес столбца для наличных, если есть карта
 		if cash_data and card_data:
+			card_id = card_data.get("card_id")
 			card_name = card_data.get("card_name", "")
 			user_name = card_data.get("user_name", "")
-			column = await get_card_column(card_name, user_name)
+			
+			# Используем уже имеющийся column, если он есть
+			column = card_data.get("column")
+			
+			if not column and card_id:
+				# Если column нет, но есть card_id, получаем его из базы данных
+				db = get_db()
+				column = await db.get_card_column(card_id)
+				if column:
+					logger.debug(f"✅ Получен столбец по card_id={card_id}: column='{column}'")
+			
+			if not column:
+				# Только если нет ни column, ни card_id, используем поиск по имени (fallback)
+				column = await get_card_column(card_name, user_name)
+				if column:
+					logger.warning(f"⚠️ Использован поиск по имени для card_name='{card_name}', найден column='{column}'")
+			
 			if column:
 				# Добавляем адрес столбца в данные карты
 				card_data = card_data.copy()
 				card_data["column"] = column
-				logger.debug(f"✅ Адрес столбца вычислен: card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
+				logger.debug(f"✅ Адрес столбца вычислен: card_id={card_id}, card_name='{card_name}', user_name='{user_name}' -> column='{column}'")
 			else:
-				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_name='{card_name}', user_name='{user_name}'")
+				logger.warning(f"⚠️ Не удалось определить адрес столбца для card_id={card_id}, card_name='{card_name}', user_name='{user_name}'")
 		
 		# Выполняем синхронную запись в отдельном потоке
 		# Передаем None для xmr_price, так как он больше не используется
@@ -999,7 +1033,8 @@ async def write_all_to_google_sheet_one_row(
 	xmr_list: list,  # [{"xmr_number": 1, "usd_amount": 50}, ...]
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
 	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
-	mode: str = "add"  # Режим: "add" или "move"
+	mode: str = "add",  # Режим: "add" или "move"
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Записывает все данные в одну строку Google Sheets.
@@ -1117,7 +1152,8 @@ async def write_all_to_google_sheet_one_row(
 			xmr_columns,
 			start_row,
 			max_row,
-			delete_range
+			delete_range,
+			sheet_name
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
@@ -1135,7 +1171,8 @@ def _write_all_to_google_sheet_one_row_sync(
 	xmr_columns: Dict[int, Optional[str]],
 	start_row: int = 5,
 	max_row: int = 374,
-	delete_range: str = "A:BB"
+	delete_range: str = "A:BB",
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи всех данных в одну строку Google Sheets.
@@ -1346,7 +1383,8 @@ async def delete_last_row_from_google_sheet(
 			credentials_path,
 			delete_range,
 			start_row,
-			max_row
+			max_row,
+			sheet_name
 		)
 	except Exception as e:
 		logger.exception(f"Ошибка удаления последней строки из Google Sheet: {e}")
@@ -1459,7 +1497,8 @@ def _delete_last_row_from_google_sheet_sync(
 	credentials_path: str,
 	delete_range: str,
 	start_row: int,
-	max_row: int
+	max_row: int,
+	sheet_name: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для удаления последней заполненной строки из Google Sheets.
@@ -1517,6 +1556,53 @@ def _delete_last_row_from_google_sheet_sync(
 		return {"success": False, "deleted_row": None, "message": f"Ошибка: {str(e)}"}
 
 
+async def delete_last_move_row_from_google_sheet(
+	sheet_id: str,
+	credentials_path: str,
+	sheet_name: Optional[str] = None
+) -> Dict[str, Any]:
+	"""
+	Удаляет последнюю заполненную строку из Google Sheets в диапазоне move.
+	Ищет последнюю заполненную строку в диапазоне move_start_row - move_max_row.
+	Удаляет эту строку в диапазоне, указанном в настройках (по умолчанию A:BB).
+	
+	Args:
+		sheet_id: ID Google Sheet
+		credentials_path: Путь к файлу с учетными данными
+		sheet_name: Название листа (опционально)
+		
+	Returns:
+		Словарь с результатами: {"success": bool, "deleted_row": int | None, "message": str}
+	"""
+	try:
+		# Получаем настройки из базы данных
+		db = get_db()
+		delete_range = await db.get_google_sheets_setting("delete_range", "A:BB")
+		
+		# Получаем настройки для move из БД
+		move_start_row_str = await db.get_google_sheets_setting("move_start_row", "375")
+		move_max_row_str = await db.get_google_sheets_setting("move_max_row", "406")
+		
+		start_row = int(move_start_row_str) if move_start_row_str else 375
+		max_row = int(move_max_row_str) if move_max_row_str else 406
+		
+		logger.info(f"📅 Удаление передвижения: start_row={start_row}, max_row={max_row}, delete_range={delete_range}")
+		
+		# Выполняем синхронное удаление в отдельном потоке
+		return await asyncio.to_thread(
+			_delete_last_row_from_google_sheet_sync,
+			sheet_id,
+			credentials_path,
+			delete_range,
+			start_row,
+			max_row,
+			sheet_name
+		)
+	except Exception as e:
+		logger.exception(f"Ошибка удаления последнего передвижения из Google Sheet: {e}")
+		return {"success": False, "deleted_row": None, "message": f"Ошибка: {str(e)}"}
+
+
 async def write_to_google_sheet_rate_mode(
 	sheet_id: str,
 	credentials_path: str,
@@ -1524,7 +1610,8 @@ async def write_to_google_sheet_rate_mode(
 	xmr_list: list,  # [{"xmr_number": 1, "usd_amount": 50}, ...]
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
 	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
-	sheet_name: Optional[str] = None
+	sheet_name: Optional[str] = None,
+	note: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Записывает данные в режиме rate: каждая запись идет в первую пустую ячейку соответствующего столбца,
@@ -1566,12 +1653,37 @@ async def write_to_google_sheet_rate_mode(
 		card_columns = {}
 		for pair in card_cash_pairs:
 			card_data = pair.get("card")
+			card_id = card_data.get("card_id")
 			card_name = card_data.get("card_name", "")
 			user_name = card_data.get("user_name", "")
-			key = f"{card_name}_{user_name}"
+			
+			# Используем уже имеющийся column, если он есть
+			column = card_data.get("column")
+			
+			if not column and card_id:
+				# Если column нет, но есть card_id, получаем его из базы данных
+				column = await db.get_card_column(card_id)
+				if column:
+					logger.debug(f"✅ Получен столбец по card_id={card_id}: column='{column}'")
+			
+			if not column:
+				# Только если нет ни column, ни card_id, используем поиск по имени (fallback)
+				column = await get_card_column(card_name, user_name)
+				if column:
+					logger.warning(f"⚠️ Использован поиск по имени для card_name='{card_name}', найден column='{column}'")
+			
+			# Используем card_id как ключ, если он есть, иначе используем имя
+			if card_id:
+				key = f"card_id_{card_id}"
+			else:
+				key = f"{card_name}_{user_name}"
+			
 			if key not in card_columns:
-				card_columns[key] = await get_card_column(card_name, user_name)
+				card_columns[key] = column
 				# Добавляем адрес столбца в данные карты
+				card_data["column"] = column
+			else:
+				# Если ключ уже есть, используем сохраненный column
 				card_data["column"] = card_columns[key]
 		
 		# Получаем адреса столбцов для наличных
@@ -1621,6 +1733,16 @@ async def write_to_google_sheet_rate_mode(
 		# В режиме rate всегда начинаем с rate_start_row (по умолчанию 407), не сохраняем последние использованные строки
 		# (убрано сохранение rate_last_row_{column} для каждого столбца)
 		
+		# Сохраняем историю операций в БД, если запись была успешной
+		if result.get("success") and result.get("operations_history"):
+			import json
+			operations_json = json.dumps(result.get("operations_history"), ensure_ascii=False)
+			try:
+				history_id = await db.add_rate_history(operations_json, note=note)
+				logger.info(f"✅ История операции /rate сохранена в БД с ID: {history_id}, примечание: {note or 'нет'}")
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка сохранения истории операции /rate: {e}")
+		
 		return result
 	except Exception as e:
 		logger.exception(f"Ошибка записи данных в режиме rate: {e}")
@@ -1663,6 +1785,7 @@ def _write_to_google_sheet_rate_mode_sync(
 		written_cells = []
 		failed_writes = []  # Список данных, которые не удалось записать из-за лимита
 		column_rows = {}  # Словарь {column: row} для обновления последних строк (не используется, но оставлен для совместимости)
+		operations_history = []  # Список операций для истории: [{"cell": "A123", "value": 100}, ...]
 		
 		# Записываем криптовалюты (любые типы из базы данных)
 		for crypto in crypto_list:
@@ -1687,10 +1810,17 @@ def _write_to_google_sheet_rate_mode_sync(
 						failed_writes.append(f"{currency}: {usd_amount_rounded} USD (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
-						worksheet.update(f"{column}{empty_row}", [[usd_amount_negative]])
-						written_cells.append(f"{column}{empty_row} ({currency}: {usd_amount_negative} USD)")
+						cell_address = f"{column}{empty_row}"
+						worksheet.update(cell_address, [[usd_amount_negative]])
+						written_cells.append(f"{cell_address} ({currency}: {usd_amount_negative} USD)")
 						column_rows[column] = empty_row
-						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {column}{empty_row} ({currency})")
+						operations_history.append({
+							"cell": cell_address,
+							"value": usd_amount_negative,
+							"type": "crypto",
+							"currency": currency
+						})
+						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {cell_address} ({currency})")
 				else:
 					failed_writes.append(f"{currency}: {usd_amount_rounded} USD (не указан адрес столбца)")
 					logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - не указан адрес столбца")
@@ -1716,10 +1846,17 @@ def _write_to_google_sheet_rate_mode_sync(
 						failed_writes.append(f"XMR-{xmr_number}: {usd_amount_rounded} USD (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано XMR-{xmr_number}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
-						worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_negative]])
-						written_cells.append(f"{usd_column}{empty_row} (XMR-{xmr_number}: {usd_amount_negative} USD)")
+						cell_address = f"{usd_column}{empty_row}"
+						worksheet.update(cell_address, [[usd_amount_negative]])
+						written_cells.append(f"{cell_address} (XMR-{xmr_number}: {usd_amount_negative} USD)")
 						column_rows[usd_column] = empty_row
-						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
+						operations_history.append({
+							"cell": cell_address,
+							"value": usd_amount_negative,
+							"type": "xmr",
+							"xmr_number": xmr_number
+						})
+						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Записываем наличные для каждой карты
 		for pair in card_cash_pairs:
@@ -1744,10 +1881,18 @@ def _write_to_google_sheet_rate_mode_sync(
 						failed_writes.append(f"Карта {card_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для карты {card_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
-						worksheet.update(f"{column}{empty_row}", [[cash_amount_negative]])
-						written_cells.append(f"{column}{empty_row} (Карта {card_name}: {cash_amount_negative} {cash_currency})")
+						cell_address = f"{column}{empty_row}"
+						worksheet.update(cell_address, [[cash_amount_negative]])
+						written_cells.append(f"{cell_address} (Карта {card_name}: {cash_amount_negative} {cash_currency})")
 						column_rows[column] = empty_row
-						logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {column}{empty_row} (карта: {card_name})")
+						operations_history.append({
+							"cell": cell_address,
+							"value": cash_amount_negative,
+							"type": "card",
+							"card_name": card_name,
+							"currency": cash_currency
+						})
+						logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {cell_address} (карта: {card_name})")
 		
 		# Записываем наличные без карты
 		logger.info(f"🔍 Запись наличных без карты: cash_list={cash_list}, len={len(cash_list)}")
@@ -1774,10 +1919,18 @@ def _write_to_google_sheet_rate_mode_sync(
 					failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
 					logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 				else:
-					worksheet.update(f"{column}{empty_row}", [[cash_amount_negative]])
-					written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {cash_amount_negative} {cash_currency})")
+					cell_address = f"{column}{empty_row}"
+					worksheet.update(cell_address, [[cash_amount_negative]])
+					written_cells.append(f"{cell_address} (Наличные {cash_name}: {cash_amount_negative} {cash_currency})")
 					column_rows[column] = empty_row
-					logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
+					operations_history.append({
+						"cell": cell_address,
+						"value": cash_amount_negative,
+						"type": "cash",
+						"cash_name": cash_name,
+						"currency": cash_currency
+					})
+					logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {cell_address} (наличные: {cash_name})")
 			elif not column:
 				failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (не указан адрес столбца)")
 				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")
@@ -1788,12 +1941,138 @@ def _write_to_google_sheet_rate_mode_sync(
 			"success": len(written_cells) > 0 or len(failed_writes) == 0,
 			"written_cells": written_cells,
 			"failed_writes": failed_writes,
-			"column_rows": column_rows
+			"column_rows": column_rows,
+			"operations_history": operations_history  # История операций для сохранения в БД
 		}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка записи данных в режиме rate: {e}")
 		return {"success": False, "written_cells": []}
+
+
+async def delete_last_rate_operation(
+	sheet_id: str,
+	credentials_path: str,
+	operations_history: List[Dict[str, Any]],
+	sheet_name: Optional[str] = None
+) -> Dict[str, Any]:
+	"""
+	Удаляет последнюю операцию /rate из Google Sheets.
+	Очищает ячейки, указанные в operations_history.
+	
+	Args:
+		sheet_id: ID Google Sheet
+		credentials_path: Путь к файлу с учетными данными
+		operations_history: Список операций из истории [{"cell": "A123", "value": 100}, ...]
+		sheet_name: Имя листа (опционально)
+		
+	Returns:
+		Словарь с результатами: {"success": bool, "deleted_cells": list, "message": str}
+	"""
+	try:
+		return await asyncio.to_thread(
+			_delete_last_rate_operation_sync,
+			sheet_id,
+			credentials_path,
+			operations_history,
+			sheet_name
+		)
+	except Exception as e:
+		logger.exception(f"Ошибка удаления последней операции /rate: {e}")
+		return {"success": False, "deleted_cells": [], "message": f"Ошибка: {str(e)}"}
+
+
+def _delete_last_rate_operation_sync(
+	sheet_id: str,
+	credentials_path: str,
+	operations_history: List[Dict[str, Any]],
+	sheet_name: Optional[str] = None
+) -> Dict[str, Any]:
+	"""
+	Синхронная функция для удаления последней операции /rate из Google Sheets.
+	Перед удалением читает значения из ячеек для формирования отчета.
+	"""
+	try:
+		# Создаем клиент
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return {"success": False, "deleted_cells": [], "message": "Не удалось создать клиент Google Sheets"}
+		
+		# Открываем таблицу
+		try:
+			spreadsheet = client.open_by_key(sheet_id)
+			worksheet = _get_worksheet(spreadsheet, sheet_name)
+		except PermissionError as e:
+			logger.error(f"Ошибка доступа к таблице: {e}")
+			raise
+		
+		deleted_cells_info = []  # Список с информацией о ячейках: [{"cell": "A123", "value": 100, "type": "crypto", ...}, ...]
+		cells_to_clear = []
+		
+		# Читаем значения из ячеек перед удалением
+		for operation in operations_history:
+			cell_address = operation.get("cell")
+			if cell_address:
+				try:
+					# Читаем текущее значение из ячейки
+					cell = worksheet.acell(cell_address)
+					current_value = cell.value if cell and cell.value else None
+					
+					# Формируем информацию о ячейке для отчета
+					cell_info = {
+						"cell": cell_address,
+						"value": current_value,
+						"type": operation.get("type", ""),
+						"currency": operation.get("currency", ""),
+						"crypto_type": operation.get("currency", ""),  # Для криптовалют
+						"xmr_number": operation.get("xmr_number"),
+						"card_name": operation.get("card_name", ""),
+						"cash_name": operation.get("cash_name", "")
+					}
+					deleted_cells_info.append(cell_info)
+					cells_to_clear.append(cell_address)
+					logger.info(f"🗑️ Подготовка к удалению ячейки {cell_address}, текущее значение: {current_value}")
+				except Exception as e:
+					logger.warning(f"⚠️ Ошибка чтения ячейки {cell_address}: {e}")
+					# Все равно добавляем ячейку для удаления
+					deleted_cells_info.append({
+						"cell": cell_address,
+						"value": None,
+						"type": operation.get("type", ""),
+						"currency": operation.get("currency", ""),
+						"crypto_type": operation.get("currency", ""),
+						"xmr_number": operation.get("xmr_number"),
+						"card_name": operation.get("card_name", ""),
+						"cash_name": operation.get("cash_name", "")
+					})
+					cells_to_clear.append(cell_address)
+		
+		if not cells_to_clear:
+			return {"success": False, "deleted_cells": [], "message": "Нет ячеек для удаления"}
+		
+		# Очищаем все ячейки одним batch запросом
+		try:
+			worksheet.batch_clear(cells_to_clear)
+			logger.info(f"✅ Успешно удалено {len(cells_to_clear)} ячеек")
+		except AttributeError:
+			# Если batch_clear не поддерживается, очищаем по одной
+			for cell in cells_to_clear:
+				try:
+					worksheet.clear(cell)
+				except Exception as e:
+					logger.warning(f"⚠️ Ошибка очистки ячейки {cell}: {e}")
+		
+		return {
+			"success": True,
+			"deleted_cells": [info["cell"] for info in deleted_cells_info],  # Для обратной совместимости
+			"deleted_cells_info": deleted_cells_info,  # Подробная информация о ячейках
+			"message": f"Успешно удалено {len(deleted_cells_info)} ячеек"
+		}
+		
+	except Exception as e:
+		logger.exception(f"Ошибка удаления операции /rate: {e}")
+		return {"success": False, "deleted_cells": [], "message": f"Ошибка: {str(e)}"}
 
 
 def _get_crypto_values_from_row_4_sync(

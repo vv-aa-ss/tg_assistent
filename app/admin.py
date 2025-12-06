@@ -11,6 +11,7 @@ import logging
 import re
 from html import escape
 import asyncio
+import json
 from app.keyboards import (
 	admin_menu_kb,
 	cards_list_kb,
@@ -170,6 +171,7 @@ class AddDataStates(StatesGroup):
 	entering_card_cash = State()  # Ввод суммы наличных для карты
 	selecting_card = State()  # Выбор карты
 	selecting_xmr = State()  # Выбор номера XMR (1, 2, 3)
+	entering_note = State()  # Ввод примечания для /rate
 
 
 class CryptoColumnEditStates(StatesGroup):
@@ -190,6 +192,14 @@ class CashColumnEditStates(StatesGroup):
 
 
 class DeleteRowStates(StatesGroup):
+	first_confirmation = State()
+	second_confirmation = State()
+
+class DeleteRateStates(StatesGroup):
+	first_confirmation = State()
+	second_confirmation = State()
+
+class DeleteMoveStates(StatesGroup):
 	first_confirmation = State()
 	second_confirmation = State()
 
@@ -601,6 +611,265 @@ async def delete_second_confirmation_no(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
+@admin_router.message(Command("del_move"))
+async def cmd_del_move(message: Message, state: FSMContext):
+	"""Команда для удаления последнего передвижения из Google Sheets"""
+	logger.info(f"🔴 ОБРАБОТЧИК cmd_del_move ВЫЗВАН! message_id={message.message_id}, user_id={message.from_user.id if message.from_user else None}")
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	is_admin_user = is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames)
+	
+	if not is_admin_user:
+		logger.warning(f"🔴 /del_move ignored: user {message.from_user.id} is not admin")
+		return
+	
+	logger.info(f"✅ /del_move обрабатывается для админа {message.from_user.id}")
+	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
+	
+	# Получаем настройки Google Sheets
+	from app.config import get_settings
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await message.answer("⚠️ Google Sheets не настроен (отсутствует GOOGLE_SHEET_ID или GOOGLE_CREDENTIALS_PATH)")
+		return
+	
+	# Спрашиваем первое подтверждение
+	await state.set_state(DeleteMoveStates.first_confirmation)
+	await message.answer("⚠️ Вы действительно хотите удалить последнее передвижение?", reply_markup=delete_confirmation_kb())
+
+
+@admin_router.callback_query(DeleteMoveStates.first_confirmation, F.data == "delete:confirm:yes")
+async def delete_move_first_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления move - пользователь нажал 'Да'"""
+	# Переходим ко второму подтверждению
+	await state.set_state(DeleteMoveStates.second_confirmation)
+	await cb.message.edit_text("⚠️ Вы уверены? Это действие нельзя отменить.", reply_markup=delete_confirmation_kb())
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteMoveStates.first_confirmation, F.data == "delete:confirm:no")
+async def delete_move_first_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления move - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteMoveStates.second_confirmation, F.data == "delete:confirm:yes")
+async def delete_move_second_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления move - выполняет удаление"""
+	# Удаляем последнюю строку в диапазоне move
+	from app.google_sheets import delete_last_move_row_from_google_sheet
+	from app.config import get_settings
+	
+	settings = get_settings()
+	
+	try:
+		result = await delete_last_move_row_from_google_sheet(
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			settings.google_sheet_name
+		)
+		
+		if result.get("success"):
+			deleted_row = result.get("deleted_row")
+			await cb.message.edit_text(f"✅ Успешно удалено последнее передвижение (строка {deleted_row})")
+		else:
+			error_message = result.get("message", "Неизвестная ошибка")
+			await cb.message.edit_text(f"❌ Ошибка удаления: {error_message}")
+	except Exception as e:
+		logger.exception(f"Ошибка при удалении передвижения: {e}")
+		await cb.message.edit_text(f"❌ Произошла ошибка при удалении: {str(e)}")
+	finally:
+		await state.clear()
+		await cb.answer()
+
+
+@admin_router.callback_query(DeleteMoveStates.second_confirmation, F.data == "delete:confirm:no")
+async def delete_move_second_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления move - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
+
+
+@admin_router.message(Command("del_rate"))
+async def cmd_del_rate(message: Message, state: FSMContext):
+	"""Команда для удаления последней операции /rate из Google Sheets"""
+	logger.info(f"🔴 ОБРАБОТЧИК cmd_del_rate ВЫЗВАН! message_id={message.message_id}, user_id={message.from_user.id if message.from_user else None}")
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	is_admin_user = is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames)
+	
+	if not is_admin_user:
+		logger.warning(f"🔴 /del_rate ignored: user {message.from_user.id} is not admin")
+		return
+	
+	logger.info(f"✅ /del_rate обрабатывается для админа {message.from_user.id}")
+	
+	# Очищаем предыдущее состояние перед началом новой операции
+	await state.clear()
+	
+	# Получаем настройки Google Sheets
+	from app.config import get_settings
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await message.answer("⚠️ Google Sheets не настроен (отсутствует GOOGLE_SHEET_ID или GOOGLE_CREDENTIALS_PATH)")
+		return
+	
+	# Проверяем, есть ли история операций
+	db = get_db()
+	last_history = await db.get_last_rate_history()
+	
+	if not last_history:
+		await message.answer("⚠️ Нет истории операций /rate для удаления")
+		return
+	
+	# Сохраняем ID истории в состояние для использования при подтверждении
+	await state.update_data(history_id=last_history["id"], operations_history=last_history["operations"])
+	
+	# Спрашиваем первое подтверждение
+	await state.set_state(DeleteRateStates.first_confirmation)
+	await message.answer("⚠️ Вы действительно хотите удалить последнюю операцию расхода?", reply_markup=delete_confirmation_kb())
+
+
+@admin_router.callback_query(DeleteRateStates.first_confirmation, F.data == "delete:confirm:yes")
+async def delete_rate_first_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления /rate - пользователь нажал 'Да'"""
+	# Переходим ко второму подтверждению
+	await state.set_state(DeleteRateStates.second_confirmation)
+	await cb.message.edit_text("⚠️ Вы уверены? Это действие нельзя отменить.", reply_markup=delete_confirmation_kb())
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteRateStates.first_confirmation, F.data == "delete:confirm:no")
+async def delete_rate_first_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик первого подтверждения удаления /rate - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
+
+
+@admin_router.callback_query(DeleteRateStates.second_confirmation, F.data == "delete:confirm:yes")
+async def delete_rate_second_confirmation_yes(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления /rate - выполняет удаление"""
+	from app.google_sheets import delete_last_rate_operation
+	from app.config import get_settings
+	
+	settings = get_settings()
+	data = await state.get_data()
+	history_id = data.get("history_id")
+	operations_history_json = data.get("operations_history")
+	
+	if not history_id or not operations_history_json:
+		await cb.message.edit_text("❌ Ошибка: не найдена история операции")
+		await state.clear()
+		await cb.answer()
+		return
+	
+	try:
+		# Парсим JSON с историей операций
+		operations_history = json.loads(operations_history_json)
+		
+		# Получаем информацию о последней истории для отображения даты (до удаления из БД)
+		db = get_db()
+		last_history = await db.get_last_rate_history()
+		
+		# Удаляем ячейки из Google Sheets
+		result = await delete_last_rate_operation(
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			operations_history,
+			settings.google_sheet_name
+		)
+		
+		if result.get("success"):
+			deleted_cells_info = result.get("deleted_cells_info", [])
+			# Удаляем запись из БД
+			await db.delete_rate_history(history_id)
+			
+			# Формируем подробный отчет
+			from datetime import datetime
+			created_at = last_history.get("created_at") if last_history else None
+			if created_at:
+				date_str = datetime.fromtimestamp(created_at).strftime("%d.%m.%Y %H:%M")
+			else:
+				date_str = "неизвестно"
+			
+			# Получаем примечание из истории
+			note = last_history.get("note") if last_history else None
+			if note and note.strip():
+				note_text = note.strip()
+			else:
+				note_text = None
+			
+			report_lines = [f"✅ Успешно удалена последняя операция расхода", f"От: {date_str}"]
+			
+			# Добавляем примечание, если оно есть
+			if note_text:
+				report_lines.append(f"📝 Примечание: {note_text}")
+			
+			report_lines.append("")
+			report_lines.append("Удаленные ячейки:")
+			
+			for cell_info in deleted_cells_info:
+				cell_address = cell_info.get("cell", "")
+				value = cell_info.get("value")
+				cell_type = cell_info.get("type", "")
+				
+				# Форматируем значение
+				if value is not None:
+					try:
+						value_float = float(str(value).replace(",", ".").replace(" ", ""))
+						value_str = f"{int(round(value_float)):,}".replace(",", " ")
+					except (ValueError, TypeError):
+						value_str = str(value)
+				else:
+					value_str = "—"
+				
+				# Формируем описание в зависимости от типа
+				if cell_type == "crypto":
+					crypto_type = cell_info.get("crypto_type", "")
+					report_lines.append(f"  • {cell_address} ({crypto_type}: {value_str} USD)")
+				elif cell_type == "xmr":
+					xmr_number = cell_info.get("xmr_number")
+					report_lines.append(f"  • {cell_address} (XMR-{xmr_number}: {value_str} USD)")
+				elif cell_type == "card":
+					card_name = cell_info.get("card_name", "")
+					currency = cell_info.get("currency", "RUB")
+					report_lines.append(f"  • {cell_address} (Карта {card_name}: {value_str} {currency})")
+				elif cell_type == "cash":
+					cash_name = cell_info.get("cash_name", "")
+					currency = cell_info.get("currency", "RUB")
+					report_lines.append(f"  • {cell_address} (Наличные {cash_name}: {value_str} {currency})")
+				else:
+					report_lines.append(f"  • {cell_address} ({value_str})")
+			
+			report_text = "\n".join(report_lines)
+			await cb.message.edit_text(report_text)
+		else:
+			error_message = result.get("message", "Неизвестная ошибка")
+			await cb.message.edit_text(f"❌ Ошибка удаления: {error_message}")
+	except Exception as e:
+		logger.exception(f"Ошибка при удалении операции /rate: {e}")
+		await cb.message.edit_text(f"❌ Произошла ошибка при удалении: {str(e)}")
+	finally:
+		await state.clear()
+		await cb.answer()
+
+
+@admin_router.callback_query(DeleteRateStates.second_confirmation, F.data == "delete:confirm:no")
+async def delete_rate_second_confirmation_no(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик второго подтверждения удаления /rate - пользователь нажал 'Нет'"""
+	await state.clear()
+	await cb.message.edit_text("❌ Операция удаления отменена.")
+	await cb.answer()
+
+
 @admin_router.callback_query(F.data == "admin:back")
 async def admin_back(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
@@ -695,6 +964,12 @@ def format_add_data_text(data: dict) -> str:
 	
 	if selected_items:
 		text += "Выбранные данные:\n" + "\n".join(selected_items) + "\n\n"
+	
+	# Показываем примечание, если оно есть (только для режима rate)
+	if mode == "rate":
+		note = data.get("note")
+		if note and note.strip():
+			text += f"📝 Примечание: {note}\n\n"
 	
 	text += "Выберите тип данных для добавления:"
 	return text
@@ -1372,6 +1647,49 @@ async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
 	await cb.answer("✅ Блок данных сохранен. Добавьте новый блок.")
 
 
+@admin_router.callback_query(F.data.startswith("add_data:note:"))
+async def add_data_note(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик кнопки 'Примечание' для /rate"""
+	mode = cb.data.split(":")[-1]
+	
+	if mode != "rate":
+		await cb.answer("⚠️ Примечание доступно только для операции /rate", show_alert=True)
+		return
+	
+	# Переходим в состояние ввода примечания
+	await state.set_state(AddDataStates.entering_note)
+	from app.keyboards import simple_back_kb
+	await cb.message.edit_text("📝 Введите примечание:", reply_markup=simple_back_kb(f"add_data:back:{mode}"))
+	await cb.answer()
+
+
+@admin_router.message(AddDataStates.entering_note, ~F.text.startswith("/"))
+async def add_data_note_entered(message: Message, state: FSMContext):
+	"""Обработчик ввода примечания для /rate"""
+	note_text = message.text.strip()
+	
+	# Сохраняем примечание в state
+	await state.update_data(note=note_text)
+	await state.set_state(AddDataStates.selecting_type)
+	
+	# Получаем текущие данные для отображения
+	data = await state.get_data()
+	mode = data.get("mode", "add")
+	
+	# Формируем текст (примечание уже будет включено в format_add_data_text)
+	text = format_add_data_text(data)
+	
+	# Обновляем сообщение с клавиатурой
+	from app.keyboards import add_data_type_kb
+	await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	
+	# Удаляем сообщение с вводом примечания
+	try:
+		await message.delete()
+	except Exception:
+		pass
+
+
 @admin_router.callback_query(F.data.startswith("add_data:confirm:"))
 async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	"""Обработчик подтверждения и записи данных в Google Sheets"""
@@ -1604,6 +1922,11 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	logger.info(f"🔍 Данные для записи (mode={mode}): crypto_list={crypto_list}, xmr_list={xmr_list}, cash_list={cash_list}, card_cash_pairs={card_cash_pairs}")
 	try:
 		if mode == "rate":
+			# Получаем примечание из state (если было введено)
+			note = data.get("note", None)
+			if note:
+				note = note.strip() if note.strip() else None
+			
 			result = await write_to_google_sheet_rate_mode(
 				settings.google_sheet_id,
 				settings.google_credentials_path,
@@ -1611,7 +1934,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				xmr_list,
 				cash_list,
 				card_cash_pairs,
-				settings.google_sheet_name
+				settings.google_sheet_name,
+				note=note
 			)
 		elif mode == "move":
 			# Для режима move получаем настройки из БД
@@ -1628,7 +1952,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				xmr_list,
 				cash_list,
 				card_cash_pairs,
-				mode=mode
+				mode=mode,
+				sheet_name=settings.google_sheet_name
 			)
 		else:
 			# Для режима add определяем диапазон строк по дню недели из БД
@@ -1694,9 +2019,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				xmr_list,
 				cash_list,
 				card_cash_pairs,
-				settings.google_sheet_name,
-				start_row=add_start_row,
-				max_row=add_max_row
+				mode="add",
+				sheet_name=settings.google_sheet_name
 			)
 			
 			# Проверяем, есть ли свободная строка в диапазоне
@@ -4054,7 +4378,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		state_str = str(current_state) if current_state else ""
 		if any(state_group in state_str for state_group in [
 			"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
-			"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates"
+			"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
+			"DeleteRateStates", "DeleteMoveStates"
 		]):
 			# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
 			logger.debug(f"⚠️ Пропуск обработки пересылки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
