@@ -44,6 +44,32 @@ USERS_PER_PAGE = 6
 
 
 
+async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str) -> None:
+	"""
+	Проверяет наличие BTC адресов в тексте и отправляет ссылки на mempool.space.
+	
+	Args:
+		bot: Экземпляр бота
+		chat_id: ID чата для отправки
+		text: Текст для проверки
+	"""
+	if not text:
+		return
+	
+	btc_addresses = find_btc_addresses(text)
+	if not btc_addresses:
+		return
+	
+	# Отправляем ссылку для каждого найденного адреса
+	for address in btc_addresses:
+		link = f"https://mempool.space/address/{address}"
+		try:
+			await bot.send_message(chat_id=chat_id, text=link)
+			logger.info(f"✅ Отправлена ссылка на BTC адрес: {address}")
+		except Exception as e:
+			logger.warning(f"⚠️ Ошибка отправки ссылки на BTC адрес {address}: {e}")
+
+
 async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db) -> int:
 	"""
 	Отправляет все реквизиты карты админу отдельными сообщениями.
@@ -294,6 +320,47 @@ def detect_cash_type(amount: int) -> str:
 		return "BYN"
 	else:
 		return "RUB"
+
+
+def find_btc_addresses(text: str) -> list[str]:
+	"""
+	Находит все BTC адреса в тексте.
+	
+	Поддерживает форматы:
+	- Bech32 (bc1...): bc1qq3e8wsy3u979ghmc0xht257zlm70gpha522n6y
+	- Legacy (1... или 3...): 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+	
+	Args:
+		text: Текст для поиска
+	
+	Returns:
+		Список найденных BTC адресов
+	"""
+	if not text:
+		return []
+	
+	import re
+	addresses = []
+	
+	# Паттерн для Bech32 адресов (bc1...)
+	bech32_pattern = r'\bbc1[a-z0-9]{25,62}\b'
+	bech32_matches = re.findall(bech32_pattern, text, re.IGNORECASE)
+	addresses.extend(bech32_matches)
+	
+	# Паттерн для Legacy адресов (начинаются с 1 или 3)
+	legacy_pattern = r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b'
+	legacy_matches = re.findall(legacy_pattern, text)
+	addresses.extend(legacy_matches)
+	
+	# Удаляем дубликаты, сохраняя порядок
+	seen = set()
+	unique_addresses = []
+	for addr in addresses:
+		if addr.lower() not in seen:
+			seen.add(addr.lower())
+			unique_addresses.append(addr)
+	
+	return unique_addresses
 
 
 def parse_forwarded_message(text: str) -> dict:
@@ -3774,7 +3841,9 @@ async def _update_crypto_values_in_stats(
 		# Читаем средний профит с начала недели (с понедельника)
 		# Если сегодня понедельник, не отображаем средний профит, так как он будет равен профиту за сегодня
 		if weekday != 0:  # 0 = понедельник
-			profit_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+			profit_days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+			# Берем только дни с понедельника до текущего дня включительно
+			profit_days = profit_days_all[:weekday + 1]
 			profit_values = []
 			
 			for day in profit_days:
@@ -4421,6 +4490,9 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	text = message.text or message.caption or ""
 	logger.info(f"📨 Пересылка от админа {message.from_user.id}: tg_id={orig_tg_id}, username={orig_username}, full_name={orig_full_name}, text={text[:50] if text else 'нет'}")
 	
+	# Сохраняем текст пересылаемого сообщения в state для последующей проверки BTC адресов
+	await state.update_data(forwarded_message_text=text)
+	
 	# Если ID недоступен, но есть username, пытаемся найти пользователя в БД по username
 	if orig_tg_id is None and orig_username:
 		logger.info(f"⚠️ ID недоступен, но есть username={orig_username}, ищем пользователя в БД")
@@ -4465,6 +4537,11 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						else:
 							await message.answer(admin_text)
 						logger.info(f"✅ Отправлено сообщение карты для скрытого пользователя '{orig_full_name}' (user_id={user_id})")
+						
+						# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+						if text:
+							await check_and_send_btc_address_links(bot, message.chat.id, text)
+						
 						return
 					else:
 						# Несколько карт - показываем выбор
@@ -4554,6 +4631,10 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 					admin_chat_id = message.chat.id
 					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db)
 					logger.info(f"✅ send_card_requisites_to_admin завершена для card_id={card_id}, отправлено: {sent_count}")
+					
+					# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+					if text:
+						await check_and_send_btc_address_links(bot, admin_chat_id, text)
 				except Exception as e:
 					logger.exception(f"❌ КРИТИЧЕСКАЯ ОШИБКА в send_card_requisites_to_admin: {e}")
 				return
@@ -4832,8 +4913,16 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		user_msg = card.get("user_message")
 		has_user_message = bool(user_msg)
 		
+		# Получаем текст пересылаемого сообщения для проверки BTC адресов
+		forwarded_text = data.get("forwarded_message_text", "")
+		
 		await state.clear()
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		
+		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+		
 		await cb.answer()
 		return
 	
@@ -4862,9 +4951,16 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
 		
+		# Получаем текст пересылаемого сообщения для проверки BTC адресов
+		forwarded_text = data.get("forwarded_message_text", "")
+		
 		# Отправляем все реквизиты админу
 		await state.clear()
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		
+		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
 		
 	elif hidden_user_name:
 		# Скрытый пользователь (MessageOriginHiddenUser)
@@ -4904,10 +5000,17 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id})")
 		
+		# Получаем текст пересылаемого сообщения для проверки BTC адресов
+		forwarded_text = data.get("forwarded_message_text", "")
+		
 		# Отправляем все реквизиты админу (даже для скрытого пользователя)
 		await state.clear()
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
+		
+		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
 	
 	await cb.answer()
 
@@ -4960,6 +5063,9 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 	# Подсчитываем общее количество реквизитов (из таблицы + user_message если есть)
 	total_requisites_count = len(requisites) + (1 if has_user_message else 0)
 	
+	# Получаем текст пересылаемого сообщения для проверки BTC адресов
+	forwarded_text = data.get("forwarded_message_text", "")
+	
 	# Логируем доставку
 	if user_tg_id:
 		await db.log_card_delivery_by_tg(
@@ -4969,6 +5075,10 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 	)
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		
+		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(
@@ -4980,5 +5090,9 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
 		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
+		
+		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
 	
 	await cb.answer()
