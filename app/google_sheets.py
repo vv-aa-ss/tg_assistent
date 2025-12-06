@@ -1200,6 +1200,7 @@ def _write_all_to_google_sheet_one_row_sync(
 		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row} (диапазон: {start_row}-{max_row}, проверяемый диапазон: {delete_range})")
 		
 		written_cells = []  # Список записанных ячеек для отчета
+		batch_updates = []  # Список обновлений для batch-записи
 		
 		# Суммируем криптовалюты с одинаковой валютой
 		crypto_sum = {}  # {currency: total_amount}
@@ -1211,16 +1212,19 @@ def _write_all_to_google_sheet_one_row_sync(
 					crypto_sum[currency] = 0.0
 				crypto_sum[currency] += usd_amount
 		
-		# Записываем суммированные криптовалюты (все валюты из crypto_columns)
+		# Подготавливаем данные для batch-записи криптовалют
 		for currency, total_amount in crypto_sum.items():
 			usd_amount_rounded = int(round(total_amount))
 			column = crypto_columns.get(currency)
 			
-			# Записываем в соответствующий столбец
 			if column:
-				worksheet.update(f"{column}{empty_row}", [[usd_amount_rounded]])
-				written_cells.append(f"{column}{empty_row} ({currency}: {usd_amount_rounded} USD)")
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {column}{empty_row} ({currency})")
+				cell_address = f"{column}{empty_row}"
+				batch_updates.append({
+					'range': cell_address,
+					'values': [[usd_amount_rounded]]
+				})
+				written_cells.append(f"{cell_address} ({currency}: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} ({currency})")
 			else:
 				logger.warning(f"⚠️ Не найден столбец для криптовалюты {currency}, пропускаем запись")
 		
@@ -1234,15 +1238,19 @@ def _write_all_to_google_sheet_one_row_sync(
 					xmr_sum[xmr_number] = 0.0
 				xmr_sum[xmr_number] += usd_amount
 		
-		# Записываем суммированные XMR
+		# Подготавливаем данные для batch-записи XMR
 		for xmr_number, total_amount in xmr_sum.items():
 			usd_amount_rounded = int(round(total_amount))
 			usd_column = xmr_columns.get(xmr_number)
 			
 			if usd_column:
-				worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
-				written_cells.append(f"{usd_column}{empty_row} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
+				cell_address = f"{usd_column}{empty_row}"
+				batch_updates.append({
+					'range': cell_address,
+					'values': [[usd_amount_rounded]]
+				})
+				written_cells.append(f"{cell_address} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
+				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Суммируем наличные для каждой карты (по card_id для правильного суммирования)
 		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name}}
@@ -1263,16 +1271,20 @@ def _write_all_to_google_sheet_one_row_sync(
 						}
 					card_cash_sum[card_id]["amount"] += cash_amount
 		
-		# Записываем суммированные наличные для карт
+		# Подготавливаем данные для batch-записи наличных для карт
 		for card_id, card_info in card_cash_sum.items():
 			column = card_info["column"]
 			total_amount = card_info["amount"]
 			card_name = card_info["card_name"]
 			
 			if total_amount != 0:
-				worksheet.update(f"{column}{empty_row}", [[total_amount]])
-				written_cells.append(f"{column}{empty_row} (Карта {card_name}: {total_amount} RUB)")
-				logger.info(f"✅ Записано {total_amount} RUB в ячейку {column}{empty_row} (карта: {card_name})")
+				cell_address = f"{column}{empty_row}"
+				batch_updates.append({
+					'range': cell_address,
+					'values': [[total_amount]]
+				})
+				written_cells.append(f"{cell_address} (Карта {card_name}: {total_amount} RUB)")
+				logger.info(f"✅ Подготовлено к записи {total_amount} RUB в ячейку {cell_address} (карта: {card_name})")
 		
 		# Суммируем наличные без карты (по cash_name)
 		cash_sum = {}  # {cash_name: {"column": column, "amount": total_amount, "currency": currency}}
@@ -1289,16 +1301,35 @@ def _write_all_to_google_sheet_one_row_sync(
 					cash_sum[cash_name] = {"column": column, "amount": 0, "currency": cash_currency}
 				cash_sum[cash_name]["amount"] += cash_amount
 		
-		# Записываем суммированные наличные без карты
+		# Подготавливаем данные для batch-записи наличных без карты
 		for cash_name, cash_data in cash_sum.items():
 			column = cash_data["column"]
 			total_amount = cash_data["amount"]
 			cash_currency = cash_data["currency"]
 			
 			if total_amount != 0:
-				worksheet.update(f"{column}{empty_row}", [[total_amount]])
-				written_cells.append(f"{column}{empty_row} (Наличные {cash_name}: {total_amount} {cash_currency})")
-				logger.info(f"✅ Записано {total_amount} {cash_currency} в ячейку {column}{empty_row} (наличные: {cash_name})")
+				cell_address = f"{column}{empty_row}"
+				batch_updates.append({
+					'range': cell_address,
+					'values': [[total_amount]]
+				})
+				written_cells.append(f"{cell_address} (Наличные {cash_name}: {total_amount} {cash_currency})")
+				logger.info(f"✅ Подготовлено к записи {total_amount} {cash_currency} в ячейку {cell_address} (наличные: {cash_name})")
+		
+		# Выполняем batch-запись всех ячеек одним запросом
+		if batch_updates:
+			try:
+				logger.info(f"🚀 Выполняем batch-запись {len(batch_updates)} ячеек одним запросом")
+				worksheet.batch_update(batch_updates)
+				logger.info(f"✅ Успешно записано {len(batch_updates)} ячеек одним batch-запросом")
+			except Exception as e:
+				logger.error(f"❌ Ошибка batch-записи: {e}, пробуем записать по одной ячейке")
+				# Fallback: записываем по одной ячейке в случае ошибки
+				for update in batch_updates:
+					try:
+						worksheet.update(update['range'], update['values'])
+					except Exception as e2:
+						logger.error(f"❌ Ошибка записи ячейки {update['range']}: {e2}")
 		
 		return {"success": True, "written_cells": written_cells, "row": empty_row}
 		

@@ -2312,6 +2312,89 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				if profits and mode == "add":
 					for cell_address, profit_value in profits.items():
 						report_lines.append(f"  📈 Профит сделки ({cell_address}) = {profit_value} USD")
+				
+				# Добавляем профит за сегодня и средний профит (только для режима /add)
+				if mode == "add":
+					try:
+						# Определяем текущий день недели
+						today = datetime.now()
+						weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+						
+						day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+						day_name = day_names[weekday]
+						
+						# Собираем все адреса ячеек для профитов для batch чтения
+						profit_cells_to_read = {}  # {cell_address: day_name}
+						
+						# Получаем ячейку профита за текущий день
+						profit_cell_key = f"profit_{day_name}"
+						profit_cell = await db.get_google_sheets_setting(profit_cell_key)
+						if profit_cell:
+							profit_cells_to_read[profit_cell] = day_name
+						
+						# Собираем адреса ячеек для среднего профита (если не понедельник)
+						if weekday != 0:  # 0 = понедельник
+							profit_days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+							# Берем только дни с понедельника до текущего дня включительно
+							profit_days = profit_days_all[:weekday + 1]
+							
+							for day in profit_days:
+								profit_cell_key = f"profit_{day}"
+								profit_cell = await db.get_google_sheets_setting(profit_cell_key)
+								if profit_cell and profit_cell not in profit_cells_to_read:
+									profit_cells_to_read[profit_cell] = day
+						
+						# Читаем все профиты одним batch запросом
+						if profit_cells_to_read:
+							from app.google_sheets import read_profits_batch
+							cell_addresses = list(profit_cells_to_read.keys())
+							profits_data = await read_profits_batch(
+								settings.google_sheet_id,
+								settings.google_credentials_path,
+								cell_addresses,
+								settings.google_sheet_name
+							)
+							
+							# Обрабатываем профит за сегодня
+							if day_name in profit_cells_to_read.values():
+								# Находим ячейку для сегодняшнего дня
+								today_cell = None
+								for cell, day in profit_cells_to_read.items():
+									if day == day_name:
+										today_cell = cell
+										break
+								
+								if today_cell and today_cell in profits_data:
+									profit_today = profits_data[today_cell]
+									if profit_today:
+										# Добавляем разделитель перед профитом за сегодня
+										report_lines.append(" .")
+										try:
+											profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
+											formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
+											report_lines.append(f"  📈 Профит за сегодня: {formatted_profit} USD")
+										except (ValueError, AttributeError):
+											report_lines.append(f"  📈 Профит за сегодня: {profit_today} USD")
+							
+							# Обрабатываем средний профит (если не понедельник)
+							if weekday != 0:
+								profit_values = []
+								for cell_address, day in profit_cells_to_read.items():
+									if cell_address in profits_data:
+										profit_value = profits_data[cell_address]
+										if profit_value:
+											try:
+												value = float(str(profit_value).replace(",", ".").replace(" ", ""))
+												profit_values.append(value)
+											except (ValueError, AttributeError):
+												pass
+								
+								if profit_values:
+									avg_profit = sum(profit_values) / len(profit_values)
+									formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
+									report_lines.append(f"  📊 Средний профит в день: {formatted_avg} USD")
+					except Exception as e:
+						logger.warning(f"Ошибка получения профита за сегодня и среднего профита: {e}")
 			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])
