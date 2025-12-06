@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter, Command
 from aiogram import Bot
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 import logging
@@ -34,6 +35,7 @@ from app.keyboards import (
 	requisite_action_kb,
 	delete_confirmation_kb,
 	stat_u_menu_kb,
+	user_menu_button_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -44,7 +46,7 @@ USERS_PER_PAGE = 6
 
 
 
-async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str) -> None:
+async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str, user_id: Optional[int] = None) -> None:
 	"""
 	Проверяет наличие BTC адресов в тексте и отправляет ссылки на mempool.space.
 	
@@ -52,6 +54,7 @@ async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str) ->
 		bot: Экземпляр бота
 		chat_id: ID чата для отправки
 		text: Текст для проверки
+		user_id: ID пользователя для отправки клавиатуры "Меню пользователя" (опционально)
 	"""
 	if not text:
 		return
@@ -61,16 +64,25 @@ async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str) ->
 		return
 	
 	# Отправляем ссылку для каждого найденного адреса
-	for address in btc_addresses:
+	last_message = None
+	for idx, address in enumerate(btc_addresses):
 		link = f"https://mempool.space/address/{address}"
 		try:
-			await bot.send_message(chat_id=chat_id, text=link)
+			# Если это последний адрес и передан user_id, добавляем клавиатуру сразу
+			if idx == len(btc_addresses) - 1 and user_id is not None:
+				last_message = await bot.send_message(
+					chat_id=chat_id,
+					text=link,
+					reply_markup=user_menu_button_kb(user_id)
+				)
+			else:
+				last_message = await bot.send_message(chat_id=chat_id, text=link)
 			logger.info(f"✅ Отправлена ссылка на BTC адрес: {address}")
 		except Exception as e:
 			logger.warning(f"⚠️ Ошибка отправки ссылки на BTC адрес {address}: {e}")
 
 
-async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db) -> int:
+async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db, user_id: Optional[int] = None) -> int:
 	"""
 	Отправляет все реквизиты карты админу отдельными сообщениями.
 	Отправляет и реквизиты из таблицы card_requisites, и user_message (если есть) для обратной совместимости.
@@ -80,38 +92,63 @@ async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: i
 		admin_chat_id: ID чата админа
 		card_id: ID карты
 		db: Экземпляр базы данных
+		user_id: ID пользователя для отправки клавиатуры "Меню пользователя" (опционально)
 	
 	Returns:
 		Количество успешно отправленных реквизитов
 	"""
-	logger.info(f"📤 send_card_requisites_to_admin: card_id={card_id}, admin_chat_id={admin_chat_id}")
+	logger.info(f"📤 send_card_requisites_to_admin: card_id={card_id}, admin_chat_id={admin_chat_id}, user_id={user_id}")
 	requisites = await db.list_card_requisites(card_id)
 	logger.info(f"📋 Найдено реквизитов в таблице: {len(requisites)} для card_id={card_id}")
 	
 	sent_count = 0
+	last_message = None
+	
+	# Проверяем наличие user_message для определения последнего сообщения
+	user_msg = await db.get_card_user_message(card_id)
+	has_user_message = bool(user_msg and user_msg.strip())
+	total_messages = len(requisites) + (1 if has_user_message else 0)
 	
 	# Отправляем все реквизиты из таблицы card_requisites
 	if requisites:
 		for idx, requisite in enumerate(requisites, 1):
 			try:
 				logger.info(f"📨 Отправка реквизита {idx}/{len(requisites)} (id={requisite['id']}) админу {admin_chat_id}")
-				await bot.send_message(
-					chat_id=admin_chat_id,
-					text=requisite["requisite_text"],
-					parse_mode="HTML"
-				)
+				# Если это последнее сообщение и передан user_id, добавляем клавиатуру сразу
+				is_last = (idx == len(requisites) and not has_user_message)
+				if is_last and user_id is not None:
+					last_message = await bot.send_message(
+						chat_id=admin_chat_id,
+						text=requisite["requisite_text"],
+						parse_mode="HTML",
+						reply_markup=user_menu_button_kb(user_id, card_id)
+					)
+				else:
+					last_message = await bot.send_message(
+						chat_id=admin_chat_id,
+						text=requisite["requisite_text"],
+						parse_mode="HTML"
+					)
 				sent_count += 1
 				logger.info(f"✅ Реквизит {requisite['id']} успешно отправлен админу {admin_chat_id}")
 			except Exception as e:
 				logger.exception(f"❌ Ошибка отправки реквизита {requisite['id']} админу {admin_chat_id}: {e}")
 	
 	# Также отправляем user_message (для обратной совместимости со старыми данными)
-	user_msg = await db.get_card_user_message(card_id)
-	logger.info(f"🔍 Проверка user_message для card_id={card_id}: value={user_msg[:100] if user_msg else None}..., is_empty={not (user_msg and user_msg.strip())}")
-	if user_msg and user_msg.strip():
+	logger.info(f"🔍 Проверка user_message для card_id={card_id}: value={user_msg[:100] if user_msg else None}..., is_empty={not has_user_message}")
+	if has_user_message:
 		try:
 			logger.info(f"📨 Отправка user_message админу {admin_chat_id}")
-			await bot.send_message(chat_id=admin_chat_id, text=user_msg, parse_mode="HTML")
+			# user_message всегда последний, если есть - добавляем клавиатуру, если передан user_id
+			if user_id is not None:
+				last_message = await bot.send_message(
+					chat_id=admin_chat_id,
+					text=user_msg,
+					parse_mode="HTML",
+					reply_markup=user_menu_button_kb(user_id, card_id)
+				)
+			else:
+				last_message = await bot.send_message(chat_id=admin_chat_id, text=user_msg, parse_mode="HTML")
 			sent_count += 1
 			logger.info(f"✅ user_message отправлен админу {admin_chat_id}")
 		except Exception as e:
@@ -2577,7 +2614,16 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			# Callback уже был обработан в начале функции
 			await state.clear()
-			await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
+			try:
+				await cb.message.edit_text(report_text, reply_markup=admin_menu_kb())
+			except Exception as edit_error:
+				# Обрабатываем ошибки сети при отправке сообщения
+				logger.warning(f"Ошибка отправки сообщения с отчетом: {edit_error}")
+				# Пытаемся отправить новое сообщение вместо редактирования
+				try:
+					await cb.message.answer(report_text, reply_markup=admin_menu_kb())
+				except Exception as answer_error:
+					logger.error(f"Не удалось отправить отчет: {answer_error}")
 		else:
 			await state.clear()
 			try:
@@ -4124,7 +4170,7 @@ async def _update_crypto_values_in_stats(
 					if profit_values:
 						avg_profit = sum(profit_values) / len(profit_values)
 						formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
-						profit_lines.append(f"<code>📊 Средний профит с начала недели: {formatted_avg} USD</code>")
+						profit_lines.append(f"<code>📊 Средний: {formatted_avg} USD</code>")
 			except Exception as e:
 				logger.warning(f"Ошибка batch чтения профитов: {e}")
 		
@@ -4485,27 +4531,34 @@ async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))
-async def user_view(cb: CallbackQuery):
+async def user_view(cb: CallbackQuery, bot: Bot):
 	db = get_db()
-	user_id = int(cb.data.split(":")[-1])
+	parts = cb.data.split(":")
+	user_id = int(parts[2])
+	
+	# Проверяем, есть ли card_id в callback_data (формат: user:view:{user_id}:card:{card_id})
+	card_id = None
+	if len(parts) > 4 and parts[3] == "card":
+		card_id = int(parts[4])
+	
 	user = await db.get_user_by_id(user_id)
 	if not user:
 		await cb.answer("Пользователь не найден", show_alert=True)
 		return
 	
 	# Формируем информацию о пользователе для заголовка
-	parts = []
+	parts_text = []
 	if user["full_name"]:
-		parts.append(user["full_name"])
+		parts_text.append(user["full_name"])
 	if user["username"]:
-		parts.append(f"@{user['username']}")
+		parts_text.append(f"@{user['username']}")
 	if user["tg_id"]:
-		parts.append(f"(tg_id: {user['tg_id']})")
+		parts_text.append(f"(tg_id: {user['tg_id']})")
 	
-	if not parts:
+	if not parts_text:
 		text = f"ID: {user['user_id']}"
 	else:
-		text = " ".join(parts)
+		text = " ".join(parts_text)
 	
 	if user["cards"]:
 		text += "\n\nТекущие привязки:"
@@ -4516,13 +4569,53 @@ async def user_view(cb: CallbackQuery):
 	
 	text += "\n\nЧто хотите сделать?"
 	
-	await cb.message.edit_text(text, reply_markup=user_action_kb(user_id, "admin:users"))
+	# Формат callback_data для возврата: user:back_to_requisites:{user_id}:{card_id}
+	if card_id is not None:
+		# Если есть card_id - это из реквизитов, отправляем новое сообщение, чтобы не потерять реквизиты
+		back_to = f"user:back_to_requisites:{user_id}:{card_id}"
+		await bot.send_message(
+			chat_id=cb.message.chat.id,
+			text=text,
+			reply_markup=user_action_kb(user_id, back_to)
+		)
+	else:
+		# Если нет card_id - это возврат из списка карт, редактируем существующее сообщение
+		back_to = "admin:back"
+		await cb.message.edit_text(
+			text,
+			reply_markup=user_action_kb(user_id, back_to)
+		)
 	await cb.answer()
 
 
-@admin_router.callback_query(F.data.startswith("user:bind:") & ~F.data.startswith("user:bind:card:"))
+@admin_router.callback_query(F.data.startswith("user:back_to_requisites:"))
+async def user_back_to_requisites(cb: CallbackQuery, bot: Bot):
+	"""Возвращает к реквизитам карты при нажатии 'Назад' в меню пользователя"""
+	db = get_db()
+	# Формат: user:back_to_requisites:{user_id}:{card_id}
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка формата данных", show_alert=True)
+		return
+	
+	user_id = int(parts[2])
+	card_id = int(parts[3])
+	
+	# Отправляем реквизиты заново
+	await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+	
+	# Удаляем сообщение с меню пользователя
+	try:
+		await cb.message.delete()
+	except Exception as e:
+		logger.warning(f"⚠️ Не удалось удалить сообщение: {e}")
+	
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("user:bind:") & ~F.data.startswith("user:bind:card:") & ~F.data.startswith("user:bind:group:"))
 async def user_bind(cb: CallbackQuery):
-	"""Показывает список карт для привязки к пользователю"""
+	"""Показывает список групп карт для привязки к пользователю"""
 	db = get_db()
 	# Формат: user:bind:{user_id}
 	user_id = int(cb.data.split(":")[-1])
@@ -4531,9 +4624,8 @@ async def user_bind(cb: CallbackQuery):
 		await cb.answer("Пользователь не найден", show_alert=True)
 		return
 	
-	# Получаем список всех карт
-	rows = await db.list_cards()
-	cards = [(r[0], r[1]) for r in rows]
+	# Получаем список групп карт
+	groups = await db.list_card_groups()
 	
 	# Формируем информацию о пользователе для заголовка
 	parts = []
@@ -4556,17 +4648,90 @@ async def user_bind(cb: CallbackQuery):
 	else:
 		text += "\n\nНе привязан к карте"
 	
-	if not cards:
-		text += "\n\n⚠️ Нет доступных карт для привязки"
-		await cb.message.edit_text(text, reply_markup=simple_back_kb(f"user:view:{user_id}"))
+	if not groups:
+		# Если групп нет, показываем все карты сразу
+		rows = await db.list_cards()
+		cards = [(r[0], r[1]) for r in rows]
+		if not cards:
+			text += "\n\n⚠️ Нет доступных карт для привязки"
+			await cb.message.edit_text(text, reply_markup=simple_back_kb(f"user:view:{user_id}"))
+		else:
+			text += "\n\nВыберите карту для изменения привязки:"
+			selected_ids = [card["card_id"] for card in user["cards"]]
+			await cb.message.edit_text(
+				text,
+				reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}", selected_ids),
+			)
 	else:
-		text += "\n\nВыберите карту для изменения привязки:"
-		selected_ids = [card["card_id"] for card in user["cards"]]
-		# Используем специальную клавиатуру для выбора карты с указанием user_id
-		await cb.message.edit_text(
-			text,
-			reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}", selected_ids),
-		)
+		text += "\n\nВыберите группу карт:"
+		# Создаем клавиатуру с группами, используя специальный формат для привязки пользователю
+		kb = InlineKeyboardBuilder()
+		for group in groups:
+			group_name = group.get("name", "")
+			group_id = group.get("id")
+			kb.button(text=f"📁 {group_name}", callback_data=f"user:bind:group:{user_id}:{group_id}")
+		kb.button(text="📋 Без группы", callback_data=f"user:bind:group:{user_id}:0")
+		kb.button(text="⬅️ Назад", callback_data=f"user:view:{user_id}")
+		kb.adjust(1)
+		await cb.message.edit_text(text, reply_markup=kb.as_markup())
+	
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("user:bind:group:"))
+async def user_bind_group(cb: CallbackQuery):
+	"""Показывает карты из выбранной группы для привязки к пользователю"""
+	db = get_db()
+	# Формат: user:bind:group:{user_id}:{group_id}
+	parts = cb.data.split(":")
+	user_id = int(parts[3])
+	group_id_str = parts[4]
+	group_id = int(group_id_str) if group_id_str != "0" else None
+	
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	
+	# Получаем карты из группы или без группы
+	if group_id:
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+		text = f"Карты группы '{group_name}':"
+	else:
+		cards = await db.get_cards_without_group()
+		text = "Карты вне групп:"
+	
+	if not cards:
+		group_text = f"группы '{group_name}'" if group_id else "вне групп"
+		await cb.answer(f"В {group_text} нет карт", show_alert=True)
+		return
+	
+	# Формируем информацию о пользователе для заголовка
+	parts_text = []
+	if user["full_name"]:
+		parts_text.append(user["full_name"])
+	if user["username"]:
+		parts_text.append(f"@{user['username']}")
+	if user["tg_id"]:
+		parts_text.append(f"(tg_id: {user['tg_id']})")
+	
+	if not parts_text:
+		user_text = f"ID: {user['user_id']}"
+	else:
+		user_text = " ".join(parts_text)
+	
+	text = f"{user_text}\n\n{text}\n\nВыберите карту для изменения привязки:"
+	
+	# Преобразуем формат карт из (id, name, details) в (id, name)
+	cards_list = [(c[0], c[1]) for c in cards]
+	selected_ids = [card["card_id"] for card in user["cards"]]
+	
+	await cb.message.edit_text(
+		text,
+		reply_markup=user_card_select_kb(cards_list, user_id, f"user:bind:{user_id}", selected_ids),
+	)
 	
 	await cb.answer()
 
@@ -4665,12 +4830,11 @@ async def user_bind_card(cb: CallbackQuery):
 		text += "\n\nНе привязан к карте"
 	
 	text += f"\n\n{action_text}"
-	
-	selected_ids = [card["card_id"] for card in user.get("cards", [])]
-	text += "\n\nВыберите карту для изменения привязки:"
+	text += "\n\nЧто хотите сделать?"
+	# Возвращаем в меню пользователя после привязки/отвязки карты
 	await cb.message.edit_text(
 		text,
-		reply_markup=user_card_select_kb(cards, user_id, f"user:view:{user_id}", selected_ids),
+		reply_markup=user_action_kb(user_id, "admin:back"),
 	)
 	await cb.answer(alert_text)
 
@@ -4688,30 +4852,6 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	if message.text and message.text.startswith("/"):
 		logger.debug(f"⚠️ Универсальный обработчик: пропускаем команду '{message.text}'")
 		return
-	
-	# Проверяем текущее состояние FSM - если пользователь находится в процессе /add или других операциях,
-	# не обрабатываем пересылки (они должны обрабатываться соответствующими обработчиками состояний)
-	current_state = await state.get_state()
-	if current_state:
-		# Если состояние относится к AddDataStates, CardUserMessageStates, CardRequisiteStates и т.д.,
-		# пропускаем обработку - эти состояния имеют свои обработчики
-		state_str = str(current_state) if current_state else ""
-		if any(state_group in state_str for state_group in [
-			"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
-			"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
-			"DeleteRateStates", "DeleteMoveStates"
-		]):
-			# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
-			logger.debug(f"⚠️ Пропуск обработки пересылки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
-			return
-		
-		# Если есть активное состояние, проверяем, не является ли это состоянием для пересылок
-		# Состояния ForwardBindStates - это состояния для обработки пересылок
-		if current_state not in [ForwardBindStates.waiting_select_card.state, 
-		                          ForwardBindStates.waiting_select_existing_card.state]:
-			# Пользователь находится в другом состоянии (например, /add), пропускаем обработку пересылки
-			logger.debug(f"⚠️ Пропуск обработки пересылки: пользователь находится в состоянии {current_state}")
-			return
 	
 	# Логируем ВСЕ сообщения, которые попадают в обработчик (ДАЖЕ ДО ПРОВЕРКИ АДМИНА)
 	text = message.text or message.caption or ""
@@ -4734,7 +4874,37 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	
 	# Обрабатываем только пересылки от админа
 	if not is_forward:
+		# Если это не пересылка, проверяем состояние FSM
+		# Если пользователь находится в процессе /add или других операциях,
+		# не обрабатываем (они должны обрабатываться соответствующими обработчиками состояний)
+		current_state = await state.get_state()
+		if current_state:
+			# Если состояние относится к AddDataStates, CardUserMessageStates, CardRequisiteStates и т.д.,
+			# пропускаем обработку - эти состояния имеют свои обработчики
+			state_str = str(current_state) if current_state else ""
+			if any(state_group in state_str for state_group in [
+				"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
+				"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
+				"DeleteRateStates", "DeleteMoveStates"
+			]):
+				# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
+				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
+				return
+			
+			# Если есть активное состояние, проверяем, не является ли это состоянием для пересылок
+			# Состояния ForwardBindStates - это состояния для обработки пересылок
+			if current_state not in [ForwardBindStates.waiting_select_card.state, 
+			                          ForwardBindStates.waiting_select_existing_card.state]:
+				# Пользователь находится в другом состоянии (например, /add), пропускаем обработку
+				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}")
+				return
 		return
+	
+	# Если это пересылка - очищаем состояние FSM перед обработкой
+	# Пересылка сообщения пользователя - это отдельная операция, которая не должна зависеть от состояния команды /add, /rate или /move
+	if current_state_before_check:
+		logger.info(f"🧹 Очистка состояния FSM перед обработкой пересылки: было состояние {current_state_before_check}")
+		await state.clear()
 	
 	# Обычная обработка пересылки
 	orig_tg_id, orig_username, orig_full_name = extract_forward_profile(message)
@@ -4881,15 +5051,15 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				)
 				
 				# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-				logger.info(f"🚀 Вызов send_card_requisites_to_admin для card_id={card_id}, admin_chat_id={message.chat.id}")
+				logger.info(f"🚀 Вызов send_card_requisites_to_admin для card_id={card_id}, admin_chat_id={message.chat.id}, user_id={user_id}")
 				try:
 					admin_chat_id = message.chat.id
-					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db)
+					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db, user_id=user_id)
 					logger.info(f"✅ send_card_requisites_to_admin завершена для card_id={card_id}, отправлено: {sent_count}")
 					
 					# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 					if text:
-						await check_and_send_btc_address_links(bot, admin_chat_id, text)
+						await check_and_send_btc_address_links(bot, admin_chat_id, text, user_id=user_id)
 				except Exception as e:
 					logger.exception(f"❌ КРИТИЧЕСКАЯ ОШИБКА в send_card_requisites_to_admin: {e}")
 				return
@@ -5070,7 +5240,12 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			await db.log_card_delivery_by_tg(tg_id, card_id, admin_id=cb.from_user.id if cb.from_user else None)
 			
 			# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-			sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+			sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+			
+			# Получаем текст пересылаемого сообщения для проверки BTC адресов
+			forwarded_text = data.get("forwarded_message_text", "")
+			if forwarded_text:
+				await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 		else:
 			# Несколько карт - выбираем
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
@@ -5082,7 +5257,7 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		# Сначала отправляем ссылку на mempool, если есть BTC адреса
 		forwarded_text = data.get("forwarded_message_text", "")
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 		# Затем показываем выбор карты
 		groups = await db.list_card_groups()
 		if groups:
@@ -5189,15 +5364,20 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		user_msg = card.get("user_message")
 		has_user_message = bool(user_msg)
 		
+		# Получаем user_id из данных состояния или из карты
+		reply_user_id = data.get("user_id_for_hidden") or data.get("existing_user_id")
+		if not reply_user_id and original_tg_id:
+			reply_user_id = await db.get_user_id_by_tg(original_tg_id)
+		
 		# Получаем текст пересылаемого сообщения для проверки BTC адресов
 		forwarded_text = data.get("forwarded_message_text", "")
 		
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=reply_user_id)
 		
 		await cb.answer()
 		return
@@ -5232,11 +5412,11 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		
 		# Отправляем все реквизиты админу
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 		
 	elif hidden_user_name:
 		# Скрытый пользователь (MessageOriginHiddenUser)
@@ -5281,12 +5461,12 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		
 		# Отправляем все реквизиты админу (даже для скрытого пользователя)
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
 		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 	
 	await cb.answer()
 
@@ -5349,12 +5529,15 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		card_id,
 		admin_id=cb.from_user.id if cb.from_user else None,
 	)
+		# Получаем user_id для обычного пользователя
+		reply_user_id = await db.get_user_id_by_tg(user_tg_id)
+		
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=reply_user_id)
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(
@@ -5364,11 +5547,11 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id})")
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id_for_hidden)
 		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text)
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id_for_hidden)
 	
 	await cb.answer()

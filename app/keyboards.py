@@ -141,6 +141,22 @@ def simple_back_kb(back_to: str = "admin:back") -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
+def user_menu_button_kb(user_id: int, card_id: Optional[int] = None) -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру с кнопкой "Меню пользователя" для перехода к user_view.
+	
+	Args:
+		user_id: ID пользователя в базе данных
+		card_id: ID карты для возврата к реквизитам (опционально)
+	"""
+	kb = InlineKeyboardBuilder()
+	if card_id is not None:
+		kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}:card:{card_id}")
+	else:
+		kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
+	return kb.as_markup()
+
+
 def stat_u_menu_kb(back_to: str = "stat_u:menu") -> InlineKeyboardMarkup:
 	"""Клавиатура для меню статистики пользователей"""
 	kb = InlineKeyboardBuilder()
