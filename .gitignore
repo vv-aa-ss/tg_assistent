@@ -42,3 +42,6 @@ build/
 proud-plane.json
 *credentials*.json
 *secret*.json
+
+# FFmpeg (local installation)
+ffmpeg/

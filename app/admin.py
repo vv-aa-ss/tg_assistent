@@ -38,6 +38,7 @@ from app.keyboards import (
 	user_menu_button_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
+from app.voice_commands import handle_voice_command
 
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
@@ -177,7 +178,8 @@ class AdminOnlyMiddleware(BaseMiddleware):
 		if isinstance(event, Message):
 			text = event.text or event.caption or ""
 			is_forward = bool(getattr(event, "forward_origin", None) or getattr(event, "forward_from", None))
-			logger.info(f"🔵 MIDDLEWARE: message_id={event.message_id}, is_forward={is_forward}, text='{text[:100]}', from_user={from_user.id if from_user else None}, handler={handler.__name__ if hasattr(handler, '__name__') else 'unknown'}")
+			has_voice = bool(getattr(event, "voice", None))
+			logger.info(f"🔵 MIDDLEWARE: message_id={event.message_id}, is_forward={is_forward}, has_voice={has_voice}, text='{text[:100]}', from_user={from_user.id if from_user else None}, handler={handler.__name__ if hasattr(handler, '__name__') else 'unknown'}")
 		
 		if from_user:
 			user_id = getattr(from_user, "id", None)
@@ -350,10 +352,10 @@ def detect_crypto_type(amount: float) -> str:
 def detect_cash_type(amount: int) -> str:
 	"""
 	Определяет тип наличных по сумме.
-	BYN: до 1000
-	RUB: 1000 и больше
+	BYN: до 1500
+	RUB: 1500 и больше
 	"""
-	if amount < 1000:
+	if amount < 1500:
 		return "BYN"
 	else:
 		return "RUB"
@@ -4528,6 +4530,46 @@ async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
 	else:
 		lines.append("❌ Google Sheets не настроен")
 		await msg.answer("\n".join(lines), reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+
+
+@admin_router.message(F.voice)
+async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
+	"""Обработчик голосовых сообщений для выполнения команд"""
+	logger.info(f"🎤 Получено голосовое сообщение от пользователя {msg.from_user.id if msg.from_user else None}")
+	
+	# Отправляем сообщение о том, что обрабатываем голосовое сообщение
+	processing_msg = await msg.answer("🎤 Обрабатываю голосовое сообщение...")
+	
+	try:
+		# Обрабатываем голосовое сообщение и определяем команду
+		command = await handle_voice_command(msg, bot)
+		
+		if not command:
+			await processing_msg.edit_text("❌ Не удалось распознать команду из голосового сообщения")
+			return
+		
+		# Выполняем соответствующую команду
+		if command == "stat_u":
+			await processing_msg.delete()
+			# Вызываем обработчик команды stat_u
+			await admin_stats_command(msg, state)
+		elif command == "stat_bk":
+			await processing_msg.delete()
+			# Вызываем обработчик команды stat_bk
+			await admin_stat_bk_command(msg, bot, state)
+		elif command == "stat_k":
+			await processing_msg.delete()
+			# Вызываем обработчик команды stat_k
+			await admin_stat_k_command(msg, bot, state)
+		else:
+			await processing_msg.edit_text(f"❌ Неизвестная команда: {command}")
+			
+	except Exception as e:
+		logger.exception(f"❌ Ошибка обработки голосового сообщения: {e}")
+		try:
+			await processing_msg.edit_text("❌ Произошла ошибка при обработке голосового сообщения")
+		except:
+			pass
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))

@@ -5,3 +5,5 @@ pydantic==2.9.2
 gspread==6.1.2
 google-auth==2.29.0
 google-auth-oauthlib>=0.4.1
+SpeechRecognition==3.10.0
+pydub==0.25.1
