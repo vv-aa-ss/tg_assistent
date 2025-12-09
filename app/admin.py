@@ -38,7 +38,7 @@ from app.keyboards import (
 	user_menu_button_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
-from app.voice_commands import handle_voice_command
+from app.voice_commands import handle_voice_command, parse_add_operation_data, find_crypto_by_name, find_card_by_group_and_name, find_cash_by_name
 
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
@@ -201,6 +201,10 @@ admin_router.callback_query.middleware(AdminOnlyMiddleware())
 
 
 class AddCardStates(StatesGroup):
+	waiting_name = State()
+
+
+class CardNameEditStates(StatesGroup):
 	waiting_name = State()
 
 
@@ -1150,47 +1154,68 @@ def format_add_data_text(data: dict) -> str:
 	# Показываем сохраненные блоки
 	saved_blocks = data.get("saved_blocks", [])
 	for block_idx, block in enumerate(saved_blocks, 1):
-		block_items = []
+		block_lines = []
 		block_crypto = block.get("crypto_data")
 		if block_crypto:
 			currency = block_crypto.get("currency", "")
 			usd_amount = block_crypto.get("usd_amount", 0)
 			xmr_number = block_crypto.get("xmr_number")
 			if xmr_number:
-				block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)}")
+				block_lines.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)},")
 			else:
-				block_items.append(f"🪙 {currency}: ${int(usd_amount)}")
+				block_lines.append(f"🪙 {currency}: ${int(usd_amount)},")
 		
 		block_card = block.get("card_data")
 		block_card_cash = block.get("card_cash_data")
 		if block_card:
 			card_name = block_card.get("card_name", "")
+			group_name = block_card.get("group_name")
+			# Формируем строку с именем группы, если есть
+			if group_name:
+				card_display = f"💳 ({group_name}){card_name}"
+			else:
+				card_display = f"💳{card_name}"
+			
 			if block_card_cash:
 				amount = block_card_cash.get("value", 0)
-				block_items.append(f"💳{card_name}: {amount} р.")
+				block_lines.append(f"{card_display}: {amount} р.")
 			else:
-				block_items.append(f"💳{card_name}")
+				block_lines.append(card_display)
 		
 		block_cash = block.get("cash_data")
 		if block_cash:
 			amount = block_cash.get("value", 0)
 			cash_name = block_cash.get("cash_name", "Наличные")
-			block_items.append(f"💵 {cash_name}: {amount}")
+			currency = block_cash.get("currency", "")
+			# Убираем дублирующийся эмодзи 💵, так как cash_name уже содержит эмодзи
+			# Если cash_name начинается с эмодзи, используем его, иначе добавляем 💵
+			if cash_name and cash_name[0] in ["💵", "💴", "💶", "💷", "💰", "🐿", "💸"]:
+				# Добавляем валюту, если она есть
+				if currency:
+					block_lines.append(f"{cash_name}: {amount} {currency}")
+				else:
+					block_lines.append(f"{cash_name}: {amount}")
+			else:
+				# Добавляем валюту, если она есть
+				if currency:
+					block_lines.append(f"💵 {cash_name}: {amount} {currency}")
+				else:
+					block_lines.append(f"💵 {cash_name}: {amount}")
 		
-		if block_items:
-			selected_items.append(f"{block_idx}: " + ", ".join(block_items))
+		if block_lines:
+			selected_items.append(f"{block_idx}:\n" + "\n".join(block_lines))
 	
 	# Показываем текущий блок (если есть)
-	current_block_items = []
+	current_block_lines = []
 	crypto_data = data.get("crypto_data")
 	if crypto_data:
 		currency = crypto_data.get("currency", "")
 		usd_amount = crypto_data.get("usd_amount", 0)
 		xmr_number = crypto_data.get("xmr_number")
 		if xmr_number:
-			current_block_items.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)}")
+			current_block_lines.append(f"🪙 XMR-{xmr_number}: ${int(usd_amount)},")
 		else:
-			current_block_items.append(f"🪙 {currency}: ${int(usd_amount)}")
+			current_block_lines.append(f"🪙 {currency}: ${int(usd_amount)},")
 	
 	card_data = data.get("card_data")
 	cash_data = data.get("cash_data")
@@ -1199,23 +1224,44 @@ def format_add_data_text(data: dict) -> str:
 	# Обрабатываем карту
 	if card_data:
 		card_name = card_data.get("card_name", "")
+		group_name = card_data.get("group_name")
+		# Формируем строку с именем группы, если есть
+		if group_name:
+			card_display = f"💳 ({group_name}){card_name}"
+		else:
+			card_display = f"💳{card_name}"
+		
 		if card_cash_data:
 			# Карта с наличными
 			amount = card_cash_data.get("value", 0)
-			current_block_items.append(f"💳{card_name}: {amount} р.")
+			current_block_lines.append(f"{card_display}: {amount} р.")
 		else:
 			# Только карта без наличных
-			current_block_items.append(f"💳{card_name}")
+			current_block_lines.append(card_display)
 	
 	# Обрабатываем наличные без карты
 	if cash_data:
 		amount = cash_data.get("value", 0)
 		cash_name = cash_data.get("cash_name", "Наличные")
-		current_block_items.append(f"💵 {cash_name}: {amount}")
+		currency = cash_data.get("currency", "")
+		# Убираем дублирующийся эмодзи 💵, так как cash_name уже содержит эмодзи
+		# Если cash_name начинается с эмодзи, используем его, иначе добавляем 💵
+		if cash_name and cash_name[0] in ["💵", "💴", "💶", "💷", "💰", "🐿", "💸"]:
+			# Добавляем валюту, если она есть
+			if currency:
+				current_block_lines.append(f"{cash_name}: {amount} {currency}")
+			else:
+				current_block_lines.append(f"{cash_name}: {amount}")
+		else:
+			# Добавляем валюту, если она есть
+			if currency:
+				current_block_lines.append(f"💵 {cash_name}: {amount} {currency}")
+			else:
+				current_block_lines.append(f"💵 {cash_name}: {amount}")
 	
-	if current_block_items:
+	if current_block_lines:
 		current_block_num = len(saved_blocks) + 1
-		selected_items.append(f"{current_block_num}: " + ", ".join(current_block_items))
+		selected_items.append(f"{current_block_num}:\n" + "\n".join(current_block_lines))
 	
 	if selected_items:
 		text += "Выбранные данные:\n" + "\n".join(selected_items) + "\n\n"
@@ -1820,11 +1866,20 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	# Получаем адрес столбца для карты
 	column = await db.get_card_column(card_id)
 	
+	# Получаем имя группы, если есть group_id
+	group_name = None
+	if card.get("group_id"):
+		group = await db.get_card_group_by_id(card["group_id"])
+		if group:
+			group_name = group["name"]
+	
 	card_data = {
 		"card_id": card_id,
 		"card_name": card.get("name", ""),
 		"user_name": None,
-		"column": column
+		"column": column,
+		"group_id": card.get("group_id"),
+		"group_name": group_name
 	}
 	
 	# Если редактируется сохраненный блок, обновляем его
@@ -3348,8 +3403,102 @@ async def card_view(cb: CallbackQuery, state: FSMContext):
 	
 	text += "\n\nЧто хотите сделать?"
 	
-	await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, "admin:cards"), parse_mode="HTML")
+	# Определяем, куда должна вести кнопка "Назад"
+	# Если карта в группе, возвращаемся к списку карт группы, иначе к списку групп
+	if card.get("group_id"):
+		back_to = f"cards:group:{card['group_id']}"
+	else:
+		back_to = "admin:cards"
+	
+	await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, back_to), parse_mode="HTML")
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("card:edit_name:"))
+async def card_edit_name_start(cb: CallbackQuery, state: FSMContext):
+	"""Начинает процесс редактирования названия карты"""
+	db = get_db()
+	card_id = int(cb.data.split(":")[-1])
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	# Очищаем старое состояние перед установкой нового
+	await state.clear()
+	await state.set_state(CardNameEditStates.waiting_name)
+	await state.update_data(card_id=card_id)
+	
+	from app.keyboards import simple_back_kb
+	await cb.message.edit_text(
+		f"💳 Текущее название: {card['name']}\n\nВведите новое название карты:",
+		reply_markup=simple_back_kb(f"card:view:{card_id}")
+	)
+	await cb.answer()
+
+
+@admin_router.message(CardNameEditStates.waiting_name)
+async def card_edit_name_set(message: Message, state: FSMContext):
+	"""Обрабатывает ввод нового названия карты"""
+	db = get_db()
+	data = await state.get_data()
+	card_id = data.get("card_id")
+	
+	if not card_id:
+		await message.answer("❌ Ошибка: не найден ID карты")
+		await state.clear()
+		return
+	
+	new_name = message.text.strip()
+	if not new_name:
+		await message.answer("❌ Название карты не может быть пустым. Попробуйте еще раз:")
+		return
+	
+	# Обновляем название карты
+	await db.set_card_name(card_id, new_name)
+	await state.clear()
+	
+	# Получаем обновленную информацию о карте
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await message.answer("❌ Карта не найдена", reply_markup=admin_menu_kb())
+		return
+	
+	# Формируем информацию о карте для возврата
+	text = f"💳 {card['name']}"
+	
+	# Получаем привязанные ячейки для этой карты
+	card_columns = await db.list_card_columns(card_id=card_id)
+	if card_columns:
+		columns_text = ", ".join([col['column'] for col in card_columns])
+		text += f"\n\nЯчейка: {columns_text}"
+	else:
+		text += "\n\nЯчейка: не привязана"
+	
+	# Получаем информацию о группе
+	if card.get("group_id"):
+		group = await db.get_card_group(card["group_id"])
+		if group:
+			text += f"\n\nГруппа: {group['name']}"
+	else:
+		text += "\n\nГруппа: не привязана"
+	
+	if card['user_message']:
+		text += f"\n\nТекущее сообщение:\n{card['user_message']}"
+	else:
+		text += "\n\nСообщение не задано"
+	
+	text += f"\n\n✅ Название карты изменено на: {new_name}\n\nЧто хотите сделать?"
+	
+	# Определяем, куда должна вести кнопка "Назад"
+	# Если карта в группе, возвращаемся к списку карт группы, иначе к списку групп
+	if card.get("group_id"):
+		back_to = f"cards:group:{card['group_id']}"
+	else:
+		back_to = "admin:cards"
+	
+	from app.keyboards import card_action_kb
+	await message.answer(text, reply_markup=card_action_kb(card_id, back_to), parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data.startswith("card:groups:"))
@@ -3474,7 +3623,14 @@ async def card_select_group(cb: CallbackQuery):
 		
 		text += "\n\nЧто хотите сделать?"
 		
-		await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, "admin:cards"), parse_mode="HTML")
+		# Определяем, куда должна вести кнопка "Назад"
+		# Если карта в группе, возвращаемся к списку карт группы, иначе к списку групп
+		if card.get("group_id"):
+			back_to = f"cards:group:{card['group_id']}"
+		else:
+			back_to = "admin:cards"
+		
+		await cb.message.edit_text(text, reply_markup=card_action_kb(card_id, back_to), parse_mode="HTML")
 	except Exception as e:
 		logger.exception(f"Ошибка при привязке карты к группе: {e}")
 		await cb.answer("❌ Произошла ошибка при привязке карты к группе", show_alert=True)
@@ -4535,14 +4691,23 @@ async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
 @admin_router.message(F.voice)
 async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 	"""Обработчик голосовых сообщений для выполнения команд"""
-	logger.info(f"🎤 Получено голосовое сообщение от пользователя {msg.from_user.id if msg.from_user else None}")
+	logger.info(f"🎤 Получено голосовое сообщение от пользователя {msg.from_user.id if msg.from_user else None}, message_id={msg.message_id}")
+	
+	# Очищаем состояние перед обработкой нового голосового сообщения
+	# Это нужно, чтобы старые данные не мешали новому распознаванию
+	current_state = await state.get_state()
+	logger.debug(f"🧹 Очистка состояния перед обработкой голосового сообщения. Текущее состояние: {current_state}")
+	await state.clear()
+	logger.debug(f"✅ Состояние очищено")
 	
 	# Отправляем сообщение о том, что обрабатываем голосовое сообщение
 	processing_msg = await msg.answer("🎤 Обрабатываю голосовое сообщение...")
 	
 	try:
 		# Обрабатываем голосовое сообщение и определяем команду
+		logger.debug(f"🔍 Начинаю распознавание команды из голосового сообщения message_id={msg.message_id}")
 		command = await handle_voice_command(msg, bot)
+		logger.debug(f"✅ Определена команда: {command}")
 		
 		if not command:
 			await processing_msg.edit_text("❌ Не удалось распознать команду из голосового сообщения")
@@ -4561,6 +4726,10 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 			await processing_msg.delete()
 			# Вызываем обработчик команды stat_k
 			await admin_stat_k_command(msg, bot, state)
+		elif command == "add":
+			# Обрабатываем голосовой ввод для команды /add
+			await processing_msg.edit_text("🎤 Распознаю данные операции...")
+			await handle_voice_add_command(msg, bot, state, processing_msg)
 		else:
 			await processing_msg.edit_text(f"❌ Неизвестная команда: {command}")
 			
@@ -4570,6 +4739,595 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 			await processing_msg.edit_text("❌ Произошла ошибка при обработке голосового сообщения")
 		except:
 			pass
+
+
+async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, processing_msg: Message):
+	"""
+	Обрабатывает голосовой ввод для команды /add.
+	Парсит данные операции и заполняет state.
+	"""
+	from app.voice_commands import transcribe_voice
+	
+	try:
+		logger.debug(f"🔍 Начинаю обработку голосового ввода для /add, message_id={msg.message_id}")
+		
+		# Распознаем речь
+		text = await transcribe_voice(bot, msg.voice)
+		if not text:
+			await processing_msg.edit_text("❌ Не удалось распознать речь из голосового сообщения")
+			return
+		
+		logger.info(f"📝 Распознанный текст для операции: {text}")
+		
+		# Парсим данные операции
+		parsed_data = parse_add_operation_data(text)
+		
+		if not parsed_data.get("blocks"):
+			await processing_msg.edit_text("❌ Не удалось распознать данные операции из голосового сообщения")
+			return
+		
+		# Инициализируем state как при обычной команде /add
+		# Состояние уже очищено в handle_voice_message, но очищаем еще раз для надежности
+		current_state = await state.get_state()
+		logger.debug(f"🧹 Очистка состояния в handle_voice_add_command. Текущее состояние: {current_state}")
+		await state.clear()
+		await state.set_state(AddDataStates.selecting_type)
+		logger.debug(f"✅ Состояние установлено: {AddDataStates.selecting_type}")
+		
+		db = get_db()
+		saved_blocks = []
+		unrecognized_items = []  # Список нераспознанных элементов
+		
+		# Обрабатываем каждый блок
+		for block_idx, block in enumerate(parsed_data["blocks"]):
+			block_data = {
+				"crypto_data": None,
+				"cash_data": None,
+				"card_data": None,
+				"card_cash_data": None
+			}
+			
+			# Обрабатываем криптовалюту
+			if "crypto" in block:
+				crypto_info = block["crypto"]
+				original_text_crypto = crypto_info.get("original_text", f"{crypto_info['currency']} {crypto_info['amount']}")
+				crypto_currency = await find_crypto_by_name(crypto_info["currency"], db, original_text_crypto)
+				if crypto_currency:
+					block_data["crypto_data"] = {
+						"currency": crypto_currency,
+						"usd_amount": crypto_info["amount"],
+						"value": crypto_info["amount"]
+					}
+				else:
+					logger.warning(f"⚠️ Криптовалюта не найдена: {crypto_info['currency']}")
+					unrecognized_items.append({
+						"type": "crypto",
+						"text": crypto_info.get("original_text", f"{crypto_info['currency']} {crypto_info['amount']}"),
+						"data": crypto_info
+					})
+			
+			# Обрабатываем карту
+			if "card" in block:
+				card_info = block["card"]
+				original_text = card_info.get("original_text", f"{card_info['group']} {card_info['name']}")
+				card = await find_card_by_group_and_name(card_info["group"], card_info["name"], db, original_text)
+				if card:
+					# Получаем имя группы, если есть group_id
+					group_name = None
+					if card.get("group_id"):
+						group = await db.get_card_group_by_id(card["group_id"])
+						if group:
+							group_name = group["name"]
+					
+					block_data["card_data"] = {
+						"card_id": card["card_id"],
+						"card_name": card["card_name"],
+						"group_id": card.get("group_id"),
+						"group_name": group_name
+					}
+					block_data["card_cash_data"] = {
+						"value": card_info["amount"]
+					}
+				else:
+					logger.warning(f"⚠️ Карта не найдена: {card_info['group']} - {card_info['name']}")
+					unrecognized_items.append({
+						"type": "card",
+						"text": card_info.get("original_text", f"{card_info['group']} {card_info['name']} {card_info['amount']}"),
+						"data": card_info
+					})
+			
+			# Обрабатываем наличные
+			if "cash" in block:
+				cash_info = block["cash"]
+				if isinstance(cash_info, dict):
+					original_text = cash_info.get("original_text", f"{cash_info['name']} {cash_info['amount']}")
+					cash = await find_cash_by_name(cash_info["name"], db, original_text)
+					if cash:
+						# Получаем валюту из БД
+						cash_column_info = await db.get_cash_column(cash["cash_name"])
+						currency = cash_column_info.get("currency", "RUB") if cash_column_info else "RUB"
+						
+						block_data["cash_data"] = {
+							"cash_name": cash["cash_name"],
+							"value": cash_info["amount"],
+							"currency": currency
+						}
+					else:
+						logger.warning(f"⚠️ Наличные не найдены: {cash_info['name']}")
+						unrecognized_items.append({
+							"type": "cash",
+							"text": original_text,
+							"data": cash_info
+						})
+			
+			# Добавляем блок в saved_blocks, если есть хотя бы одно поле
+			if any(block_data.values()):
+				saved_blocks.append(block_data)
+				logger.debug(f"✅ Блок {block_idx + 1} добавлен: crypto={block_data.get('crypto_data') is not None}, card={block_data.get('card_data') is not None}, cash={block_data.get('cash_data') is not None}")
+			else:
+				logger.warning(f"⚠️ Блок {block_idx + 1} не добавлен: нет распознанных данных")
+		
+		logger.info(f"📊 После парсинга: {len(saved_blocks)} блоков, нераспознано: {len(unrecognized_items)}")
+		
+		# Если есть нераспознанные элементы, показываем кнопку "Обучить"
+		if unrecognized_items:
+			# Сохраняем нераспознанные элементы в state для обучения
+			await state.update_data(
+				voice_unrecognized_items=unrecognized_items,
+				voice_original_text=text
+			)
+		
+		# Сохраняем данные в state
+		await state.update_data(
+			mode="add",
+			crypto_data=None,
+			cash_data=None,
+			card_data=None,
+			card_cash_data=None,
+			xmr_number=None,
+			saved_blocks=saved_blocks,
+			crypto_list=[],
+			xmr_list=[],
+			cash_list=[],
+			card_cash_pairs=[]
+		)
+		
+		# Отображаем данные в виде кнопок
+		from app.keyboards import add_data_type_kb
+		
+		data = await state.get_data()
+		text = format_add_data_text(data)
+		
+		# Если есть нераспознанные элементы, добавляем информацию и кнопку "Обучить"
+		if unrecognized_items:
+			text += "\n\n⚠️ <b>Нераспознанные элементы:</b>\n"
+			for item in unrecognized_items:
+				text += f"• {item['type']}: {item['text']}\n"
+			text += "\nНажмите 'Обучить' для исправления соответствий."
+			
+			# Создаем клавиатуру с кнопкой "Обучить"
+			kb = InlineKeyboardBuilder()
+			kb.button(text="🎓 Обучить", callback_data="voice:train:start")
+			kb.button(text="✅ Продолжить", callback_data="voice:train:skip")
+			kb.adjust(2)
+			
+			# Добавляем стандартную клавиатуру add_data_type_kb
+			standard_kb = add_data_type_kb(mode="add", data=data)
+			# Объединяем клавиатуры
+			for row in standard_kb.inline_keyboard:
+				kb.row(*row)
+			
+			await processing_msg.delete()
+			await msg.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+		else:
+			await processing_msg.delete()
+			await msg.answer(text, reply_markup=add_data_type_kb(mode="add", data=data))
+		
+		logger.info(f"✅ Голосовая операция успешно обработана: {len(saved_blocks)} блоков, нераспознано: {len(unrecognized_items)}")
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка обработки голосовой команды /add: {e}")
+		try:
+			await processing_msg.edit_text("❌ Произошла ошибка при обработке голосовой команды /add")
+		except:
+			pass
+
+
+@admin_router.callback_query(F.data == "voice:train:skip")
+async def voice_train_skip(cb: CallbackQuery, state: FSMContext):
+	"""Пропустить обучение и продолжить с текущими данными"""
+	await cb.answer("Обучение пропущено")
+	data = await state.get_data()
+	# Убираем данные об обучении
+	await state.update_data(
+		voice_unrecognized_items=None,
+		voice_original_text=None
+	)
+	# Обновляем сообщение без кнопки "Обучить"
+	from app.keyboards import add_data_type_kb
+	text = format_add_data_text(data)
+	await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+
+
+@admin_router.callback_query(F.data == "voice:train:start")
+async def voice_train_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Начать обучение - показать нераспознанные элементы и варианты выбора"""
+	data = await state.get_data()
+	unrecognized_items = data.get("voice_unrecognized_items", [])
+	
+	if not unrecognized_items:
+		await cb.answer("Нет нераспознанных элементов", show_alert=True)
+		return
+	
+	# Показываем первый нераспознанный элемент
+	await state.update_data(voice_training_index=0)
+	await show_training_item(cb, state, bot, 0)
+
+
+async def show_training_item(cb: CallbackQuery, state: FSMContext, bot: Bot, index: int):
+	"""Показывает элемент для обучения"""
+	from aiogram.utils.keyboard import InlineKeyboardBuilder
+	
+	data = await state.get_data()
+	unrecognized_items = data.get("voice_unrecognized_items", [])
+	
+	if index >= len(unrecognized_items):
+		# Обучение завершено - перезапускаем парсинг с учетом новых соответствий
+		await cb.message.edit_text("✅ Обучение завершено! Перезапускаю парсинг...")
+		
+		# Получаем оригинальный текст
+		original_text = data.get("voice_original_text")
+		if original_text:
+			# Перезапускаем парсинг с учетом новых соответствий
+			from app.voice_commands import parse_add_operation_data
+			
+			parsed_data = parse_add_operation_data(original_text)
+			
+			if parsed_data.get("blocks"):
+				db = get_db()
+				saved_blocks = []
+				unrecognized_items_new = []
+				
+				# Обрабатываем каждый блок заново
+				for block_idx, block in enumerate(parsed_data["blocks"]):
+					block_data = {
+						"crypto_data": None,
+						"cash_data": None,
+						"card_data": None,
+						"card_cash_data": None
+					}
+					
+					# Обрабатываем криптовалюту
+					if "crypto" in block:
+						crypto_info = block["crypto"]
+						from app.voice_commands import find_crypto_by_name
+						original_text_crypto = crypto_info.get("original_text", f"{crypto_info['currency']} {crypto_info['amount']}")
+						crypto_currency = await find_crypto_by_name(crypto_info["currency"], db, original_text_crypto)
+						if crypto_currency:
+							block_data["crypto_data"] = {
+								"currency": crypto_currency,
+								"usd_amount": crypto_info["amount"],
+								"value": crypto_info["amount"]
+							}
+						else:
+							unrecognized_items_new.append({
+								"type": "crypto",
+								"text": crypto_info.get("original_text", f"{crypto_info['currency']} {crypto_info['amount']}"),
+								"data": crypto_info
+							})
+					
+					# Обрабатываем карту
+					if "card" in block:
+						card_info = block["card"]
+						original_text_card = card_info.get("original_text", f"{card_info['group']} {card_info['name']}")
+						from app.voice_commands import find_card_by_group_and_name
+						card = await find_card_by_group_and_name(card_info["group"], card_info["name"], db, original_text_card)
+						if card:
+							# Получаем имя группы, если есть group_id
+							group_name = None
+							if card.get("group_id"):
+								group = await db.get_card_group_by_id(card["group_id"])
+								if group:
+									group_name = group["name"]
+							
+							block_data["card_data"] = {
+								"card_id": card["card_id"],
+								"card_name": card["card_name"],
+								"group_id": card.get("group_id"),
+								"group_name": group_name
+							}
+							block_data["card_cash_data"] = {
+								"value": card_info["amount"]
+							}
+						else:
+							unrecognized_items_new.append({
+								"type": "card",
+								"text": card_info.get("original_text", f"{card_info['group']} {card_info['name']} {card_info['amount']}"),
+								"data": card_info
+							})
+					
+					# Обрабатываем наличные
+					if "cash" in block:
+						cash_info = block["cash"]
+						if isinstance(cash_info, dict):
+							original_text_cash = cash_info.get("original_text", f"{cash_info['name']} {cash_info['amount']}")
+							from app.voice_commands import find_cash_by_name
+							cash = await find_cash_by_name(cash_info["name"], db, original_text_cash)
+							if cash:
+								# Получаем валюту из БД
+								cash_column_info = await db.get_cash_column(cash["cash_name"])
+								currency = cash_column_info.get("currency", "RUB") if cash_column_info else "RUB"
+								
+								block_data["cash_data"] = {
+									"cash_name": cash["cash_name"],
+									"value": cash_info["amount"],
+									"currency": currency
+								}
+							else:
+								unrecognized_items_new.append({
+									"type": "cash",
+									"text": original_text_cash,
+									"data": cash_info
+								})
+					
+				# Добавляем блок в saved_blocks, если есть хотя бы одно поле
+				if any(block_data.values()):
+					saved_blocks.append(block_data)
+					logger.debug(f"✅ Блок {block_idx + 1} добавлен: crypto={block_data.get('crypto_data') is not None}, card={block_data.get('card_data') is not None}, cash={block_data.get('cash_data') is not None}")
+				else:
+					logger.warning(f"⚠️ Блок {block_idx + 1} не добавлен: нет распознанных данных")
+				
+				logger.info(f"📊 После перезапуска парсинга: {len(saved_blocks)} блоков, нераспознано: {len(unrecognized_items_new)}")
+				
+				# Обновляем state с новыми данными
+				await state.update_data(
+					mode="add",
+					crypto_data=None,
+					cash_data=None,
+					card_data=None,
+					card_cash_data=None,
+					xmr_number=None,
+					saved_blocks=saved_blocks,
+					crypto_list=[],
+					xmr_list=[],
+					cash_list=[],
+					card_cash_pairs=[],
+					voice_unrecognized_items=unrecognized_items_new if unrecognized_items_new else None,
+					voice_original_text=original_text if unrecognized_items_new else None,
+					voice_training_index=None
+				)
+				
+				# Получаем обновленные данные
+				data = await state.get_data()
+				text = format_add_data_text(data)
+				
+				# Если есть нераспознанные элементы, добавляем информацию
+				if unrecognized_items_new:
+					text += "\n\n⚠️ <b>Нераспознанные элементы:</b>\n"
+					for item in unrecognized_items_new:
+						text += f"• {item['type']}: {item['text']}\n"
+					text += "\nНажмите 'Обучить' для исправления соответствий."
+					
+					# Создаем клавиатуру с кнопкой "Обучить"
+					kb = InlineKeyboardBuilder()
+					kb.button(text="🎓 Обучить", callback_data="voice:train:start")
+					kb.button(text="✅ Продолжить", callback_data="voice:train:skip")
+					kb.adjust(2)
+					
+					# Добавляем стандартную клавиатуру add_data_type_kb
+					from app.keyboards import add_data_type_kb
+					standard_kb = add_data_type_kb(mode="add", data=data)
+					# Объединяем клавиатуры
+					for row in standard_kb.inline_keyboard:
+						kb.row(*row)
+					
+					await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+				else:
+					from app.keyboards import add_data_type_kb
+					await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+			else:
+				await cb.message.edit_text("❌ Не удалось перезапустить парсинг")
+		else:
+			# Если нет оригинального текста, просто показываем текущие данные
+			await state.update_data(
+				voice_unrecognized_items=None,
+				voice_original_text=None,
+				voice_training_index=None
+			)
+			text = format_add_data_text(data)
+			from app.keyboards import add_data_type_kb
+			await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+		return
+	
+	item = unrecognized_items[index]
+	kb = InlineKeyboardBuilder()
+	
+	if item["type"] == "card":
+		# Проверяем, выбрана ли уже папка
+		data = await state.get_data()
+		selected_group_id = data.get(f"voice_train_group_{index}")
+		
+		if selected_group_id is None:
+			# Показываем список папок (групп) для выбора
+			db = get_db()
+			groups = await db.list_card_groups()
+			
+			text = f"🎓 <b>Обучение</b>\n\n"
+			text += f"Распознано: <code>{item['text']}</code>\n"
+			text += f"Выберите папку (группу) карт:\n\n"
+			text += f"Прогресс: {index + 1}/{len(unrecognized_items)}"
+			
+			# Показываем все папки
+			for group in groups:
+				kb.button(text=f"📁 {group['name']}", callback_data=f"voice:train:select_group:{group['id']}:{index}")
+			
+			# Добавляем опцию для карт без группы
+			cards_no_group = await db.get_cards_without_group()
+			if cards_no_group:
+				kb.button(text="📁 Без группы", callback_data=f"voice:train:select_group:0:{index}")
+			
+			kb.button(text="⏭ Пропустить", callback_data=f"voice:train:skip_item:{index}")
+			kb.button(text="⬅️ Назад", callback_data="voice:train:start")
+			kb.adjust(1)
+		else:
+			# Показываем карты из выбранной папки
+			db = get_db()
+			if selected_group_id == 0:
+				# Карты без группы
+				cards = await db.get_cards_without_group()
+				group_name = "Без группы"
+			else:
+				cards = await db.get_cards_by_group(selected_group_id)
+				group = await db.get_card_group_by_id(selected_group_id)
+				group_name = group["name"] if group else "Неизвестная группа"
+			
+			text = f"🎓 <b>Обучение</b>\n\n"
+			text += f"Распознано: <code>{item['text']}</code>\n"
+			text += f"Папка: <b>{group_name}</b>\n"
+			text += f"Выберите правильную карту:\n\n"
+			text += f"Прогресс: {index + 1}/{len(unrecognized_items)}"
+			
+			# Показываем все карты из папки
+			for card_id, card_name, _ in cards:
+				kb.button(text=card_name, callback_data=f"voice:train:select:card:{card_id}:{index}")
+			
+			kb.button(text="⬅️ Выбрать другую папку", callback_data=f"voice:train:select_group:clear:{index}")
+			kb.button(text="⏭ Пропустить", callback_data=f"voice:train:skip_item:{index}")
+			kb.button(text="⬅️ Назад", callback_data="voice:train:start")
+			kb.adjust(1)
+		
+	elif item["type"] == "cash":
+		# Показываем список наличных для выбора
+		db = get_db()
+		cash_columns = await db.list_cash_columns()
+		
+		text = f"🎓 <b>Обучение</b>\n\n"
+		text += f"Распознано: <code>{item['text']}</code>\n"
+		text += f"Выберите правильные наличные:\n\n"
+		text += f"Прогресс: {index + 1}/{len(unrecognized_items)}"
+		
+		for cash in cash_columns:
+			display_name = cash.get("display_name") or cash.get("cash_name", "")
+			kb.button(text=display_name, callback_data=f"voice:train:select:cash:{cash['cash_name']}:{index}")
+		
+		kb.button(text="⏭ Пропустить", callback_data=f"voice:train:skip_item:{index}")
+		kb.button(text="⬅️ Назад", callback_data="voice:train:start")
+		kb.adjust(1)
+		
+	elif item["type"] == "crypto":
+		# Показываем список криптовалют для выбора
+		db = get_db()
+		crypto_columns = await db.list_crypto_columns()
+		
+		text = f"🎓 <b>Обучение</b>\n\n"
+		text += f"Распознано: <code>{item['text']}</code>\n"
+		text += f"Выберите правильную криптовалюту:\n\n"
+		text += f"Прогресс: {index + 1}/{len(unrecognized_items)}"
+		
+		for crypto in crypto_columns:
+			kb.button(text=crypto["crypto_type"], callback_data=f"voice:train:select:crypto:{crypto['crypto_type']}:{index}")
+		
+		kb.button(text="⏭ Пропустить", callback_data=f"voice:train:skip_item:{index}")
+		kb.button(text="⬅️ Назад", callback_data="voice:train:start")
+		kb.adjust(1)
+	
+	await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+	if hasattr(cb, 'answer'):
+		await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("voice:train:select_group:"))
+async def voice_train_select_group(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора папки (группы) при обучении карт"""
+	parts = cb.data.split(":")
+	group_id_str = parts[3]
+	index = int(parts[4])
+	
+	if group_id_str == "clear":
+		# Очищаем выбранную папку и возвращаемся к выбору папок
+		await state.update_data(**{f"voice_train_group_{index}": None})
+		await show_training_item(cb, state, bot, index)
+		return
+	
+	group_id = int(group_id_str) if group_id_str != "0" else 0
+	
+	# Сохраняем выбранную папку в state
+	await state.update_data(**{f"voice_train_group_{index}": group_id})
+	
+	# Показываем карты из выбранной папки
+	await show_training_item(cb, state, bot, index)
+
+
+@admin_router.callback_query(F.data.startswith("voice:train:select:"))
+async def voice_train_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора правильного соответствия при обучении"""
+	parts = cb.data.split(":")
+	item_type = parts[3]  # card, cash, crypto
+	target_id = parts[4]  # ID или название
+	index = int(parts[5])
+	
+	# Очищаем выбранную папку после выбора карты
+	if item_type == "card":
+		await state.update_data(**{f"voice_train_group_{index}": None})
+	
+	data = await state.get_data()
+	unrecognized_items = data.get("voice_unrecognized_items", [])
+	
+	if index >= len(unrecognized_items):
+		await cb.answer("Ошибка: элемент не найден", show_alert=True)
+		return
+	
+	item = unrecognized_items[index]
+	db = get_db()
+	
+	# Сохраняем соответствие в базу данных
+	# Нормализуем текст: убираем числа, чтобы обучение работало для любых сумм
+	import re
+	voice_text = item["text"].lower()
+	
+	# Нормализуем текст для сохранения (убираем числа и лишние слова)
+	if item_type == "card":
+		# Убираем слово "карта" в начале и числа
+		normalized_text = voice_text
+		for word in ["карта", "карты", "card", "cards"]:
+			if normalized_text.startswith(word + " "):
+				normalized_text = normalized_text[len(word):].strip()
+		normalized_text = re.sub(r'\d+(?:\.\d+)?', '', normalized_text).strip()
+		# Сохраняем нормализованный текст (без чисел), чтобы обучение работало для любых сумм
+		card_id = int(target_id)
+		card = await db.get_card_by_id(card_id)
+		if card:
+			await db.add_voice_mapping("card", normalized_text, "card_id", target_id=card_id, target_name=card["name"])
+			logger.info(f"✅ Сохранено соответствие: '{normalized_text}' (из '{voice_text}') -> карта {card_id} ({card['name']})")
+	
+	elif item_type == "cash":
+		# Убираем ключевые слова "наличные", "нал", "cash" и числа
+		normalized_text = voice_text
+		for word in ["наличные", "нал", "cash"]:
+			normalized_text = normalized_text.replace(word, "").strip()
+		normalized_text = re.sub(r'\d+(?:\.\d+)?', '', normalized_text).strip()
+		# Сохраняем нормализованный текст (без чисел)
+		await db.add_voice_mapping("cash", normalized_text, "cash_name", target_name=target_id)
+		logger.info(f"✅ Сохранено соответствие: '{normalized_text}' (из '{voice_text}') -> наличные {target_id}")
+	
+	elif item_type == "crypto":
+		# Убираем числа
+		normalized_text = re.sub(r'\d+(?:\.\d+)?', '', voice_text).strip()
+		# Сохраняем нормализованный текст (без чисел)
+		await db.add_voice_mapping("crypto", normalized_text, "crypto_type", target_name=target_id)
+		logger.info(f"✅ Сохранено соответствие: '{normalized_text}' (из '{voice_text}') -> крипта {target_id}")
+	
+	# Переходим к следующему элементу
+	await cb.answer("Соответствие сохранено")
+	await show_training_item(cb, state, bot, index + 1)
+
+
+@admin_router.callback_query(F.data.startswith("voice:train:skip_item:"))
+async def voice_train_skip_item(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Пропустить текущий элемент обучения"""
+	index = int(cb.data.split(":")[-1])
+	await cb.answer("Элемент пропущен")
+	await show_training_item(cb, state, bot, index + 1)
 
 
 @admin_router.callback_query(F.data.startswith("user:view:"))
@@ -4893,6 +5651,11 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 	# Проверяем это ПЕРВЫМ делом, до любых других проверок
 	if message.text and message.text.startswith("/"):
 		logger.debug(f"⚠️ Универсальный обработчик: пропускаем команду '{message.text}'")
+		return
+	
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
+		logger.debug(f"⚠️ Универсальный обработчик: пропускаем голосовое сообщение message_id={message.message_id}")
 		return
 	
 	# Логируем ВСЕ сообщения, которые попадают в обработчик (ДАЖЕ ДО ПРОВЕРКИ АДМИНА)

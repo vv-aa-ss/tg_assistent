@@ -270,6 +270,7 @@ def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboard
 
 def card_action_kb(card_id: int, back_to: str = "admin:cards") -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
+	kb.button(text="✏️ Изменить название", callback_data=f"card:edit_name:{card_id}")
 	kb.button(text="✏️ Изменить реквизиты", callback_data=f"card:edit:{card_id}")
 	kb.button(text="➕ Реквизиты", callback_data=f"card:add_requisite:{card_id}")
 	kb.button(text="🔗 Привязать ячейку", callback_data=f"card:bind_column:{card_id}")

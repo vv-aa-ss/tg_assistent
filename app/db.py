@@ -81,8 +81,35 @@ class Database:
 		await self._ensure_card_requisites()
 		await self._ensure_rate_history()
 		await self._ensure_menu_user()
+		await self._ensure_voice_mappings()
 		await self._db.commit()
 
+	async def _ensure_voice_mappings(self) -> None:
+		"""Создает таблицу для хранения соответствий голосовых команд"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='voice_mappings'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE voice_mappings (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					mapping_type TEXT NOT NULL,
+					voice_text TEXT NOT NULL,
+					target_type TEXT NOT NULL,
+					target_id INTEGER,
+					target_name TEXT,
+					created_at INTEGER NOT NULL,
+					UNIQUE(mapping_type, voice_text)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_voice_mappings_type_text ON voice_mappings(mapping_type, voice_text)"
+			)
+			_logger.debug("Created table voice_mappings")
+	
 	async def _ensure_menu_user(self) -> None:
 		"""Создает специального пользователя для логирования выбора карт в меню"""
 		assert self._db
@@ -904,6 +931,18 @@ class Database:
 		await self._db.execute("UPDATE cards SET user_message = ? WHERE id = ?", (text, card_id))
 		await self._db.commit()
 
+	async def set_card_name(self, card_id: int, name: str) -> None:
+		"""
+		Обновляет название карты.
+		
+		Args:
+			card_id: ID карты
+			name: Новое название карты
+		"""
+		assert self._db
+		await self._db.execute("UPDATE cards SET name = ? WHERE id = ?", (name, card_id))
+		await self._db.commit()
+
 	async def get_card_user_message(self, card_id: int) -> Optional[str]:
 		assert self._db
 		cur = await self._db.execute("SELECT user_message FROM cards WHERE id = ?", (card_id,))
@@ -1292,6 +1331,39 @@ class Database:
 		cur = await self._db.execute(
 			"SELECT id, name, created_at FROM card_groups ORDER BY name"
 		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"id": row[0],
+				"name": row[1],
+				"created_at": row[2]
+			}
+			for row in rows
+		]
+	
+	async def get_card_group_by_id(self, group_id: int) -> Optional[Dict[str, Any]]:
+		"""
+		Получает группу карт по ID.
+		
+		Args:
+			group_id: ID группы карт
+			
+		Returns:
+			Словарь с ключами: id, name, created_at или None, если группа не найдена
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, name, created_at FROM card_groups WHERE id = ?",
+			(group_id,)
+		)
+		row = await cur.fetchone()
+		if row:
+			return {
+				"id": row[0],
+				"name": row[1],
+				"created_at": row[2]
+			}
+		return None
 		rows = await cur.fetchall()
 		return [
 			{
@@ -1745,3 +1817,58 @@ class Database:
 		await self._db.execute("DELETE FROM card_requisites WHERE id = ?", (requisite_id,))
 		await self._db.commit()
 		_logger.debug(f"Card requisite deleted: id={requisite_id}")
+	
+	async def add_voice_mapping(self, mapping_type: str, voice_text: str, target_type: str, target_id: Optional[int] = None, target_name: Optional[str] = None) -> int:
+		"""
+		Добавляет соответствие голосовой команды.
+		
+		Args:
+			mapping_type: Тип соответствия ("card", "cash", "crypto")
+			voice_text: Текст, который был распознан из голоса
+			target_type: Тип цели ("card_id", "cash_name", "crypto_type")
+			target_id: ID цели (для карт)
+			target_name: Название цели (для наличных, крипты)
+		
+		Returns:
+			ID созданного соответствия
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			INSERT OR REPLACE INTO voice_mappings(mapping_type, voice_text, target_type, target_id, target_name, created_at)
+			VALUES(?, ?, ?, ?, ?, ?)
+			""",
+			(mapping_type, voice_text.lower(), target_type, target_id, target_name, int(time.time()))
+		)
+		await self._db.commit()
+		mapping_id = cur.lastrowid
+		_logger.debug(f"Voice mapping added: type={mapping_type}, voice_text={voice_text}, target={target_type}")
+		return mapping_id
+	
+	async def get_voice_mapping(self, mapping_type: str, voice_text: str) -> Optional[Dict[str, Any]]:
+		"""
+		Получает соответствие голосовой команды.
+		
+		Args:
+			mapping_type: Тип соответствия ("card", "cash", "crypto")
+			voice_text: Текст, который был распознан из голоса
+		
+		Returns:
+			Словарь с информацией о соответствии или None
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, mapping_type, voice_text, target_type, target_id, target_name FROM voice_mappings WHERE mapping_type = ? AND voice_text = ?",
+			(mapping_type, voice_text.lower())
+		)
+		row = await cur.fetchone()
+		if row:
+			return {
+				"id": row[0],
+				"mapping_type": row[1],
+				"voice_text": row[2],
+				"target_type": row[3],
+				"target_id": row[4],
+				"target_name": row[5]
+			}
+		return None

@@ -71,7 +71,7 @@ async def main() -> None:
 	dp.message.middleware(LoggingMiddleware())
 
 	@dp.message(CommandStart())
-	async def on_start(message: Message):
+	async def on_start(message: Message, state):
 		logger.debug(f"/start from user_id={getattr(message.from_user,'id',None)} username={getattr(message.from_user,'username',None)}")
 		if message.from_user and is_admin(
 			message.from_user.id,
@@ -79,6 +79,13 @@ async def main() -> None:
 			settings.admin_ids,
 			settings.admin_usernames
 		):
+			# Очищаем состояние FSM при вызове /start
+			current_state = await state.get_state()
+			if current_state:
+				logger.debug(f"🧹 Очистка состояния при /start. Текущее состояние: {current_state}")
+				await state.clear()
+				logger.debug(f"✅ Состояние очищено при /start")
+			
 			# Устанавливаем команды для админа после начала диалога
 			# Для личных чатов это работает только после того, как пользователь начал диалог
 			try:
