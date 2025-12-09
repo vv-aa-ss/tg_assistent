@@ -16,6 +16,7 @@
 """
 import logging
 import os
+import sys
 import tempfile
 import re
 from typing import Optional, Dict, List, Any, Tuple
@@ -29,11 +30,31 @@ def _setup_ffmpeg_path():
 	"""
 	Настраивает путь к ffmpeg.exe для pydub.
 	Ищет ffmpeg в папке проекта (ffmpeg/bin/ffmpeg.exe).
+	Поддерживает работу как в обычном режиме, так и в EXE (PyInstaller).
 	"""
 	try:
-		# Получаем путь к корню проекта (на уровень выше app/)
-		project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-		ffmpeg_path = os.path.join(project_root, "ffmpeg", "bin", "ffmpeg.exe")
+		# Проверяем, запущена ли программа как EXE (PyInstaller)
+		if getattr(sys, 'frozen', False):
+			# Если это EXE, используем путь к папке, где находится EXE файл
+			# sys.executable содержит путь к EXE файлу
+			exe_dir = os.path.dirname(sys.executable)
+			ffmpeg_path = os.path.join(exe_dir, "ffmpeg", "bin", "ffmpeg.exe")
+			
+			logger.debug(f"🔍 EXE режим: ищем ffmpeg в {ffmpeg_path}")
+			
+			# Если не найдено рядом с EXE, пробуем в папке _MEIPASS (временная папка PyInstaller)
+			if not os.path.exists(ffmpeg_path):
+				meipass = getattr(sys, '_MEIPASS', None)
+				if meipass:
+					ffmpeg_path_meipass = os.path.join(meipass, "ffmpeg", "bin", "ffmpeg.exe")
+					logger.debug(f"🔍 EXE режим: пробуем _MEIPASS: {ffmpeg_path_meipass}")
+					if os.path.exists(ffmpeg_path_meipass):
+						ffmpeg_path = ffmpeg_path_meipass
+		else:
+			# Обычный режим: получаем путь к корню проекта (на уровень выше app/)
+			project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+			ffmpeg_path = os.path.join(project_root, "ffmpeg", "bin", "ffmpeg.exe")
+			logger.debug(f"🔍 Обычный режим: ищем ffmpeg в {ffmpeg_path}")
 		
 		if os.path.exists(ffmpeg_path):
 			# Устанавливаем путь для pydub
