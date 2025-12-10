@@ -3396,8 +3396,15 @@ async def card_view(cb: CallbackQuery, state: FSMContext):
 	else:
 		text += "\n\nГруппа: не привязана"
 	
-	if card['user_message']:
+	# Проверяем наличие реквизитов (user_message и/или реквизиты из card_requisites)
+	requisites = await db.list_card_requisites(card_id)
+	has_user_message = bool(card.get('user_message') and card['user_message'].strip())
+	has_requisites = len(requisites) > 0
+	
+	if has_user_message:
 		text += f"\n\nТекущее сообщение:\n{card['user_message']}"
+	elif has_requisites:
+		text += f"\n\nРеквизитов: {len(requisites)}"
 	else:
 		text += "\n\nСообщение не задано"
 	
