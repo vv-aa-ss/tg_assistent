@@ -713,15 +713,24 @@ def crypto_select_kb(back_to: str = "multi:back_to_main", show_confirm: bool = T
 	return kb.as_markup()
 
 
-def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+def add_data_type_kb(
+	mode: str = "add", 
+	back_to: str = "admin:back", 
+	data: Optional[Dict[str, Any]] = None,
+	recent_cryptos: Optional[List[str]] = None,
+	recent_cards: Optional[List[Tuple[int, str, Optional[str]]]] = None
+) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора типа данных в командах /add и /rate.
 	Показывает все сохраненные блоки + текущий блок.
 	
 	Args:
-		mode: Режим работы ("add" или "rate")
+		mode: Режим работы ("add", "rate" или "move")
 		back_to: Callback data для кнопки "Назад"
 		data: Словарь с выбранными данными (saved_blocks, crypto_data, cash_data, card_data, card_cash_data)
+		recent_cryptos: Список последних используемых криптовалют (например, ['BTC', 'LTC', 'XMR-1'])
+		recent_cards: Список кортежей (card_id, card_name, group_name) последних используемых карт (до 6)
+			group_name может быть None, если карта не привязана к группе
 	"""
 	kb = InlineKeyboardBuilder()
 	
@@ -813,16 +822,65 @@ def add_data_type_kb(mode: str = "add", back_to: str = "admin:back", data: Optio
 	if mode == "rate":
 		kb.button(text="📝 Примечание", callback_data=f"add_data:note:{mode}")
 	
+	# Три последние используемые криптовалюты
+	if recent_cryptos:
+		for crypto_id in recent_cryptos[:3]:
+			# Форматируем название для отображения
+			if crypto_id.startswith("XMR-"):
+				display_name = crypto_id  # "XMR-1", "XMR-2", "XMR-3"
+			else:
+				display_name = crypto_id  # "BTC", "LTC", "USDT", etc.
+			kb.button(text=display_name, callback_data=f"add_data:quick:crypto:{crypto_id}:{mode}")
+	
+	# Шесть последних используемых карт
+	if recent_cards:
+		for card_tuple in recent_cards[:6]:
+			card_id = card_tuple[0]
+			card_name = card_tuple[1]
+			group_name = card_tuple[2] if len(card_tuple) > 2 else None
+			# Отображаем группу в скобках, если она есть
+			if group_name:
+				display_name = f"{card_name} ({group_name})"
+			else:
+				display_name = card_name
+			kb.button(text=display_name, callback_data=f"add_data:quick:card:{card_id}:{mode}")
+	
 	# Подтвердить и Назад
 	kb.button(text="✅ Подтвердить", callback_data=f"add_data:confirm:{mode}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	
-	# Настраиваем расположение: каждая строка блока - 3 кнопки, затем "+", затем "Примечание" (если rate), затем "Подтвердить" и "Назад"
-	# saved_blocks + 1 (текущий блок) строк по 3 кнопки, затем 1 кнопка "+", затем 1 кнопка "Примечание" (если rate), затем 2 кнопки
-	adjust_list = [3] * (len(saved_blocks) + 1) + [1]
+	# Настраиваем расположение:
+	# saved_blocks + 1 (текущий блок) строк по 3 кнопки
+	# затем 1 кнопка "+"
+	# затем 1 кнопка "Примечание" (если rate)
+	# затем до 3 кнопок криптовалют (по 3 в ряд)
+	# затем до 6 кнопок карт (по 3 в ряд)
+	# затем 2 кнопки ("Подтвердить" и "Назад")
+	adjust_list = [3] * (len(saved_blocks) + 1) + [1]  # Блоки + "+"
 	if mode == "rate":
 		adjust_list.append(1)  # Кнопка "Примечание"
-	adjust_list.extend([2])  # "Подтвердить" и "Назад"
+	
+	# Криптовалюты (до 3, по 3 в ряд)
+	if recent_cryptos:
+		crypto_count = min(len(recent_cryptos), 3)
+		if crypto_count > 0:
+			adjust_list.append(crypto_count)
+	
+	# Карты (до 6, по 3 в ряд)
+	if recent_cards:
+		card_count = min(len(recent_cards), 6)
+		if card_count > 0:
+			# Разбиваем на ряды по 3 карты
+			full_rows = card_count // 3
+			remainder = card_count % 3
+			if full_rows > 0:
+				adjust_list.extend([3] * full_rows)
+			if remainder > 0:
+				adjust_list.append(remainder)
+	
+	# Подтвердить и Назад
+	adjust_list.append(2)
+	
 	kb.adjust(*adjust_list)
 	return kb.as_markup()
 

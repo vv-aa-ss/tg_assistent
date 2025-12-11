@@ -46,6 +46,34 @@ logger = logging.getLogger("app.admin")
 USERS_PER_PAGE = 6
 
 
+async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optional[Dict[str, Any]] = None, back_to: str = "admin:back"):
+	"""
+	Получает клавиатуру add_data_type_kb с последними используемыми криптовалютами и картами.
+	
+	Args:
+		admin_id: ID администратора
+		mode: Режим работы ("add", "rate" или "move")
+		data: Словарь с выбранными данными
+		back_to: Callback data для кнопки "Назад"
+	
+	Returns:
+		InlineKeyboardMarkup с последними используемыми элементами
+	"""
+	from app.keyboards import add_data_type_kb
+	db = get_db()
+	
+	# Получаем последние используемые криптовалюты и карты
+	recent_cryptos = await db.get_recent_cryptos_by_admin(admin_id, limit=3)
+	recent_cards = await db.get_recent_cards_by_admin_for_menu(admin_id, limit=6)
+	
+	return add_data_type_kb(
+		mode=mode,
+		back_to=back_to,
+		data=data,
+		recent_cryptos=recent_cryptos,
+		recent_cards=recent_cards
+	)
+
 
 async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str, user_id: Optional[int] = None) -> None:
 	"""
@@ -83,7 +111,7 @@ async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str, us
 			logger.warning(f"⚠️ Ошибка отправки ссылки на BTC адрес {address}: {e}")
 
 
-async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db, user_id: Optional[int] = None) -> int:
+async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db, user_id: Optional[int] = None, admin_id: Optional[int] = None) -> int:
 	"""
 	Отправляет все реквизиты карты админу отдельными сообщениями.
 	Отправляет и реквизиты из таблицы card_requisites, и user_message (если есть) для обратной совместимости.
@@ -94,11 +122,18 @@ async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: i
 		card_id: ID карты
 		db: Экземпляр базы данных
 		user_id: ID пользователя для отправки клавиатуры "Меню пользователя" (опционально)
+		admin_id: ID администратора для логирования использования карты (опционально)
 	
 	Returns:
 		Количество успешно отправленных реквизитов
 	"""
-	logger.info(f"📤 send_card_requisites_to_admin: card_id={card_id}, admin_chat_id={admin_chat_id}, user_id={user_id}")
+	logger.info(f"📤 send_card_requisites_to_admin: card_id={card_id}, admin_chat_id={admin_chat_id}, user_id={user_id}, admin_id={admin_id}")
+	
+	# Логируем использование карты в usage_log, если передан admin_id
+	if admin_id is not None:
+		await db.log_usage(admin_id, 'card', f'card_id_{card_id}')
+		logger.info(f"📝 Логирование использования карты card_id={card_id} для admin_id={admin_id}")
+	
 	requisites = await db.list_card_requisites(card_id)
 	logger.info(f"📋 Найдено реквизитов в таблице: {len(requisites)} для card_id={card_id}")
 	
@@ -1301,10 +1336,10 @@ async def cmd_add(message: Message, state: FSMContext):
 		card_cash_pairs=[]
 	)
 	
-	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
 	text = format_add_data_text(data)
-	await message.answer(text, reply_markup=add_data_type_kb(mode="add", data=data))
+	kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode="add", data=data)
+	await message.answer(text, reply_markup=kb)
 
 
 @admin_router.message(Command("rate"))
@@ -1332,10 +1367,10 @@ async def cmd_rate(message: Message, state: FSMContext):
 		card_cash_pairs=[]
 	)
 	
-	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
 	text = format_add_data_text(data)
-	await message.answer(text, reply_markup=add_data_type_kb(mode="rate", data=data))
+	kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode="rate", data=data)
+	await message.answer(text, reply_markup=kb)
 
 
 @admin_router.message(Command("move"))
@@ -1361,10 +1396,10 @@ async def cmd_move(message: Message, state: FSMContext):
 		card_cash_pairs=[]
 	)
 	
-	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
 	text = format_add_data_text(data)
-	await message.answer(text, reply_markup=add_data_type_kb(mode="move", data=data))
+	kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode="move", data=data)
+	await message.answer(text, reply_markup=kb)
 
 
 @admin_router.callback_query(F.data == "admin:cash")
@@ -1493,15 +1528,14 @@ async def add_data_select_type(cb: CallbackQuery, state: FSMContext):
 		groups = await db.list_card_groups()
 		# Получаем последние используемые карты для текущего админа
 		admin_id = cb.from_user.id
-		recent_cards = await db.get_recent_cards_by_admin(admin_id, limit=4)
-		# Получаем информацию о группах для последних карт
+		recent_cards_raw = await db.get_recent_cards_by_admin(admin_id, limit=4)
+		# Преобразуем в старый формат для совместимости с card_groups_select_kb
+		recent_cards = [(card_id, card_name) for card_id, card_name, _ in recent_cards_raw]
+		# Получаем информацию о группах для последних карт из кортежа
 		recent_cards_groups = {}
-		for card_id, _ in recent_cards:
-			card = await db.get_card_by_id(card_id)
-			if card and card.get("group_id"):
-				group = await db.get_card_group(card.get("group_id"))
-				if group:
-					recent_cards_groups[card_id] = group.get("name", "")
+		for card_id, _, group_name in recent_cards_raw:
+			if group_name:
+				recent_cards_groups[card_id] = group_name
 		
 		from app.keyboards import card_groups_select_kb
 		await state.set_state(AddDataStates.selecting_card)
@@ -1535,11 +1569,135 @@ async def add_data_back(cb: CallbackQuery, state: FSMContext):
 		)
 	
 	await state.set_state(AddDataStates.selecting_type)
-	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
 	text = format_add_data_text(data)
-	await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode=mode, data=data)
+	await cb.message.edit_text(text, reply_markup=kb)
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("add_data:quick:"))
+async def add_data_quick_select(cb: CallbackQuery, state: FSMContext):
+	"""Обработчик быстрого выбора криптовалюты, карты или наличных"""
+	# Формат: add_data:quick:{type}:{id}:{mode}
+	# type: crypto, card, cash
+	# id: crypto_id (например, 'BTC', 'XMR-1'), card_id, или currency ('BYN', 'USD')
+	parts = cb.data.split(":")
+	item_type = parts[2]  # crypto, card, cash
+	item_id = parts[3]
+	mode = parts[4]
+	
+	db = get_db()
+	admin_id = cb.from_user.id
+	
+	# Логируем использование
+	# Для карт используем формат 'card_id_{card_id}', для остальных - как есть
+	if item_type == "card":
+		log_item_id = f"card_id_{item_id}"
+	else:
+		log_item_id = item_id
+	await db.log_usage(admin_id, item_type, log_item_id)
+	
+	if item_type == "crypto":
+		# Быстрый выбор криптовалюты
+		crypto_id = item_id
+		
+		# Определяем, это XMR с номером или обычная крипта
+		if crypto_id.startswith("XMR-"):
+			# XMR с номером кошелька
+			xmr_number = int(crypto_id.split("-")[1])
+			await state.update_data(
+				crypto_currency="XMR",
+				xmr_number=xmr_number,
+				editing_block_idx=None
+			)
+		else:
+			# Обычная криптовалюта
+			await state.update_data(
+				crypto_currency=crypto_id,
+				xmr_number=None,
+				editing_block_idx=None
+			)
+		
+		# Запрашиваем сумму
+		await state.set_state(AddDataStates.entering_crypto)
+		await cb.message.edit_text(
+			f"💰 Введите сумму в USD для {crypto_id}:",
+			reply_markup=None
+		)
+		await cb.answer()
+		
+	elif item_type == "card":
+		# Быстрый выбор карты
+		card_id = int(item_id)
+		card = await db.get_card_by_id(card_id)
+		
+		if not card:
+			await cb.answer("Карта не найдена", show_alert=True)
+			return
+		
+		# Получаем адрес столбца для карты
+		column = await db.get_card_column(card_id)
+		
+		# Получаем имя группы, если есть group_id
+		group_name = None
+		if card.get("group_id"):
+			group = await db.get_card_group_by_id(card["group_id"])
+			if group:
+				group_name = group["name"]
+		
+		card_data = {
+			"card_id": card_id,
+			"card_name": card.get("name", ""),
+			"user_name": None,
+			"column": column,
+			"group_id": card.get("group_id"),
+			"group_name": group_name
+		}
+		
+		await state.update_data(
+			card_data=card_data,
+			editing_block_idx=None
+		)
+		
+		# Запрашиваем сумму для карты
+		await state.set_state(AddDataStates.entering_card_cash)
+		await cb.message.edit_text(
+			f"💰 Введите сумму в рублях для карты {card_data['card_name']}:",
+			reply_markup=None
+		)
+		await cb.answer()
+		
+	elif item_type == "cash":
+		# Быстрый выбор наличных (BYN или USD)
+		currency = item_id  # 'BYN' или 'USD'
+		
+		# Находим соответствующую запись в cash_columns
+		cash_columns = await db.list_cash_columns()
+		cash_found = None
+		for cash in cash_columns:
+			cash_currency = cash.get("currency", "RUB")
+			if cash_currency == currency:
+				cash_found = cash
+				break
+		
+		if not cash_found:
+			await cb.answer(f"Наличные {currency} не найдены в базе", show_alert=True)
+			return
+		
+		cash_name = cash_found.get("cash_name", "")
+		await state.update_data(
+			cash_name=cash_name,
+			editing_block_idx=None
+		)
+		
+		# Запрашиваем сумму
+		await state.set_state(AddDataStates.entering_cash)
+		await cb.message.edit_text(
+			f"💰 Введите сумму в {currency} для наличных:",
+			reply_markup=None
+		)
+		await cb.answer()
 
 
 @admin_router.callback_query(F.data.startswith("add_data:back:") & F.data.contains(":group:"))
@@ -1583,6 +1741,12 @@ async def add_data_select_crypto(cb: CallbackQuery, state: FSMContext):
 	data = await state.get_data()
 	mode = data.get("mode", "add")
 	
+	# Логируем выбор криптовалюты (будет логироваться с номером при выборе XMR)
+	db = get_db()
+	admin_id = cb.from_user.id
+	if currency != "XMR":
+		await db.log_usage(admin_id, "crypto", currency)
+	
 	if currency == "XMR":
 		# Для XMR нужно выбрать номер
 		await state.set_state(AddDataStates.selecting_xmr)
@@ -1610,6 +1774,11 @@ async def add_data_select_xmr(cb: CallbackQuery, state: FSMContext):
 	xmr_number = int(parts[2])
 	mode = parts[3]
 	
+	# Логируем выбор XMR с номером
+	db = get_db()
+	admin_id = cb.from_user.id
+	await db.log_usage(admin_id, "crypto", f"XMR-{xmr_number}")
+	
 	await state.update_data(xmr_number=xmr_number, crypto_currency="XMR")
 	await state.set_state(AddDataStates.entering_crypto)
 	await cb.message.edit_text(
@@ -1619,11 +1788,14 @@ async def add_data_select_xmr(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.message(AddDataStates.entering_crypto)
+@admin_router.message(AddDataStates.entering_crypto, ~F.voice)
 async def add_data_enter_crypto(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы криптовалюты"""
 	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
 	if message.text and message.text.startswith("/"):
+		return
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
 		return
 	
 	try:
@@ -1669,10 +1841,15 @@ async def add_data_enter_crypto(message: Message, state: FSMContext):
 		await state.set_state(AddDataStates.selecting_type)
 		
 		mode = data.get("mode", "add")
-		from app.keyboards import add_data_type_kb
+		# Логируем использование криптовалюты
+		db = get_db()
+		crypto_id = f"XMR-{xmr_number}" if xmr_number else currency
+		await db.log_usage(message.from_user.id, "crypto", crypto_id)
+		
 		data = await state.get_data()
 		text = format_add_data_text(data)
-		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+		kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode=mode, data=data)
+		await message.answer(text, reply_markup=kb)
 	except ValueError:
 		await message.answer("❌ Неверный формат. Введите число, например: 100 или -100")
 	except Exception as e:
@@ -1692,6 +1869,11 @@ async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
 	cash_info = await db.get_cash_column(cash_name)
 	display_name = cash_info.get("display_name", "") if cash_info else ""
 	display = display_name if display_name else cash_name
+	currency = cash_info.get("currency", "RUB") if cash_info else "RUB"
+	
+	# Логируем использование наличных (по валюте)
+	admin_id = cb.from_user.id
+	await db.log_usage(admin_id, "cash", currency)
 	
 	# Сохраняем название наличных
 	await state.update_data(cash_name=cash_name)
@@ -1704,11 +1886,14 @@ async def add_data_select_cash_name(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.message(AddDataStates.entering_card_cash)
+@admin_router.message(AddDataStates.entering_card_cash, ~F.voice)
 async def add_data_enter_card_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных для карты"""
 	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
 	if message.text and message.text.startswith("/"):
+		return
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
 		return
 	
 	try:
@@ -1755,10 +1940,18 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 		await state.set_state(AddDataStates.selecting_type)
 
 		mode = data.get("mode", "add")
-		from app.keyboards import add_data_type_kb
+		# Логируем использование карты
+		db = get_db()
+		card_data = data.get("card_data")
+		if card_data:
+			card_id = card_data.get("card_id")
+			if card_id:
+				await db.log_usage(message.from_user.id, "card", f"card_id_{card_id}")
+		
 		data = await state.get_data()
 		text = format_add_data_text(data)
-		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+		kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode=mode, data=data)
+		await message.answer(text, reply_markup=kb)
 	except ValueError:
 		await message.answer("❌ Неверный формат. Введите число, например: 200 или -200")
 	except Exception as e:
@@ -1766,11 +1959,14 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
 
 
-@admin_router.message(AddDataStates.entering_cash)
+@admin_router.message(AddDataStates.entering_cash, ~F.voice)
 async def add_data_enter_cash(message: Message, state: FSMContext):
 	"""Обработчик ввода суммы наличных (без карты)"""
 	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
 	if message.text and message.text.startswith("/"):
+		return
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
 		return
 	
 	try:
@@ -1819,10 +2015,13 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 		await state.set_state(AddDataStates.selecting_type)
 
 		mode = data.get("mode", "add")
-		from app.keyboards import add_data_type_kb
+		# Логируем использование наличных (по валюте)
+		await db.log_usage(message.from_user.id, "cash", currency)
+		
 		data = await state.get_data()
 		text = format_add_data_text(data)
-		await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+		kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode=mode, data=data)
+		await message.answer(text, reply_markup=kb)
 	except ValueError:
 		await message.answer("❌ Неверный формат. Введите число, например: 5000 или -5000")
 	except Exception as e:
@@ -1830,18 +2029,21 @@ async def add_data_enter_cash(message: Message, state: FSMContext):
 		await message.answer("❌ Произошла ошибка. Попробуйте еще раз.")
 
 
-@admin_router.message(AddDataStates.selecting_type, ~F.text.startswith("/"))
+@admin_router.message(AddDataStates.selecting_type, ~F.text.startswith("/"), ~F.voice, ~(F.forward_origin | F.forward_from))
 async def add_data_selecting_type_message(message: Message, state: FSMContext):
 	"""Обработчик текстовых сообщений в состоянии selecting_type - игнорируем, показываем подсказку"""
 	# Пропускаем команды - они должны обрабатываться отдельными обработчиками
 	if message.text and message.text.startswith("/"):
 		return
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
+		return
 	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
-	from app.keyboards import add_data_type_kb
 	text = format_add_data_text(data)
-	await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode=mode, data=data)
+	await message.answer(text, reply_markup=kb)
 
 
 @admin_router.callback_query(AddDataStates.selecting_card, F.data.startswith("card:view:"))
@@ -1858,6 +2060,7 @@ async def add_data_select_card(cb: CallbackQuery, state: FSMContext):
 	# Логируем выбор карты для отслеживания последних используемых карт
 	admin_id = cb.from_user.id
 	await db.log_card_selection(card_id, admin_id)
+	await db.log_usage(admin_id, "card", f"card_id_{card_id}")
 	
 	data = await state.get_data()
 	mode = data.get("mode", "add")
@@ -1963,11 +2166,11 @@ async def add_data_add_block(cb: CallbackQuery, state: FSMContext):
 	)
 	
 	# Обновляем сообщение
-	from app.keyboards import add_data_type_kb
 	data = await state.get_data()
 	text = format_add_data_text(data)
+	kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode=mode, data=data)
 	try:
-		await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+		await cb.message.edit_text(text, reply_markup=kb)
 	except Exception as e:
 		# Игнорируем ошибку, если сообщение не изменилось
 		if "message is not modified" not in str(e):
@@ -1991,9 +2194,12 @@ async def add_data_note(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.message(AddDataStates.entering_note, ~F.text.startswith("/"))
+@admin_router.message(AddDataStates.entering_note, ~F.text.startswith("/"), ~F.voice)
 async def add_data_note_entered(message: Message, state: FSMContext):
 	"""Обработчик ввода примечания для /rate"""
+	# Пропускаем голосовые сообщения - они обрабатываются отдельным обработчиком
+	if message.voice:
+		return
 	note_text = message.text.strip()
 	
 	# Сохраняем примечание в state
@@ -2008,8 +2214,8 @@ async def add_data_note_entered(message: Message, state: FSMContext):
 	text = format_add_data_text(data)
 	
 	# Обновляем сообщение с клавиатурой
-	from app.keyboards import add_data_type_kb
-	await message.answer(text, reply_markup=add_data_type_kb(mode=mode, data=data))
+	kb = await get_add_data_type_kb_with_recent(message.from_user.id, mode=mode, data=data)
+	await message.answer(text, reply_markup=kb)
 	
 	# Удаляем сообщение с вводом примечания
 	try:
@@ -4703,9 +4909,21 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 	# Очищаем состояние перед обработкой нового голосового сообщения
 	# Это нужно, чтобы старые данные не мешали новому распознаванию
 	current_state = await state.get_state()
-	logger.debug(f"🧹 Очистка состояния перед обработкой голосового сообщения. Текущее состояние: {current_state}")
+	current_data = await state.get_data()
+	if current_data:
+		logger.debug(f"🧹 Очистка состояния перед обработкой голосового сообщения. Текущее состояние: {current_state}, данные: {list(current_data.keys())}")
+	else:
+		logger.debug(f"🧹 Очистка состояния перед обработкой голосового сообщения. Текущее состояние: {current_state}, данных нет")
+	# Полностью очищаем состояние, включая все данные
 	await state.clear()
-	logger.debug(f"✅ Состояние очищено")
+	# Дополнительно очищаем данные, если они остались (на случай проблем с clear())
+	check_data = await state.get_data()
+	if check_data:
+		logger.warning(f"⚠️ После clear() остались данные: {list(check_data.keys())}, очищаем вручную")
+		# Очищаем все ключи явно
+		await state.update_data({key: None for key in check_data.keys()})
+		await state.clear()
+	logger.debug(f"✅ Состояние полностью очищено")
 	
 	# Отправляем сообщение о том, что обрабатываем голосовое сообщение
 	processing_msg = await msg.answer("🎤 Обрабатываю голосовое сообщение...")
@@ -4713,7 +4931,8 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 	try:
 		# Обрабатываем голосовое сообщение и определяем команду
 		logger.debug(f"🔍 Начинаю распознавание команды из голосового сообщения message_id={msg.message_id}")
-		command = await handle_voice_command(msg, bot)
+		db = get_db()
+		command = await handle_voice_command(msg, bot, db)
 		logger.debug(f"✅ Определена команда: {command}")
 		
 		if not command:
@@ -4759,15 +4978,19 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 		logger.debug(f"🔍 Начинаю обработку голосового ввода для /add, message_id={msg.message_id}")
 		
 		# Распознаем речь
-		text = await transcribe_voice(bot, msg.voice)
+		db = get_db()
+		text = await transcribe_voice(bot, msg.voice, db)
 		if not text:
 			await processing_msg.edit_text("❌ Не удалось распознать речь из голосового сообщения")
 			return
 		
 		logger.info(f"📝 Распознанный текст для операции: {text}")
 		
+		# Получаем ключевые слова криптовалют из БД
+		crypto_keywords = await db.get_crypto_keywords()
+		
 		# Парсим данные операции
-		parsed_data = parse_add_operation_data(text)
+		parsed_data = parse_add_operation_data(text, crypto_keywords)
 		
 		if not parsed_data.get("blocks"):
 			await processing_msg.edit_text("❌ Не удалось распознать данные операции из голосового сообщения")
@@ -4776,10 +4999,22 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 		# Инициализируем state как при обычной команде /add
 		# Состояние уже очищено в handle_voice_message, но очищаем еще раз для надежности
 		current_state = await state.get_state()
-		logger.debug(f"🧹 Очистка состояния в handle_voice_add_command. Текущее состояние: {current_state}")
+		current_data = await state.get_data()
+		if current_data:
+			logger.debug(f"🧹 Очистка состояния в handle_voice_add_command. Текущее состояние: {current_state}, данные: {list(current_data.keys())}")
+		else:
+			logger.debug(f"🧹 Очистка состояния в handle_voice_add_command. Текущее состояние: {current_state}, данных нет")
+		# Полностью очищаем состояние, включая все данные
 		await state.clear()
+		# Дополнительно очищаем данные, если они остались (на случай проблем с clear())
+		check_data = await state.get_data()
+		if check_data:
+			logger.warning(f"⚠️ После clear() остались данные: {list(check_data.keys())}, очищаем вручную")
+			# Очищаем все ключи явно
+			await state.update_data({key: None for key in check_data.keys()})
+			await state.clear()
 		await state.set_state(AddDataStates.selecting_type)
-		logger.debug(f"✅ Состояние установлено: {AddDataStates.selecting_type}")
+		logger.debug(f"✅ Состояние установлено: {AddDataStates.selecting_type}, данные очищены")
 		
 		db = get_db()
 		saved_blocks = []
@@ -4805,6 +5040,9 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 						"usd_amount": crypto_info["amount"],
 						"value": crypto_info["amount"]
 					}
+					# Если это XMR с номером кошелька, сохраняем номер
+					if crypto_currency == "XMR" and "xmr_number" in crypto_info:
+						block_data["crypto_data"]["xmr_number"] = crypto_info["xmr_number"]
 				else:
 					logger.warning(f"⚠️ Криптовалюта не найдена: {crypto_info['currency']}")
 					unrecognized_items.append({
@@ -4919,7 +5157,7 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 			kb.adjust(2)
 			
 			# Добавляем стандартную клавиатуру add_data_type_kb
-			standard_kb = add_data_type_kb(mode="add", data=data)
+			standard_kb = await get_add_data_type_kb_with_recent(msg.from_user.id, mode="add", data=data)
 			# Объединяем клавиатуры
 			for row in standard_kb.inline_keyboard:
 				kb.row(*row)
@@ -4928,7 +5166,8 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 			await msg.answer(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 		else:
 			await processing_msg.delete()
-			await msg.answer(text, reply_markup=add_data_type_kb(mode="add", data=data))
+			kb = await get_add_data_type_kb_with_recent(msg.from_user.id, mode="add", data=data)
+			await msg.answer(text, reply_markup=kb)
 		
 		logger.info(f"✅ Голосовая операция успешно обработана: {len(saved_blocks)} блоков, нераспознано: {len(unrecognized_items)}")
 		
@@ -4951,9 +5190,9 @@ async def voice_train_skip(cb: CallbackQuery, state: FSMContext):
 		voice_original_text=None
 	)
 	# Обновляем сообщение без кнопки "Обучить"
-	from app.keyboards import add_data_type_kb
 	text = format_add_data_text(data)
-	await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+	kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode="add", data=data)
+	await cb.message.edit_text(text, reply_markup=kb)
 
 
 @admin_router.callback_query(F.data == "voice:train:start")
@@ -4988,7 +5227,11 @@ async def show_training_item(cb: CallbackQuery, state: FSMContext, bot: Bot, ind
 			# Перезапускаем парсинг с учетом новых соответствий
 			from app.voice_commands import parse_add_operation_data
 			
-			parsed_data = parse_add_operation_data(original_text)
+			# Получаем ключевые слова криптовалют из БД
+			db = get_db()
+			crypto_keywords = await db.get_crypto_keywords()
+			
+			parsed_data = parse_add_operation_data(original_text, crypto_keywords)
 			
 			if parsed_data.get("blocks"):
 				db = get_db()
@@ -5122,16 +5365,15 @@ async def show_training_item(cb: CallbackQuery, state: FSMContext, bot: Bot, ind
 					kb.adjust(2)
 					
 					# Добавляем стандартную клавиатуру add_data_type_kb
-					from app.keyboards import add_data_type_kb
-					standard_kb = add_data_type_kb(mode="add", data=data)
+					standard_kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode="add", data=data)
 					# Объединяем клавиатуры
 					for row in standard_kb.inline_keyboard:
 						kb.row(*row)
 					
 					await cb.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 				else:
-					from app.keyboards import add_data_type_kb
-					await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+					kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode="add", data=data)
+					await cb.message.edit_text(text, reply_markup=kb)
 			else:
 				await cb.message.edit_text("❌ Не удалось перезапустить парсинг")
 		else:
@@ -5142,8 +5384,8 @@ async def show_training_item(cb: CallbackQuery, state: FSMContext, bot: Bot, ind
 				voice_training_index=None
 			)
 			text = format_add_data_text(data)
-			from app.keyboards import add_data_type_kb
-			await cb.message.edit_text(text, reply_markup=add_data_type_kb(mode="add", data=data))
+			kb = await get_add_data_type_kb_with_recent(cb.from_user.id, mode="add", data=data)
+			await cb.message.edit_text(text, reply_markup=kb)
 		return
 	
 	item = unrecognized_items[index]
@@ -5409,7 +5651,7 @@ async def user_back_to_requisites(cb: CallbackQuery, bot: Bot):
 	card_id = int(parts[3])
 	
 	# Отправляем реквизиты заново
-	await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+	await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 	
 	# Удаляем сообщение с меню пользователя
 	try:
@@ -5578,7 +5820,7 @@ async def user_delete(cb: CallbackQuery):
 
 
 @admin_router.callback_query(F.data.startswith("user:bind:card:"))
-async def user_bind_card(cb: CallbackQuery):
+async def user_bind_card(cb: CallbackQuery, bot: Bot):
 	db = get_db()
 	# Формат: user:bind:card:{user_id}:{card_id}
 	parts = cb.data.split(":")
@@ -5598,7 +5840,8 @@ async def user_bind_card(cb: CallbackQuery):
 	card_name = next((name for cid, name in cards if cid == card_id), None)
 
 	# Привязываем или отвязываем карту
-	if card_id in bound_ids_before:
+	was_bound = card_id in bound_ids_before
+	if was_bound:
 		await db.unbind_user_from_card(user_id, card_id)
 		action_text = f"❎ Карта {card_name if card_name else card_id} отвязана"
 		alert_text = "Карта отвязана ❎"
@@ -5608,6 +5851,24 @@ async def user_bind_card(cb: CallbackQuery):
 		action_text = f"✅ Карта {card_name if card_name else card_id} привязана"
 		alert_text = "Карта привязана ✅"
 		logger.debug(f"Bound user_id={user_id} to card_id={card_id}")
+		
+		# Если карта была привязана, логируем доставку и отправляем реквизиты
+		user = await db.get_user_by_id(user_id)
+		if user and user.get("tg_id"):
+			await db.log_card_delivery_by_tg(
+				user["tg_id"],
+				card_id,
+				admin_id=cb.from_user.id if cb.from_user else None,
+			)
+		else:
+			await db.log_card_delivery(
+				user_id,
+				card_id,
+				admin_id=cb.from_user.id if cb.from_user else None,
+			)
+		
+		# Отправляем реквизиты новой карты
+		await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 	
 	# Получаем обновленную информацию о пользователе
 	user = await db.get_user_by_id(user_id)
@@ -5763,17 +6024,23 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 					# У пользователя уже есть привязанные карты - продолжаем как обычно
 					if len(cards_for_user) == 1:
 						card = cards_for_user[0]
-						user_msg = card.get("user_message")
-						admin_text = "Сообщение карты отсутствует" if not user_msg else user_msg
-						if user_msg:
-							await message.answer(admin_text, parse_mode="HTML")
-						else:
-							await message.answer(admin_text)
-						logger.info(f"✅ Отправлено сообщение карты для скрытого пользователя '{orig_full_name}' (user_id={user_id})")
+						card_id = card.get("card_id")
+						
+						# Логируем доставку
+						await db.log_card_delivery(
+							user_id,
+							card_id,
+							admin_id=message.from_user.id if message.from_user else None,
+						)
+						
+						# Отправляем все реквизиты карты (из card_requisites и user_message)
+						await send_card_requisites_to_admin(bot, message.chat.id, card_id, db, user_id=user_id, admin_id=message.from_user.id if message.from_user else None)
 						
 						# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 						if text:
-							await check_and_send_btc_address_links(bot, message.chat.id, text)
+							await check_and_send_btc_address_links(bot, message.chat.id, text, user_id=user_id)
+						
+						logger.info(f"✅ Отправлено сообщение карты для скрытого пользователя '{orig_full_name}' (user_id={user_id})")
 						
 						return
 					else:
@@ -5866,7 +6133,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				logger.info(f"🚀 Вызов send_card_requisites_to_admin для card_id={card_id}, admin_chat_id={message.chat.id}, user_id={user_id}")
 				try:
 					admin_chat_id = message.chat.id
-					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db, user_id=user_id)
+					sent_count = await send_card_requisites_to_admin(bot, admin_chat_id, card_id, db, user_id=user_id, admin_id=message.from_user.id if message.from_user else None)
 					logger.info(f"✅ send_card_requisites_to_admin завершена для card_id={card_id}, отправлено: {sent_count}")
 					
 					# Проверяем и отправляем ссылки на BTC адреса, если они найдены
@@ -6052,7 +6319,7 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			await db.log_card_delivery_by_tg(tg_id, card_id, admin_id=cb.from_user.id if cb.from_user else None)
 			
 			# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-			sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+			sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 			
 			# Получаем текст пересылаемого сообщения для проверки BTC адресов
 			forwarded_text = data.get("forwarded_message_text", "")
@@ -6185,7 +6452,7 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		forwarded_text = data.get("forwarded_message_text", "")
 		
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id, admin_id=cb.from_user.id if cb.from_user else None)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
@@ -6224,7 +6491,7 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		
 		# Отправляем все реквизиты админу
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
@@ -6273,7 +6540,7 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		
 		# Отправляем все реквизиты админу (даже для скрытого пользователя)
 		await state.clear()
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
@@ -6345,7 +6612,7 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		reply_user_id = await db.get_user_id_by_tg(user_tg_id)
 		
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id, admin_id=cb.from_user.id if cb.from_user else None)
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 		if forwarded_text:
@@ -6359,7 +6626,7 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id})")
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id_for_hidden)
+		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id_for_hidden, admin_id=cb.from_user.id if cb.from_user else None)
 		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
 		
 		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
