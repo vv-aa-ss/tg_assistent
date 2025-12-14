@@ -4956,6 +4956,10 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 			# Обрабатываем голосовой ввод для команды /add
 			await processing_msg.edit_text("🎤 Распознаю данные операции...")
 			await handle_voice_add_command(msg, bot, state, processing_msg)
+		elif command == "move":
+			# Обрабатываем голосовой ввод для команды /move
+			await processing_msg.edit_text("🎤 Распознаю данные для перемещения...")
+			await handle_voice_move_command(msg, bot, state, processing_msg)
 		else:
 			await processing_msg.edit_text(f"❌ Неизвестная команда: {command}")
 			
@@ -4967,12 +4971,221 @@ async def handle_voice_message(msg: Message, bot: Bot, state: FSMContext):
 			pass
 
 
+async def handle_voice_move_command(msg: Message, bot: Bot, state: FSMContext, processing_msg: Message):
+	"""
+	Обрабатывает голосовой ввод для команды /move.
+	Парсит данные перемещения (две карты) и заполняет state.
+	"""
+	from app.voice_commands import transcribe_voice, parse_voice_with_gpt, find_card_by_group_and_name
+	
+	try:
+		logger.debug(f"🔍 Начинаю обработку голосового ввода для /move, message_id={msg.message_id}")
+		
+		# Распознаем речь
+		db = get_db()
+		text = await transcribe_voice(bot, msg.voice, db)
+		if not text:
+			await processing_msg.edit_text("❌ Не удалось распознать речь из голосового сообщения")
+			return
+		
+		logger.info(f"📝 Распознанный текст для перемещения: {text}")
+		
+		# Парсим данные операции через GPT
+		parsed = await parse_voice_with_gpt(text, db)
+		
+		if not parsed or parsed.get("command") != "move" or not parsed.get("blocks"):
+			await processing_msg.edit_text("❌ Не удалось распознать команду перемещения из голосового сообщения")
+			return
+		
+		# Инициализируем state как при обычной команде /move
+		await state.clear()
+		await state.set_state(AddDataStates.selecting_type)
+		logger.debug(f"✅ Состояние установлено: {AddDataStates.selecting_type}, данные очищены")
+		
+		saved_blocks = []
+		unrecognized_items = []
+		
+		# Обрабатываем блоки от GPT
+		# Для move нужно две карты: одна "откуда", другая "куда"
+		card_from = None
+		card_to = None
+		amount = 0
+		
+		for block in parsed["blocks"]:
+			# Проверяем формат с card_from и card_to
+			if "card_from" in block:
+				card_from_info = block["card_from"]
+				original_text = f"{card_from_info.get('group', '')} {card_from_info.get('name', '')}"
+				card = await find_card_by_group_and_name(
+					card_from_info.get("group", ""),
+					card_from_info.get("name", ""),
+					db,
+					original_text
+				)
+				if card:
+					group_name = None
+					if card.get("group_id"):
+						group = await db.get_card_group_by_id(card["group_id"])
+						if group:
+							group_name = group["name"]
+					card_from = {
+						"card_id": card["card_id"],
+						"card_name": card["card_name"],
+						"group_id": card.get("group_id"),
+						"group_name": group_name
+					}
+					amount = card_from_info.get("amount", 0)
+				else:
+					unrecognized_items.append({
+						"type": "card",
+						"text": original_text,
+						"data": card_from_info
+					})
+			
+			if "card_to" in block:
+				card_to_info = block["card_to"]
+				original_text = f"{card_to_info.get('group', '')} {card_to_info.get('name', '')}"
+				card = await find_card_by_group_and_name(
+					card_to_info.get("group", ""),
+					card_to_info.get("name", ""),
+					db,
+					original_text
+				)
+				if card:
+					group_name = None
+					if card.get("group_id"):
+						group = await db.get_card_group_by_id(card["group_id"])
+						if group:
+							group_name = group["name"]
+					card_to = {
+						"card_id": card["card_id"],
+						"card_name": card["card_name"],
+						"group_id": card.get("group_id"),
+						"group_name": group_name
+					}
+					if not amount:
+						amount = card_to_info.get("amount", 0)
+				else:
+					unrecognized_items.append({
+						"type": "card",
+						"text": original_text,
+						"data": card_to_info
+					})
+			
+			# Если формат с двумя блоками card (первый - откуда, второй - куда)
+			if "card" in block and (not card_from or not card_to):
+				card_info = block["card"]
+				original_text = f"{card_info.get('group', '')} {card_info.get('name', '')}"
+				card = await find_card_by_group_and_name(
+					card_info.get("group", ""),
+					card_info.get("name", ""),
+					db,
+					original_text
+				)
+				if card:
+					group_name = None
+					if card.get("group_id"):
+						group = await db.get_card_group_by_id(card["group_id"])
+						if group:
+							group_name = group["name"]
+					
+					if not card_from:
+						# Первая карта - это "откуда"
+						card_from = {
+							"card_id": card["card_id"],
+							"card_name": card["card_name"],
+							"group_id": card.get("group_id"),
+							"group_name": group_name
+						}
+						amount = card_info.get("amount", 0)
+					elif not card_to:
+						# Вторая карта - это "куда"
+						card_to = {
+							"card_id": card["card_id"],
+							"card_name": card["card_name"],
+							"group_id": card.get("group_id"),
+							"group_name": group_name
+						}
+						if not amount:
+							amount = card_info.get("amount", 0)
+				else:
+					unrecognized_items.append({
+						"type": "card",
+						"text": original_text,
+						"data": card_info
+					})
+		
+		# Формируем блоки для move (нужно два блока: один с card_from, другой с card_to)
+		if card_from and card_to:
+			# Получаем абсолютное значение суммы
+			abs_amount = abs(amount) if amount else 0
+			
+			# Блок "откуда" (с отрицательной суммой - деньги уходят)
+			saved_blocks.append({
+				"card_data": card_from,
+				"card_cash_data": {"value": -abs_amount}
+			})
+			# Блок "куда" (с положительной суммой - деньги приходят)
+			saved_blocks.append({
+				"card_data": card_to,
+				"card_cash_data": {"value": abs_amount}
+			})
+			logger.info(f"✅ Сформированы блоки для move: с {card_from['card_name']} (-{abs_amount}) на {card_to['card_name']} (+{abs_amount})")
+		else:
+			missing = []
+			if not card_from:
+				missing.append("карта-источник")
+			if not card_to:
+				missing.append("карта-получатель")
+			await processing_msg.edit_text(f"❌ Не удалось распознать обе карты для перемещения. Отсутствует: {', '.join(missing)}")
+			return
+		
+		# Если есть нераспознанные элементы, показываем кнопку "Обучить"
+		if unrecognized_items:
+			await state.update_data(
+				voice_unrecognized_items=unrecognized_items,
+				voice_original_text=text
+			)
+		
+		# Сохраняем данные в state
+		await state.update_data(
+			mode="move",
+			crypto_data=None,
+			cash_data=None,
+			card_data=None,
+			card_cash_data=None,
+			xmr_number=None,
+			saved_blocks=saved_blocks,
+			crypto_list=[],
+			xmr_list=[],
+			cash_list=[],
+			card_cash_pairs=[]
+		)
+		
+		# Отображаем данные
+		data = await state.get_data()
+		text = format_add_data_text(data)
+		kb = await get_add_data_type_kb_with_recent(msg.from_user.id, mode="move", data=data)
+		
+		await processing_msg.delete()
+		await msg.answer(text, reply_markup=kb)
+		
+		logger.info(f"✅ Голосовое перемещение успешно обработано: {len(saved_blocks)} блоков")
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка обработки голосовой команды /move: {e}")
+		try:
+			await processing_msg.edit_text("❌ Произошла ошибка при обработке голосовой команды /move")
+		except:
+			pass
+
+
 async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, processing_msg: Message):
 	"""
 	Обрабатывает голосовой ввод для команды /add.
 	Парсит данные операции и заполняет state.
 	"""
-	from app.voice_commands import transcribe_voice
+	from app.voice_commands import transcribe_voice, parse_voice_with_gpt
 	
 	try:
 		logger.debug(f"🔍 Начинаю обработку голосового ввода для /add, message_id={msg.message_id}")
@@ -4986,11 +5199,49 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 		
 		logger.info(f"📝 Распознанный текст для операции: {text}")
 		
-		# Получаем ключевые слова криптовалют из БД
-		crypto_keywords = await db.get_crypto_keywords()
+		# Парсим данные операции через GPT
+		parsed = await parse_voice_with_gpt(text, db)
 		
-		# Парсим данные операции
-		parsed_data = parse_add_operation_data(text, crypto_keywords)
+		if not parsed or parsed.get("command") != "add" or not parsed.get("blocks"):
+			# Fallback на старый метод парсинга
+			logger.warning("⚠️ GPT не распарсил команду add, пробуем старый метод")
+			from app.voice_commands import parse_add_operation_data
+			crypto_keywords = await db.get_crypto_keywords()
+			parsed_data = parse_add_operation_data(text, crypto_keywords)
+		else:
+			# Преобразуем формат GPT в формат старого парсера
+			parsed_data = {"blocks": []}
+			for gpt_block in parsed["blocks"]:
+				block = {}
+				
+				# Крипта
+				if "crypto" in gpt_block:
+					crypto = gpt_block["crypto"]
+					block["crypto"] = {
+						"currency": crypto.get("currency", ""),
+						"amount": crypto.get("usd_amount", crypto.get("amount", 0)),
+						"xmr_number": crypto.get("xmr_number")
+					}
+				
+				# Карта
+				if "card" in gpt_block:
+					card = gpt_block["card"]
+					block["card"] = {
+						"group": card.get("group", ""),
+						"name": card.get("name", ""),
+						"amount": card.get("amount", 0)
+					}
+				
+				# Наличные
+				if "cash" in gpt_block:
+					cash = gpt_block["cash"]
+					block["cash"] = {
+						"name": cash.get("name", ""),
+						"amount": cash.get("amount", 0)
+					}
+				
+				if block:
+					parsed_data["blocks"].append(block)
 		
 		if not parsed_data.get("blocks"):
 			await processing_msg.edit_text("❌ Не удалось распознать данные операции из голосового сообщения")
@@ -5084,26 +5335,30 @@ async def handle_voice_add_command(msg: Message, bot: Bot, state: FSMContext, pr
 			# Обрабатываем наличные
 			if "cash" in block:
 				cash_info = block["cash"]
-				if isinstance(cash_info, dict):
-					original_text = cash_info.get("original_text", f"{cash_info['name']} {cash_info['amount']}")
-					cash = await find_cash_by_name(cash_info["name"], db, original_text)
-					if cash:
-						# Получаем валюту из БД
-						cash_column_info = await db.get_cash_column(cash["cash_name"])
-						currency = cash_column_info.get("currency", "RUB") if cash_column_info else "RUB"
-						
-						block_data["cash_data"] = {
-							"cash_name": cash["cash_name"],
-							"value": cash_info["amount"],
-							"currency": currency
-						}
+				if isinstance(cash_info, dict) and cash_info.get("name"):
+					cash_name = cash_info.get("name")
+					if cash_name:  # Проверяем, что name не None и не пустое
+						original_text = cash_info.get("original_text", f"{cash_name} {cash_info.get('amount', 0)}")
+						cash = await find_cash_by_name(cash_name, db, original_text)
+						if cash:
+							# Получаем валюту из БД
+							cash_column_info = await db.get_cash_column(cash["cash_name"])
+							currency = cash_column_info.get("currency", "RUB") if cash_column_info else "RUB"
+							
+							block_data["cash_data"] = {
+								"cash_name": cash["cash_name"],
+								"value": cash_info.get("amount", 0),
+								"currency": currency
+							}
+						else:
+							logger.warning(f"⚠️ Наличные не найдены: {cash_name}")
+							unrecognized_items.append({
+								"type": "cash",
+								"text": original_text,
+								"data": cash_info
+							})
 					else:
-						logger.warning(f"⚠️ Наличные не найдены: {cash_info['name']}")
-						unrecognized_items.append({
-							"type": "cash",
-							"text": original_text,
-							"data": cash_info
-						})
+						logger.warning(f"⚠️ Наличные пропущены: поле 'name' отсутствует или пустое в {cash_info}")
 			
 			# Добавляем блок в saved_blocks, если есть хотя бы одно поле
 			if any(block_data.values()):
@@ -5612,7 +5867,14 @@ async def user_view(cb: CallbackQuery, bot: Bot):
 	if user["cards"]:
 		text += "\n\nТекущие привязки:"
 		for card in user["cards"]:
-			text += f"\n• {card['card_name']}"
+			# Получаем полную информацию о карте для получения группы
+			card_info = await db.get_card_by_id(card["card_id"])
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group(card_info["group_id"])
+				if group:
+					group_name = f" ({group['name']})"
+			text += f"\n• {card['card_name']}{group_name}"
 	else:
 		text += "\n\nНе привязан к карте"
 	
@@ -5693,7 +5955,14 @@ async def user_bind(cb: CallbackQuery):
 	if user["cards"]:
 		text += "\n\nТекущие привязки:"
 		for card in user["cards"]:
-			text += f"\n• {card['card_name']}"
+			# Получаем полную информацию о карте для получения группы
+			card_info = await db.get_card_by_id(card["card_id"])
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group(card_info["group_id"])
+				if group:
+					group_name = f" ({group['name']})"
+			text += f"\n• {card['card_name']}{group_name}"
 	else:
 		text += "\n\nНе привязан к карте"
 	
@@ -5820,7 +6089,7 @@ async def user_delete(cb: CallbackQuery):
 
 
 @admin_router.callback_query(F.data.startswith("user:bind:card:"))
-async def user_bind_card(cb: CallbackQuery, bot: Bot):
+async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 	db = get_db()
 	# Формат: user:bind:card:{user_id}:{card_id}
 	parts = cb.data.split(":")
@@ -5867,6 +6136,12 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot):
 				admin_id=cb.from_user.id if cb.from_user else None,
 			)
 		
+		# Проверяем, есть ли в state сохраненный текст пересылаемого сообщения для отправки ссылки
+		data = await state.get_data()
+		forwarded_text = data.get("forwarded_message_text", "")
+		if forwarded_text:
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
+		
 		# Отправляем реквизиты новой карты
 		await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 	
@@ -5893,7 +6168,14 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot):
 	if user["cards"]:
 		text += "\n\nТекущие привязки:"
 		for card in user["cards"]:
-			text += f"\n• {card['card_name']}"
+			# Получаем полную информацию о карте для получения группы
+			card_info = await db.get_card_by_id(card["card_id"])
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group(card_info["group_id"])
+				if group:
+					group_name = f" ({group['name']})"
+			text += f"\n• {card['card_name']}{group_name}"
 	else:
 		text += "\n\nНе привязан к карте"
 	
@@ -6044,13 +6326,15 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						
 						return
 					else:
-						# Несколько карт - показываем выбор
+						# Несколько карт - сначала отправляем ссылку, затем показываем выбор
+						if text:
+							await check_and_send_btc_address_links(bot, message.chat.id, text, user_id=user_id)
 						buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 						await state.set_state(ForwardBindStates.waiting_select_existing_card)
 						await state.update_data(original_tg_id=None, user_id_for_hidden=user_id, hidden_user_name=orig_full_name)
 						await message.answer(
 							f"✅ Найден пользователь '{orig_full_name}' с привязанными картами.\n\nУ пользователя привязано несколько карт. Выберите нужную:",
-							reply_markup=user_cards_reply_kb(buttons, 0, back_to="admin:back"),  # Используем 0, так как tg_id нет
+							reply_markup=user_cards_reply_kb(buttons, 0, back_to="admin:back", user_id=user_id),  # Используем 0, так как tg_id нет
 						)
 						return
 				else:
@@ -6142,12 +6426,16 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				except Exception as e:
 					logger.exception(f"❌ КРИТИЧЕСКАЯ ОШИБКА в send_card_requisites_to_admin: {e}")
 				return
+			# Сначала отправляем ссылку на mempool, если есть BTC адреса
+			if text:
+				await check_and_send_btc_address_links(bot, message.chat.id, text, user_id=user_id)
+			# Затем показываем меню выбора карты
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
 			await state.update_data(original_tg_id=orig_tg_id)
 			await message.answer(
 				"У пользователя привязано несколько карт. Выберите нужную:",
-				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
+				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back", user_id=user_id),
 			)
 			return
 		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать группу карт")
@@ -6326,11 +6614,14 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			if forwarded_text:
 				await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 		else:
-			# Несколько карт - выбираем
+			# Несколько карт - сначала отправляем ссылку, затем показываем выбор
+			forwarded_text = data.get("forwarded_message_text", "")
+			if forwarded_text:
+				await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
 			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nУ пользователя привязано несколько карт. Выберите нужную:"
-			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back"))
+			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back", user_id=user_id))
 	else:
 		# Не привязан - выбираем группу карт для привязки
 		# Сначала отправляем ссылку на mempool, если есть BTC адреса
@@ -6437,6 +6728,13 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		await cb.answer("Карта не найдена", show_alert=True)
 		return
 	
+	# Удаляем меню выбора карты (если это не reply_only, так как там может быть другое меню)
+	if not reply_only:
+		try:
+			await cb.message.delete()
+		except Exception as e:
+			logger.warning(f"⚠️ Не удалось удалить меню выбора карты: {e}")
+	
 	# Если это только ответ администратору (reply_only), отправляем реквизиты и завершаем
 	if reply_only:
 		requisites = await db.list_card_requisites(card_id)
@@ -6486,16 +6784,10 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			admin_id=cb.from_user.id if cb.from_user else None,
 		)
 		
-		# Получаем текст пересылаемого сообщения для проверки BTC адресов
-		forwarded_text = data.get("forwarded_message_text", "")
-		
 		# Отправляем все реквизиты админу
+		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		await state.clear()
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
-		
-		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
-		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 		
 	elif hidden_user_name:
 		# Скрытый пользователь (MessageOriginHiddenUser)
@@ -6535,17 +6827,11 @@ async def forward_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id}, card_id={card_id})")
 		
-		# Получаем текст пересылаемого сообщения для проверки BTC адресов
-		forwarded_text = data.get("forwarded_message_text", "")
-		
 		# Отправляем все реквизиты админу (даже для скрытого пользователя)
+		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		await state.clear()
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id, admin_id=cb.from_user.id if cb.from_user else None)
 		logger.info(f"✅ Отправлено {sent_count} сообщений с реквизитами админу для скрытого пользователя '{hidden_user_name}'")
-		
-		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
-		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id)
 	
 	await cb.answer()
 
@@ -6588,6 +6874,13 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 	if not card:
 		await cb.answer("Карта не найдена", show_alert=True)
 		return
+	
+	# Удаляем меню выбора карты
+	try:
+		await cb.message.delete()
+	except Exception as e:
+		logger.warning(f"⚠️ Не удалось удалить меню выбора карты: {e}")
+	
 	await state.clear()
 	
 	# Получаем реквизиты карты
@@ -6612,11 +6905,8 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		reply_user_id = await db.get_user_id_by_tg(user_tg_id)
 		
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id, admin_id=cb.from_user.id if cb.from_user else None)
-		
-		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
-		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=reply_user_id)
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(
@@ -6626,11 +6916,8 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id})")
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
+		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id_for_hidden, admin_id=cb.from_user.id if cb.from_user else None)
 		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
-		
-		# Проверяем и отправляем ссылки на BTC адреса, если они найдены
-		if forwarded_text:
-			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id_for_hidden)
 	
 	await cb.answer()
