@@ -5566,7 +5566,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 						await state.update_data(original_tg_id=None, user_id_for_hidden=user_id, hidden_user_name=orig_full_name)
 						await message.answer(
 							f"✅ Найден пользователь '{orig_full_name}' с привязанными картами.\n\nУ пользователя привязано несколько карт. Выберите нужную:",
-							reply_markup=user_cards_reply_kb(buttons, 0, back_to="admin:back", user_id=user_id),  # Используем 0, так как tg_id нет
+							reply_markup=user_cards_reply_kb(buttons, 0, back_to="admin:back"),  # Используем 0, так как tg_id нет
 						)
 						return
 				else:
@@ -5667,7 +5667,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			await state.update_data(original_tg_id=orig_tg_id)
 			await message.answer(
 				"У пользователя привязано несколько карт. Выберите нужную:",
-				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back", user_id=user_id),
+				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
 			)
 			return
 		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать группу карт")
@@ -5853,7 +5853,7 @@ async def hidden_user_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
 			text = f"✅ Выбран: {user.get('full_name', 'Без имени')}\n\nУ пользователя привязано несколько карт. Выберите нужную:"
-			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back", user_id=user_id))
+			await cb.message.edit_text(text, reply_markup=user_cards_reply_kb(buttons, tg_id, back_to="admin:back"))
 	else:
 		# Не привязан - выбираем группу карт для привязки
 		# Сначала отправляем ссылку на mempool, если есть BTC адреса
