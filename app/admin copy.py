@@ -186,38 +186,6 @@ async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: i
 	sent_count = 0
 	last_message = None
 	
-	# Отправляем статистику пользователя отдельным сообщением, если передан user_id
-	if user_id is not None:
-		try:
-			user_stats = await db.get_user_stats(user_id)
-			if user_stats:
-				delivery_count = user_stats.get("delivery_count", 0)
-				last_interaction = user_stats.get("last_interaction_at")
-				last_activity = format_relative(last_interaction)
-				user_stats_text = f"📊 Всего сделок: {delivery_count}\n🕒 Последняя активность: {last_activity}"
-				
-				try:
-					await bot.send_message(
-						chat_id=admin_chat_id,
-						text=user_stats_text,
-						parse_mode="HTML"
-					)
-					logger.info(f"✅ Статистика пользователя отправлена админу {admin_chat_id}")
-					
-					# Отправляем разделитель из точек
-					try:
-						await bot.send_message(
-							chat_id=admin_chat_id,
-							text="....................."
-						)
-						logger.info(f"✅ Разделитель отправлен админу {admin_chat_id}")
-					except Exception as e:
-						logger.exception(f"❌ Ошибка отправки разделителя админу {admin_chat_id}: {e}")
-				except Exception as e:
-					logger.exception(f"❌ Ошибка отправки статистики пользователя админу {admin_chat_id}: {e}")
-		except Exception as e:
-			logger.warning(f"⚠️ Не удалось получить статистику пользователя user_id={user_id}: {e}")
-	
 	# Проверяем наличие user_message для определения последнего сообщения
 	user_msg = await db.get_card_user_message(card_id)
 	has_user_message = bool(user_msg and user_msg.strip())
@@ -2828,8 +2796,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					if balance:
 						crypto_balances[crypto_type] = balance
 			
-			# Добавляем информацию о балансах в отчет
-			if card_balances or cash_balances or crypto_balances:
+			# Добавляем информацию о балансах и профите в отчет
+			# Профит отображаем в режимах /add и /move
+			if card_balances or cash_balances or crypto_balances or (profits and mode in ["add", "move"]):
 				report_lines.append("")
 				report_lines.append("💰 Дополнительная информация:")
 				
@@ -2848,17 +2817,13 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				if crypto_balances:
 					for crypto_type, balance in crypto_balances.items():
 						report_lines.append(f"  💳 Баланс {crypto_type} = {balance}")
-			
-			# Добавляем раздел с профитом
-			profit_section_lines = []
-			
-			# Профит сделки (для режимов /add и /move)
-			if profits and mode in ["add", "move"]:
-				for cell_address, profit_value in profits.items():
-					profit_section_lines.append(f"  📈 <b><u>Профит сделки</u></b> ({cell_address}) = {profit_value} USD")
-			
-			# Профит за сегодня и средний профит (только для режима /add)
-			if mode == "add":
+				
+				if profits and mode in ["add", "move"]:
+					for cell_address, profit_value in profits.items():
+						report_lines.append(f"  📈 <b>Профит сделки</b> ({cell_address}) = {profit_value} USD")
+				
+				# Добавляем профит за сегодня и средний профит (только для режима /add)
+				if mode == "add":
 					try:
 						# Определяем текущий день недели
 						today = datetime.now()
@@ -2911,12 +2876,14 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 								if today_cell and today_cell in profits_data:
 									profit_today = profits_data[today_cell]
 									if profit_today:
+										# Добавляем разделитель перед профитом за сегодня
+										report_lines.append(" .")
 										try:
 											profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
 											formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
-											profit_section_lines.append(f"  📈 Профит за сегодня: {formatted_profit} USD")
+											report_lines.append(f"  📈 Профит за сегодня: {formatted_profit} USD")
 										except (ValueError, AttributeError):
-											profit_section_lines.append(f"  📈 Профит за сегодня: {profit_today} USD")
+											report_lines.append(f"  📈 Профит за сегодня: {profit_today} USD")
 							
 							# Обрабатываем средний профит (если не понедельник)
 							if weekday != 0:
@@ -2934,15 +2901,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 								if profit_values:
 									avg_profit = sum(profit_values) / len(profit_values)
 									formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
-									profit_section_lines.append(f"  📊 Средний профит в день: {formatted_avg} USD")
+									report_lines.append(f"  📊 Средний профит в день: {formatted_avg} USD")
 					except Exception as e:
 						logger.warning(f"Ошибка получения профита за сегодня и среднего профита: {e}")
-			
-			# Добавляем раздел с профитом в отчет, если есть данные
-			if profit_section_lines:
-				report_lines.append("")
-				report_lines.append("💰 Профит:")
-				report_lines.extend(profit_section_lines)
 			
 			# Проверяем наличие ошибок
 			failed_writes = result.get("failed_writes", [])

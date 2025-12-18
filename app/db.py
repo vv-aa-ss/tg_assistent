@@ -81,35 +81,9 @@ class Database:
 		await self._ensure_card_requisites()
 		await self._ensure_rate_history()
 		await self._ensure_menu_user()
-		await self._ensure_voice_mappings()
+		await self._ensure_item_usage_log()
 		await self._db.commit()
 
-	async def _ensure_voice_mappings(self) -> None:
-		"""Создает таблицу для хранения соответствий голосовых команд"""
-		assert self._db
-		cur = await self._db.execute(
-			"SELECT name FROM sqlite_master WHERE type='table' AND name='voice_mappings'"
-		)
-		if not await cur.fetchone():
-			await self._db.execute(
-				"""
-				CREATE TABLE voice_mappings (
-					id INTEGER PRIMARY KEY AUTOINCREMENT,
-					mapping_type TEXT NOT NULL,
-					voice_text TEXT NOT NULL,
-					target_type TEXT NOT NULL,
-					target_id INTEGER,
-					target_name TEXT,
-					created_at INTEGER NOT NULL,
-					UNIQUE(mapping_type, voice_text)
-				)
-				"""
-			)
-			await self._db.execute(
-				"CREATE INDEX IF NOT EXISTS idx_voice_mappings_type_text ON voice_mappings(mapping_type, voice_text)"
-			)
-			_logger.debug("Created table voice_mappings")
-	
 	async def _ensure_menu_user(self) -> None:
 		"""Создает специального пользователя для логирования выбора карт в меню"""
 		assert self._db
@@ -524,6 +498,37 @@ class Database:
 			"cards": await self.list_cards_for_user(row[0]),
 		}
 
+	async def get_user_stats(self, user_id: int) -> Optional[Dict[str, Any]]:
+		"""
+		Получает статистику пользователя: количество доставок и последнюю активность.
+		
+		Args:
+			user_id: ID пользователя
+		
+		Returns:
+			Словарь с ключами: delivery_count, last_interaction_at или None если пользователь не найден
+		"""
+		assert self._db
+		query = (
+			"""
+			SELECT 
+				u.last_interaction_at,
+				COUNT(l.id) AS delivery_count
+			FROM users u
+			LEFT JOIN card_delivery_log l ON l.user_id = u.id
+			WHERE u.id = ?
+			GROUP BY u.id
+			"""
+		)
+		cur = await self._db.execute(query, (user_id,))
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"last_interaction_at": row[0],
+			"delivery_count": row[1] or 0,
+		}
+
 	async def bind_user_to_card(self, user_id: int, card_id: int) -> None:
 		assert self._db
 		await self._db.execute(
@@ -783,6 +788,8 @@ class Database:
 			"INSERT INTO card_delivery_log(user_id, card_id, delivered_at, admin_id) VALUES(?, ?, ?, ?)",
 			(menu_user_id, card_id, timestamp, admin_id),
 		)
+		# Также логируем в item_usage_log для быстрого доступа
+		await self.log_item_usage(admin_id, "card", f"card_id_{card_id}")
 		await self._db.commit()
 		_logger.debug(f"Logged card selection: card_id={card_id}, admin_id={admin_id}, ts={timestamp}")
 
@@ -1567,6 +1574,84 @@ class Database:
 		await self._db.commit()
 		return cur.rowcount > 0
 
+	async def _ensure_item_usage_log(self) -> None:
+		"""Создает таблицу для логирования использования элементов (криптовалют, карт, наличных)"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='item_usage_log'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE item_usage_log (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					admin_id INTEGER NOT NULL,
+					item_type TEXT NOT NULL,
+					item_id TEXT NOT NULL,
+					used_at INTEGER NOT NULL,
+					UNIQUE(admin_id, item_type, item_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_item_usage_log_admin_type ON item_usage_log(admin_id, item_type, used_at DESC)"
+			)
+			_logger.debug("Created table item_usage_log")
+
+	async def log_item_usage(self, admin_id: int, item_type: str, item_id: str) -> None:
+		"""
+		Логирует использование элемента (криптовалюта, карта, наличные) администратором.
+		
+		Args:
+			admin_id: ID администратора
+			item_type: Тип элемента ("crypto", "card", "cash")
+			item_id: ID элемента (например, "BTC", "XMR-1", "card_id_123", "BYN")
+		"""
+		assert self._db
+		timestamp = int(time.time())
+		await self._db.execute(
+			"""
+			INSERT OR REPLACE INTO item_usage_log(admin_id, item_type, item_id, used_at)
+			VALUES(?, ?, ?, ?)
+			""",
+			(admin_id, item_type, item_id, timestamp)
+		)
+		await self._db.commit()
+		_logger.debug(f"Logged item usage: admin_id={admin_id}, type={item_type}, id={item_id}")
+
+	async def get_recent_items_by_admin(self, admin_id: int, limit: int = 6) -> List[Dict[str, Any]]:
+		"""
+		Получает последние используемые элементы всех типов для администратора.
+		
+		Args:
+			admin_id: ID администратора
+			limit: Максимальное количество элементов (по умолчанию 6)
+		
+		Returns:
+			Список словарей с ключами: item_type, item_id, used_at
+			Отсортирован по времени использования (новые первыми)
+		"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT item_type, item_id, used_at
+			FROM item_usage_log
+			WHERE admin_id = ?
+			ORDER BY used_at DESC
+			LIMIT ?
+			""",
+			(admin_id, limit)
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"item_type": row[0],
+				"item_id": row[1],
+				"used_at": row[2]
+			}
+			for row in rows
+		]
+
 	async def _ensure_google_sheets_settings(self) -> None:
 		"""Создает таблицу для хранения настроек Google Sheets"""
 		assert self._db
@@ -1818,57 +1903,3 @@ class Database:
 		await self._db.commit()
 		_logger.debug(f"Card requisite deleted: id={requisite_id}")
 	
-	async def add_voice_mapping(self, mapping_type: str, voice_text: str, target_type: str, target_id: Optional[int] = None, target_name: Optional[str] = None) -> int:
-		"""
-		Добавляет соответствие голосовой команды.
-		
-		Args:
-			mapping_type: Тип соответствия ("card", "cash", "crypto")
-			voice_text: Текст, который был распознан из голоса
-			target_type: Тип цели ("card_id", "cash_name", "crypto_type")
-			target_id: ID цели (для карт)
-			target_name: Название цели (для наличных, крипты)
-		
-		Returns:
-			ID созданного соответствия
-		"""
-		assert self._db
-		cur = await self._db.execute(
-			"""
-			INSERT OR REPLACE INTO voice_mappings(mapping_type, voice_text, target_type, target_id, target_name, created_at)
-			VALUES(?, ?, ?, ?, ?, ?)
-			""",
-			(mapping_type, voice_text.lower(), target_type, target_id, target_name, int(time.time()))
-		)
-		await self._db.commit()
-		mapping_id = cur.lastrowid
-		_logger.debug(f"Voice mapping added: type={mapping_type}, voice_text={voice_text}, target={target_type}")
-		return mapping_id
-	
-	async def get_voice_mapping(self, mapping_type: str, voice_text: str) -> Optional[Dict[str, Any]]:
-		"""
-		Получает соответствие голосовой команды.
-		
-		Args:
-			mapping_type: Тип соответствия ("card", "cash", "crypto")
-			voice_text: Текст, который был распознан из голоса
-		
-		Returns:
-			Словарь с информацией о соответствии или None
-		"""
-		assert self._db
-		cur = await self._db.execute(
-			"SELECT id, mapping_type, voice_text, target_type, target_id, target_name FROM voice_mappings WHERE mapping_type = ? AND voice_text = ?",
-			(mapping_type, voice_text.lower())
-		)
-		row = await cur.fetchone()
-		if row:
-			return {
-				"id": row[0],
-				"mapping_type": row[1],
-				"voice_text": row[2],
-				"target_type": row[3],
-				"target_id": row[4],
-				"target_name": row[5]
-			}
-		return None

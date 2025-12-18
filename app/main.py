@@ -64,8 +64,7 @@ async def main() -> None:
 	class LoggingMiddleware:
 		async def __call__(self, handler, event, data):
 			if isinstance(event, Message):
-				has_voice = bool(getattr(event, "voice", None))
-				logger.info(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', has_voice={has_voice}, user_id={event.from_user.id if event.from_user else None}")
+				logger.info(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', user_id={event.from_user.id if event.from_user else None}")
 			return await handler(event, data)
 	
 	dp.message.middleware(LoggingMiddleware())
@@ -106,12 +105,10 @@ async def main() -> None:
 
 	# Регистрировать пользователя только когда нет активного состояния и сообщение не переслано
 	# Исключаем команды - они обрабатываются отдельными обработчиками
-	# Исключаем голосовые сообщения - они обрабатываются отдельным обработчиком
 	# ВАЖНО: Фильтр ~F.text.startswith("/") исключает команды на уровне декоратора
 	@dp.message(
 		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
 		StateFilter(None),
-		~F.voice,  # Исключаем голосовые сообщения
 		~(F.text.startswith("/") if F.text else False)
 	)
 	async def register_user_on_any_message(message: Message):

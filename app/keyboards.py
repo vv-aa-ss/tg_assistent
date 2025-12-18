@@ -718,7 +718,8 @@ def add_data_type_kb(
 	back_to: str = "admin:back", 
 	data: Optional[Dict[str, Any]] = None,
 	recent_cryptos: Optional[List[str]] = None,
-	recent_cards: Optional[List[Tuple[int, str, Optional[str]]]] = None
+	recent_cards: Optional[List[Tuple[int, str, Optional[str]]]] = None,
+	recent_cash: Optional[List[Tuple[str, str]]] = None
 ) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для выбора типа данных в командах /add и /rate.
@@ -729,8 +730,9 @@ def add_data_type_kb(
 		back_to: Callback data для кнопки "Назад"
 		data: Словарь с выбранными данными (saved_blocks, crypto_data, cash_data, card_data, card_cash_data)
 		recent_cryptos: Список последних используемых криптовалют (например, ['BTC', 'LTC', 'XMR-1'])
-		recent_cards: Список кортежей (card_id, card_name, group_name) последних используемых карт (до 6)
+		recent_cards: Список кортежей (card_id, card_name, group_name) последних используемых карт
 			group_name может быть None, если карта не привязана к группе
+		recent_cash: Список кортежей (cash_name, display_name) последних используемых наличных
 	"""
 	kb = InlineKeyboardBuilder()
 	
@@ -822,19 +824,22 @@ def add_data_type_kb(
 	if mode == "rate":
 		kb.button(text="📝 Примечание", callback_data=f"add_data:note:{mode}")
 	
-	# Три последние используемые криптовалюты
+	# Объединяем все последние используемые элементы в один список (до 6 элементов)
+	# Формат: (type, display_name, callback_data)
+	recent_items_combined = []
+	
+	# Добавляем криптовалюты
 	if recent_cryptos:
-		for crypto_id in recent_cryptos[:3]:
-			# Форматируем название для отображения
+		for crypto_id in recent_cryptos:
 			if crypto_id.startswith("XMR-"):
 				display_name = crypto_id  # "XMR-1", "XMR-2", "XMR-3"
 			else:
 				display_name = crypto_id  # "BTC", "LTC", "USDT", etc.
-			kb.button(text=display_name, callback_data=f"add_data:quick:crypto:{crypto_id}:{mode}")
+			recent_items_combined.append(("crypto", display_name, f"add_data:quick:crypto:{crypto_id}:{mode}"))
 	
-	# Шесть последних используемых карт
+	# Добавляем карты
 	if recent_cards:
-		for card_tuple in recent_cards[:6]:
+		for card_tuple in recent_cards:
 			card_id = card_tuple[0]
 			card_name = card_tuple[1]
 			group_name = card_tuple[2] if len(card_tuple) > 2 else None
@@ -843,7 +848,22 @@ def add_data_type_kb(
 				display_name = f"{card_name} ({group_name})"
 			else:
 				display_name = card_name
-			kb.button(text=display_name, callback_data=f"add_data:quick:card:{card_id}:{mode}")
+			recent_items_combined.append(("card", display_name, f"add_data:quick:card:{card_id}:{mode}"))
+	
+	# Добавляем наличные
+	if recent_cash:
+		for cash_tuple in recent_cash:
+			if isinstance(cash_tuple, tuple) and len(cash_tuple) == 2:
+				cash_name, display_name = cash_tuple
+			else:
+				# Обратная совместимость: если передан просто cash_name
+				cash_name = cash_tuple
+				display_name = cash_name
+			recent_items_combined.append(("cash", display_name, f"add_data:quick:cash:{cash_name}:{mode}"))
+	
+	# Ограничиваем до 6 элементов и добавляем кнопки
+	for _, display_name, callback_data in recent_items_combined[:6]:
+		kb.button(text=display_name, callback_data=callback_data)
 	
 	# Подтвердить и Назад
 	kb.button(text="✅ Подтвердить", callback_data=f"add_data:confirm:{mode}")
@@ -853,30 +873,22 @@ def add_data_type_kb(
 	# saved_blocks + 1 (текущий блок) строк по 3 кнопки
 	# затем 1 кнопка "+"
 	# затем 1 кнопка "Примечание" (если rate)
-	# затем до 3 кнопок криптовалют (по 3 в ряд)
-	# затем до 6 кнопок карт (по 3 в ряд)
+	# затем до 6 кнопок быстрого доступа (по 3 в ряд) - криптовалюты, карты, наличные
 	# затем 2 кнопки ("Подтвердить" и "Назад")
 	adjust_list = [3] * (len(saved_blocks) + 1) + [1]  # Блоки + "+"
 	if mode == "rate":
 		adjust_list.append(1)  # Кнопка "Примечание"
 	
-	# Криптовалюты (до 3, по 3 в ряд)
-	if recent_cryptos:
-		crypto_count = min(len(recent_cryptos), 3)
-		if crypto_count > 0:
-			adjust_list.append(crypto_count)
-	
-	# Карты (до 6, по 3 в ряд)
-	if recent_cards:
-		card_count = min(len(recent_cards), 6)
-		if card_count > 0:
-			# Разбиваем на ряды по 3 карты
-			full_rows = card_count // 3
-			remainder = card_count % 3
-			if full_rows > 0:
-				adjust_list.extend([3] * full_rows)
-			if remainder > 0:
-				adjust_list.append(remainder)
+	# Быстрый доступ (до 6 элементов, по 3 в ряд)
+	recent_count = len(recent_items_combined[:6])
+	if recent_count > 0:
+		# Разбиваем на ряды по 3 элемента
+		full_rows = recent_count // 3
+		remainder = recent_count % 3
+		for _ in range(full_rows):
+			adjust_list.append(3)
+		if remainder > 0:
+			adjust_list.append(remainder)
 	
 	# Подтвердить и Назад
 	adjust_list.append(2)
