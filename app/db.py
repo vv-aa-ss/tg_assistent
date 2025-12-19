@@ -82,6 +82,7 @@ class Database:
 		await self._ensure_rate_history()
 		await self._ensure_menu_user()
 		await self._ensure_item_usage_log()
+		await self._ensure_card_replenishments()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -500,33 +501,51 @@ class Database:
 
 	async def get_user_stats(self, user_id: int) -> Optional[Dict[str, Any]]:
 		"""
-		Получает статистику пользователя: количество доставок и последнюю активность.
+		Получает статистику пользователя: количество доставок и предпоследнюю активность.
 		
 		Args:
 			user_id: ID пользователя
 		
 		Returns:
-			Словарь с ключами: delivery_count, last_interaction_at или None если пользователь не найден
+			Словарь с ключами: delivery_count, last_interaction_at (предпоследнее обращение) или None если пользователь не найден
 		"""
 		assert self._db
-		query = (
+		# Получаем количество доставок
+		query_count = (
 			"""
-			SELECT 
-				u.last_interaction_at,
-				COUNT(l.id) AS delivery_count
+			SELECT COUNT(l.id) AS delivery_count
 			FROM users u
 			LEFT JOIN card_delivery_log l ON l.user_id = u.id
 			WHERE u.id = ?
 			GROUP BY u.id
 			"""
 		)
-		cur = await self._db.execute(query, (user_id,))
-		row = await cur.fetchone()
-		if not row:
-			return None
+		cur_count = await self._db.execute(query_count, (user_id,))
+		row_count = await cur_count.fetchone()
+		delivery_count = row_count[0] if row_count else 0
+		
+		# Получаем предпоследнее обращение из card_delivery_log (второе по времени, так как последнее - это текущая пересылка)
+		# Если доставок больше 1, берем предпоследнюю. Если доставок 1, возвращаем None (первая доставка)
+		prev_interaction = None
+		if delivery_count > 1:
+			# Берем предпоследнюю запись (OFFSET 1 пропускает последнюю - текущую пересылку)
+			query_prev = (
+				"""
+				SELECT delivered_at
+				FROM card_delivery_log
+				WHERE user_id = ?
+				ORDER BY delivered_at DESC
+				LIMIT 1 OFFSET 1
+				"""
+			)
+			cur_prev = await self._db.execute(query_prev, (user_id,))
+			row_prev = await cur_prev.fetchone()
+			prev_interaction = row_prev[0] if row_prev else None
+		# Если доставок 1 или 0, prev_interaction остается None (первая доставка или нет доставок)
+		
 		return {
-			"last_interaction_at": row[0],
-			"delivery_count": row[1] or 0,
+			"last_interaction_at": prev_interaction,  # Теперь это предпоследнее обращение
+			"delivery_count": delivery_count or 0,
 		}
 
 	async def bind_user_to_card(self, user_id: int, card_id: int) -> None:
@@ -1902,4 +1921,85 @@ class Database:
 		await self._db.execute("DELETE FROM card_requisites WHERE id = ?", (requisite_id,))
 		await self._db.commit()
 		_logger.debug(f"Card requisite deleted: id={requisite_id}")
+	
+	async def _ensure_card_replenishments(self) -> None:
+		"""Создает таблицу для хранения статистики пополнений карт"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='card_replenishments'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE card_replenishments (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					card_id INTEGER NOT NULL,
+					amount REAL NOT NULL,
+					created_at INTEGER NOT NULL,
+					FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_card_replenishments_card_created ON card_replenishments(card_id, created_at DESC)"
+			)
+			_logger.debug("Created table card_replenishments")
+	
+	async def log_card_replenishment(self, card_id: int, amount: float) -> None:
+		"""
+		Логирует пополнение карты.
+		
+		Args:
+			card_id: ID карты
+			amount: Сумма пополнения (должна быть положительной)
+		"""
+		assert self._db
+		if amount <= 0:
+			_logger.warning(f"Попытка залогировать пополнение с неположительной суммой: card_id={card_id}, amount={amount}")
+			return
+		
+		created_at = int(time.time())
+		await self._db.execute(
+			"INSERT INTO card_replenishments(card_id, amount, created_at) VALUES(?, ?, ?)",
+			(card_id, amount, created_at)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card replenishment logged: card_id={card_id}, amount={amount}")
+	
+	async def get_card_replenishment_stats(self, card_id: int) -> Dict[str, float]:
+		"""
+		Получает статистику пополнений карты: за текущий месяц и за все время.
+		
+		Args:
+			card_id: ID карты
+		
+		Returns:
+			Словарь с ключами: month_total (за текущий месяц), all_time_total (за все время)
+		"""
+		assert self._db
+		from datetime import datetime
+		
+		# Получаем начало текущего месяца
+		now = datetime.now()
+		month_start = datetime(now.year, now.month, 1)
+		month_start_ts = int(month_start.timestamp())
+		
+		# Сумма за текущий месяц
+		cur_month = await self._db.execute(
+			"SELECT COALESCE(SUM(amount), 0) FROM card_replenishments WHERE card_id = ? AND created_at >= ?",
+			(card_id, month_start_ts)
+		)
+		month_total = (await cur_month.fetchone())[0] or 0.0
+		
+		# Сумма за все время
+		cur_all = await self._db.execute(
+			"SELECT COALESCE(SUM(amount), 0) FROM card_replenishments WHERE card_id = ?",
+			(card_id,)
+		)
+		all_time_total = (await cur_all.fetchone())[0] or 0.0
+		
+		return {
+			"month_total": float(month_total),
+			"all_time_total": float(all_time_total)
+		}
 	

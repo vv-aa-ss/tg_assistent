@@ -132,17 +132,22 @@ async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str, us
 		user_id: ID пользователя для отправки клавиатуры "Меню пользователя" (опционально)
 	"""
 	if not text:
+		logger.debug(f"🔍 check_and_send_btc_address_links: text пустой, пропускаем")
 		return
 	
 	btc_addresses = find_btc_addresses(text)
 	if not btc_addresses:
+		logger.debug(f"🔍 check_and_send_btc_address_links: BTC адреса не найдены в тексте '{text[:50]}...'")
 		return
+	
+	logger.info(f"🔍 check_and_send_btc_address_links: найдено {len(btc_addresses)} BTC адресов, chat_id={chat_id}, user_id={user_id}")
 	
 	# Отправляем ссылку для каждого найденного адреса
 	last_message = None
 	for idx, address in enumerate(btc_addresses):
 		link = f"https://mempool.space/address/{address}"
 		try:
+			logger.debug(f"🔍 Отправка ссылки на BTC адрес {idx+1}/{len(btc_addresses)}: {address}, chat_id={chat_id}")
 			# Если это последний адрес и передан user_id, добавляем клавиатуру сразу
 			if idx == len(btc_addresses) - 1 and user_id is not None:
 				last_message = await bot.send_message(
@@ -150,11 +155,12 @@ async def check_and_send_btc_address_links(bot: Bot, chat_id: int, text: str, us
 					text=link,
 					reply_markup=user_menu_button_kb(user_id)
 				)
+				logger.info(f"✅ Отправлена ссылка на BTC адрес: {address} (с клавиатурой) в chat_id={chat_id}, message_id={last_message.message_id if last_message else None}")
 			else:
 				last_message = await bot.send_message(chat_id=chat_id, text=link)
-			logger.info(f"✅ Отправлена ссылка на BTC адрес: {address}")
+				logger.info(f"✅ Отправлена ссылка на BTC адрес: {address} в chat_id={chat_id}, message_id={last_message.message_id if last_message else None}")
 		except Exception as e:
-			logger.warning(f"⚠️ Ошибка отправки ссылки на BTC адрес {address}: {e}")
+			logger.exception(f"❌ Ошибка отправки ссылки на BTC адрес {address} в chat_id={chat_id}: {e}")
 
 
 async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: int, db, user_id: Optional[int] = None, admin_id: Optional[int] = None) -> int:
@@ -193,7 +199,11 @@ async def send_card_requisites_to_admin(bot: Bot, admin_chat_id: int, card_id: i
 			if user_stats:
 				delivery_count = user_stats.get("delivery_count", 0)
 				last_interaction = user_stats.get("last_interaction_at")
-				last_activity = format_relative(last_interaction)
+				# Если это первая доставка (доставок 1), показываем "первая доставка"
+				if delivery_count == 1:
+					last_activity = "первая доставка"
+				else:
+					last_activity = format_relative(last_interaction)
 				user_stats_text = f"📊 Всего сделок: {delivery_count}\n🕒 Последняя активность: {last_activity}"
 				
 				try:
@@ -2657,6 +2667,23 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					return
 		
 		if result.get("success"):
+			# Сохраняем пополнения карт в БД (только для mode == "add" и только положительные суммы)
+			db = get_db()
+			if mode == "add":
+				for pair in card_cash_pairs:
+					card_data = pair.get("card")
+					cash_data = pair.get("cash")
+					if card_data and cash_data:
+						card_id = card_data.get("card_id")
+						cash_value = cash_data.get("value", 0)
+						# Сохраняем только положительные суммы (пополнения)
+						if card_id and cash_value > 0:
+							try:
+								await db.log_card_replenishment(card_id, float(cash_value))
+								logger.info(f"✅ Пополнение сохранено: card_id={card_id}, amount={cash_value}")
+							except Exception as e:
+								logger.warning(f"⚠️ Ошибка сохранения пополнения card_id={card_id}, amount={cash_value}: {e}")
+			
 			# Формируем отчет о записи
 			from app.google_sheets import read_card_balance, read_profit
 			current_date = datetime.now().strftime("%d.%m.%Y")
@@ -2679,7 +2706,6 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			# Читаем балансы карт и профиты
 			# Получаем настройки из БД
-			db = get_db()
 			balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
 			profit_column_str = await db.get_google_sheets_setting("profit_column", "BC")
 			balance_row = int(balance_row_str) if balance_row_str else 4
@@ -2836,6 +2862,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				if card_balances:
 					for card_name, data in card_balances.items():
 						group_name = data.get("group_name", "")
+						# Формируем строку с балансом
 						if group_name:
 							report_lines.append(f"  💳 Баланс {card_name} ({group_name}) = {data['balance']}")
 						else:
@@ -2848,6 +2875,43 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				if crypto_balances:
 					for crypto_type, balance in crypto_balances.items():
 						report_lines.append(f"  💳 Баланс {crypto_type} = {balance}")
+				
+				# Добавляем статистику пополнений после всех балансов (только для mode == "add")
+				if mode == "add" and card_balances:
+					replenishment_lines = []
+					for card_name, data in card_balances.items():
+						# Находим card_id для этой карты из card_mapping
+						card_id = None
+						for cell_address, (mapped_card_name, column, mapped_card_id) in card_mapping.items():
+							if mapped_card_name == card_name:
+								card_id = mapped_card_id
+								break
+						
+						# Получаем статистику пополнений
+						if card_id:
+							try:
+								replenishment_stats = await db.get_card_replenishment_stats(card_id)
+								if replenishment_stats:
+									month_total = replenishment_stats.get("month_total", 0.0)
+									all_time_total = replenishment_stats.get("all_time_total", 0.0)
+									# Форматируем числа (убираем лишние нули после запятой)
+									month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+									all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+									
+									group_name = data.get("group_name", "")
+									if group_name:
+										replenishment_lines.append(f"  💳 {card_name} ({group_name}):")
+									else:
+										replenishment_lines.append(f"  💳 {card_name}:")
+									replenishment_lines.append(f"    <b><u>💳❇️ Пополнение за месяц</u></b>: {month_str}")
+									replenishment_lines.append(f"    <b><u>💳✳️ Общее пополнение</u></b>: {all_time_str}")
+							except Exception as e:
+								logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+					
+					# Добавляем статистику пополнений в отчет, если есть данные
+					if replenishment_lines:
+						report_lines.append("")
+						report_lines.extend(replenishment_lines)
 			
 			# Добавляем раздел с профитом
 			profit_section_lines = []
@@ -2855,7 +2919,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			# Профит сделки (для режимов /add и /move)
 			if profits and mode in ["add", "move"]:
 				for cell_address, profit_value in profits.items():
-					profit_section_lines.append(f"  📈 <b><u>Профит сделки</u></b> ({cell_address}) = {profit_value} USD")
+					profit_section_lines.append(f"  ⏩ <b><u>Профит сделки</u></b> ({cell_address}) = {profit_value} USD ⏪")
 			
 			# Профит за сегодня и средний профит (только для режима /add)
 			if mode == "add":
@@ -4713,8 +4777,79 @@ async def _update_crypto_values_in_stats(
 			except Exception as e:
 				logger.warning(f"Ошибка batch чтения профитов: {e}")
 		
-		# Объединяем базовые строки, строки с криптовалютами и профитом
+		# Читаем балансы наличных БЕЛКИ и БАКСЫ
+		cash_lines = []
+		try:
+			from app.google_sheets import read_card_balances_batch
+			
+			# Получаем balance_row из настроек
+			balance_row_str = await db.get_google_sheets_setting("balance_row", "4")
+			balance_row = int(balance_row_str) if balance_row_str else 4
+			
+			# Получаем информацию о наличных из базы
+			belki_info = await db.get_cash_column("БЕЛКИ")
+			baksy_info = await db.get_cash_column("БАКСЫ")
+			
+			cash_cell_addresses = []
+			cash_mapping = {}  # {cell_address: (cash_name, currency, emoji)}
+			
+			# БЕЛКИ: если не найдено в базе, используем хардкод AP (BYN)
+			if belki_info:
+				column = belki_info.get("column")
+				currency = belki_info.get("currency", "BYN")
+			else:
+				column = "AP"
+				currency = "BYN"
+				logger.debug("БЕЛКИ не найдено в базе, используем хардкод: AP (BYN)")
+			
+			if column:
+				cell_address = f"{column}{balance_row}"
+				cash_cell_addresses.append(cell_address)
+				cash_mapping[cell_address] = ("БЕЛКИ", currency, "🐿")
+			
+			# БАКСЫ: если не найдено в базе, используем хардкод AQ (USD)
+			if baksy_info:
+				column = baksy_info.get("column")
+				currency = baksy_info.get("currency", "USD")
+			else:
+				column = "AQ"
+				currency = "USD"
+				logger.debug("БАКСЫ не найдено в базе, используем хардкод: AQ (USD)")
+			
+			if column:
+				cell_address = f"{column}{balance_row}"
+				cash_cell_addresses.append(cell_address)
+				cash_mapping[cell_address] = ("БАКСЫ", currency, "💵")
+			
+			# Читаем балансы наличных одним batch запросом
+			if cash_cell_addresses:
+				cash_balances = await read_card_balances_batch(
+					sheet_id,
+					credentials_path,
+					cash_cell_addresses,
+					sheet_name
+				)
+				
+				for cell_address, (cash_name, currency, emoji) in cash_mapping.items():
+					balance = cash_balances.get(cell_address)
+					if balance:
+						try:
+							# Пытаемся форматировать как число
+							num_value = float(str(balance).replace(",", ".").replace(" ", ""))
+							formatted_value = f"{int(round(num_value)):,}".replace(",", " ")
+							cash_lines.append(f"<code>{emoji} {cash_name} ({currency}) = {formatted_value}</code>")
+						except (ValueError, AttributeError):
+							cash_lines.append(f"<code>{emoji} {cash_name} ({currency}) = {balance}</code>")
+					else:
+						cash_lines.append(f"<code>{emoji} {cash_name} ({currency}) = —</code>")
+		except Exception as e:
+			logger.warning(f"Ошибка чтения балансов наличных: {e}")
+		
+		# Объединяем базовые строки, строки с криптовалютами, наличными и профитом
 		all_lines = base_lines + crypto_lines
+		if cash_lines:
+			all_lines.append("")  # Пустая строка перед наличными
+			all_lines.extend(cash_lines)
 		if profit_lines:
 			all_lines.append("")  # Пустая строка перед профитом
 			all_lines.extend(profit_lines)
@@ -5048,6 +5183,11 @@ async def admin_stat_k_command(msg: Message, bot: Bot, state: FSMContext):
 		for crypto in crypto_columns:
 			crypto_type = crypto.get("crypto_type", "")
 			lines.append(f"<code>{crypto_type} = Загрузка...</code>")
+		
+		# Добавляем заглушки для наличных (всегда показываем БЕЛКИ и БАКСЫ)
+		lines.append("")
+		lines.append("<code>🐿 БЕЛКИ (BYN) = Загрузка...</code>")
+		lines.append("<code>💵 БАКСЫ (USD) = Загрузка...</code>")
 		
 		text = "\n".join(lines)
 		sent_message = await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
@@ -5654,13 +5794,17 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 					
 					# Проверяем и отправляем ссылки на BTC адреса, если они найдены
 					if text:
+						logger.info(f"🔍 Отправка ссылки на BTC адрес после отправки реквизитов, text='{text[:50]}...', admin_chat_id={admin_chat_id}, user_id={user_id}")
 						await check_and_send_btc_address_links(bot, admin_chat_id, text, user_id=user_id)
+						logger.info(f"✅ Функция check_and_send_btc_address_links завершена для admin_chat_id={admin_chat_id}")
 				except Exception as e:
 					logger.exception(f"❌ КРИТИЧЕСКАЯ ОШИБКА в send_card_requisites_to_admin: {e}")
 				return
 			# Сначала отправляем ссылку на mempool, если есть BTC адреса
 			if text:
+				logger.info(f"🔍 Отправка ссылки на BTC адрес перед показом меню выбора карты, text='{text[:50]}...', chat_id={message.chat.id}, user_id={user_id}")
 				await check_and_send_btc_address_links(bot, message.chat.id, text, user_id=user_id)
+				logger.info(f"✅ Функция check_and_send_btc_address_links завершена для chat_id={message.chat.id}")
 			# Затем показываем меню выбора карты
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
@@ -6137,8 +6281,14 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		reply_user_id = await db.get_user_id_by_tg(user_tg_id)
 		
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=reply_user_id, admin_id=cb.from_user.id if cb.from_user else None)
+		
+		# Отправляем ссылку на BTC адрес, если она есть в пересланном сообщении
+		# Это гарантирует, что ссылка будет отправлена даже если при первой пересылке что-то пошло не так
+		if forwarded_text:
+			logger.info(f"🔍 Отправка ссылки на BTC адрес при выборе карты, forwarded_text='{forwarded_text[:50]}...', chat_id={cb.message.chat.id}, user_id={reply_user_id}")
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=reply_user_id)
+			logger.info(f"✅ Функция check_and_send_btc_address_links завершена при выборе карты для chat_id={cb.message.chat.id}")
 	elif user_id_for_hidden:
 		# Логируем для скрытого пользователя через user_id
 		await db.log_card_delivery(
@@ -6148,8 +6298,14 @@ async def forward_existing_card_reply(cb: CallbackQuery, state: FSMContext, bot:
 		)
 		logger.info(f"✅ Логирование доставки для скрытого пользователя '{hidden_user_name}' (user_id={user_id_for_hidden}, card_id={card_id})")
 		# Отправляем все реквизиты админу (из таблицы + user_message если есть)
-		# Ссылка уже была отправлена при пересылке, поэтому не отправляем повторно
 		sent_count = await send_card_requisites_to_admin(bot, cb.message.chat.id, card_id, db, user_id=user_id_for_hidden, admin_id=cb.from_user.id if cb.from_user else None)
 		logger.info(f"✅ Отправлено {sent_count} реквизитов админу для скрытого пользователя")
+		
+		# Отправляем ссылку на BTC адрес, если она есть в пересланном сообщении
+		# Это гарантирует, что ссылка будет отправлена даже если при первой пересылке что-то пошло не так
+		if forwarded_text:
+			logger.info(f"🔍 Отправка ссылки на BTC адрес при выборе карты (скрытый пользователь), forwarded_text='{forwarded_text[:50]}...', chat_id={cb.message.chat.id}, user_id={user_id_for_hidden}")
+			await check_and_send_btc_address_links(bot, cb.message.chat.id, forwarded_text, user_id=user_id_for_hidden)
+			logger.info(f"✅ Функция check_and_send_btc_address_links завершена при выборе карты (скрытый пользователь) для chat_id={cb.message.chat.id}")
 	
 	await cb.answer()
