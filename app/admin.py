@@ -62,7 +62,7 @@ async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optio
 	db = get_db()
 	
 	# Получаем последние используемые элементы всех типов
-	recent_items = await db.get_recent_items_by_admin(admin_id, limit=6)
+	recent_items = await db.get_recent_items_by_admin(admin_id, limit=9)
 	
 	# Разделяем по типам
 	recent_cryptos = []
@@ -96,12 +96,12 @@ async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optio
 			else:
 				recent_cash.append((item_id, item_id))
 	
-	# Если элементов меньше 6, дополняем картами из старого метода
-	if len(recent_cryptos) + len(recent_cards) + len(recent_cash) < 6:
-		recent_cards_raw = await db.get_recent_cards_by_admin(admin_id, limit=6)
+	# Если элементов меньше 9, дополняем картами из старого метода
+	if len(recent_cryptos) + len(recent_cards) + len(recent_cash) < 9:
+		recent_cards_raw = await db.get_recent_cards_by_admin(admin_id, limit=9)
 		existing_card_ids = {card[0] for card in recent_cards}
 		for card_id, card_name in recent_cards_raw:
-			if card_id not in existing_card_ids and len(recent_cards) + len(recent_cryptos) + len(recent_cash) < 6:
+			if card_id not in existing_card_ids and len(recent_cards) + len(recent_cryptos) + len(recent_cash) < 9:
 				card_info = await db.get_card_by_id(card_id)
 				if card_info:
 					group_name = None
@@ -2692,15 +2692,14 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			row = result.get("row")
 			column_rows = result.get("column_rows", {})  # Для режима rate: {column: row}
 			
-			report_lines = ["📊 Отчет:"]
+			report_lines = []
 			
 			if mode == "add" and row:
-				report_lines.append(f"📍 Строка: {row}")
+				report_lines.append(f"<code>📍 Строка: {row}</code>")
 			
 			if written_cells:
-				report_lines.append("✅ Записано:")
 				for cell_info in written_cells:
-					report_lines.append(f"  • {cell_info}")
+					report_lines.append(f"<code> • {cell_info}</code>")
 			else:
 				report_lines.append("⚠️ Нет записанных данных")
 			
@@ -2857,24 +2856,23 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			# Добавляем информацию о балансах в отчет
 			if card_balances or cash_balances or crypto_balances:
 				report_lines.append("")
-				report_lines.append("💰 Дополнительная информация:")
 				
 				if card_balances:
 					for card_name, data in card_balances.items():
 						group_name = data.get("group_name", "")
 						# Формируем строку с балансом
 						if group_name:
-							report_lines.append(f"  💳 Баланс {card_name} ({group_name}) = {data['balance']}")
+							report_lines.append(f"  💳 Баланс <code>{card_name} ({group_name}) = {data['balance']}</code>")
 						else:
-							report_lines.append(f"  💳 Баланс {card_name} = {data['balance']}")
+							report_lines.append(f"  💳 Баланс <code>{card_name} = {data['balance']}</code>")
 				
 				if cash_balances:
 					for cash_name, balance in cash_balances.items():
-						report_lines.append(f"  💳 Баланс {cash_name} = {balance}")
+						report_lines.append(f"  💳 Баланс <code>{cash_name} = {balance}</code>")
 				
 				if crypto_balances:
 					for crypto_type, balance in crypto_balances.items():
-						report_lines.append(f"  💳 Баланс {crypto_type} = {balance}")
+						report_lines.append(f"  💳 Баланс <code>{crypto_type} = {balance}</code>")
 				
 				# Добавляем статистику пополнений после всех балансов (только для mode == "add")
 				if mode == "add" and card_balances:
@@ -2903,8 +2901,8 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 										replenishment_lines.append(f"  💳 {card_name} ({group_name}):")
 									else:
 										replenishment_lines.append(f"  💳 {card_name}:")
-									replenishment_lines.append(f"    <b><u>💳❇️ Пополнение за месяц</u></b>: {month_str}")
-									replenishment_lines.append(f"    <b><u>💳✳️ Общее пополнение</u></b>: {all_time_str}")
+									replenishment_lines.append(f"    💳❇️ Пополнение за месяц: <code>{month_str}</code>")
+									replenishment_lines.append(f"    💳✳️ Общее пополнение: <code>{all_time_str}</code>")
 							except Exception as e:
 								logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
 					
@@ -2919,7 +2917,7 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			# Профит сделки (для режимов /add и /move)
 			if profits and mode in ["add", "move"]:
 				for cell_address, profit_value in profits.items():
-					profit_section_lines.append(f"  ⏩ <b><u>Профит сделки</u></b> ({cell_address}) = {profit_value} USD ⏪")
+					profit_section_lines.append(f"  💹 <b>Профит сделки ({cell_address}) = {profit_value} USD </b>💹\n")
 			
 			# Профит за сегодня и средний профит (только для режима /add)
 			if mode == "add":
@@ -2978,9 +2976,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 										try:
 											profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
 											formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
-											profit_section_lines.append(f"  📈 Профит за сегодня: {formatted_profit} USD")
+											profit_section_lines.append(f"  📈 Профит за сегодня: <code>{formatted_profit} USD</code>")
 										except (ValueError, AttributeError):
-											profit_section_lines.append(f"  📈 Профит за сегодня: {profit_today} USD")
+											profit_section_lines.append(f"  📈 Профит за сегодня: <code>{profit_today} USD</code>")
 							
 							# Обрабатываем средний профит (если не понедельник)
 							if weekday != 0:
@@ -2998,14 +2996,13 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 								if profit_values:
 									avg_profit = sum(profit_values) / len(profit_values)
 									formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
-									profit_section_lines.append(f"  📊 Средний профит в день: {formatted_avg} USD")
+									profit_section_lines.append(f"  📊 Средний профит в день: <code>{formatted_avg} USD</code>")
 					except Exception as e:
 						logger.warning(f"Ошибка получения профита за сегодня и среднего профита: {e}")
 			
 			# Добавляем раздел с профитом в отчет, если есть данные
 			if profit_section_lines:
 				report_lines.append("")
-				report_lines.append("💰 Профит:")
 				report_lines.extend(profit_section_lines)
 			
 			# Проверяем наличие ошибок

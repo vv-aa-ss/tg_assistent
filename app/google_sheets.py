@@ -1825,12 +1825,6 @@ def _write_to_google_sheet_rate_mode_sync(
 			
 			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))
-				# В режиме rate записываем со знаком минус (если значение положительное)
-				# Если значение уже отрицательное, оставляем как есть
-				if usd_amount_rounded > 0:
-					usd_amount_negative = -usd_amount_rounded
-				else:
-					usd_amount_negative = usd_amount_rounded  # Уже отрицательное
 				
 				# Получаем столбец из словаря crypto_columns
 				column = crypto_columns.get(currency) if currency else None
@@ -1842,16 +1836,16 @@ def _write_to_google_sheet_rate_mode_sync(
 						logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
 						cell_address = f"{column}{empty_row}"
-						worksheet.update(cell_address, [[usd_amount_negative]])
-						written_cells.append(f"{cell_address} ({currency}: {usd_amount_negative} USD)")
+						worksheet.update(cell_address, [[usd_amount_rounded]])
+						written_cells.append(f"{cell_address} ({currency}: {usd_amount_rounded} USD)")
 						column_rows[column] = empty_row
 						operations_history.append({
 							"cell": cell_address,
-							"value": usd_amount_negative,
+							"value": usd_amount_rounded,
 							"type": "crypto",
 							"currency": currency
 						})
-						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {cell_address} ({currency})")
+						logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {cell_address} ({currency})")
 				else:
 					failed_writes.append(f"{currency}: {usd_amount_rounded} USD (не указан адрес столбца)")
 					logger.warning(f"⚠️ Не записано {currency}: {usd_amount_rounded} USD - не указан адрес столбца")
@@ -1863,12 +1857,6 @@ def _write_to_google_sheet_rate_mode_sync(
 			
 			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
 				usd_amount_rounded = int(round(usd_amount))
-				# В режиме rate записываем со знаком минус (если значение положительное)
-				# Если значение уже отрицательное, оставляем как есть
-				if usd_amount_rounded > 0:
-					usd_amount_negative = -usd_amount_rounded
-				else:
-					usd_amount_negative = usd_amount_rounded  # Уже отрицательное
 				usd_column = xmr_columns.get(xmr_number)
 				
 				if usd_column:
@@ -1878,16 +1866,16 @@ def _write_to_google_sheet_rate_mode_sync(
 						logger.warning(f"⚠️ Не записано XMR-{xmr_number}: {usd_amount_rounded} USD - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
 						cell_address = f"{usd_column}{empty_row}"
-						worksheet.update(cell_address, [[usd_amount_negative]])
-						written_cells.append(f"{cell_address} (XMR-{xmr_number}: {usd_amount_negative} USD)")
+						worksheet.update(cell_address, [[usd_amount_rounded]])
+						written_cells.append(f"{cell_address} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
 						column_rows[usd_column] = empty_row
 						operations_history.append({
 							"cell": cell_address,
-							"value": usd_amount_negative,
+							"value": usd_amount_rounded,
 							"type": "xmr",
 							"xmr_number": xmr_number
 						})
-						logger.info(f"✅ Записано {usd_amount_negative} USD в ячейку {cell_address} (XMR-{xmr_number})")
+						logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Записываем наличные для каждой карты
 		for pair in card_cash_pairs:
@@ -1901,29 +1889,23 @@ def _write_to_google_sheet_rate_mode_sync(
 				cash_amount = cash_data.get("value", 0)
 				
 				if cash_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
-					# В режиме rate записываем со знаком минус (если значение положительное)
-					# Если значение уже отрицательное, оставляем как есть
-					if cash_amount > 0:
-						cash_amount_negative = -cash_amount
-					else:
-						cash_amount_negative = cash_amount  # Уже отрицательное
 					empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 					if empty_row > rate_max_row:
 						failed_writes.append(f"Карта {card_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
 						logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для карты {card_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 					else:
 						cell_address = f"{column}{empty_row}"
-						worksheet.update(cell_address, [[cash_amount_negative]])
-						written_cells.append(f"{cell_address} (Карта {card_name}: {cash_amount_negative} {cash_currency})")
+						worksheet.update(cell_address, [[cash_amount]])
+						written_cells.append(f"{cell_address} (Карта {card_name}: {cash_amount} {cash_currency})")
 						column_rows[column] = empty_row
 						operations_history.append({
 							"cell": cell_address,
-							"value": cash_amount_negative,
+							"value": cash_amount,
 							"type": "card",
 							"card_name": card_name,
 							"currency": cash_currency
 						})
-						logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {cell_address} (карта: {card_name})")
+						logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {cell_address} (карта: {card_name})")
 		
 		# Записываем наличные без карты
 		logger.info(f"🔍 Запись наличных без карты: cash_list={cash_list}, len={len(cash_list)}")
@@ -1939,29 +1921,23 @@ def _write_to_google_sheet_rate_mode_sync(
 				column = column_raw
 			
 			if column and cash_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
-				# В режиме rate записываем со знаком минус (если значение положительное)
-				# Если значение уже отрицательное, оставляем как есть
-				if cash_amount > 0:
-					cash_amount_negative = -cash_amount
-				else:
-					cash_amount_negative = cash_amount  # Уже отрицательное
 				empty_row = _find_empty_cell_in_column(worksheet, column, start_row=start_row, max_row=rate_max_row)
 				if empty_row > rate_max_row:
 					failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (нет места, последняя строка: {rate_max_row})")
 					logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - превышен лимит строки {rate_max_row}, найдена строка {empty_row}")
 				else:
 					cell_address = f"{column}{empty_row}"
-					worksheet.update(cell_address, [[cash_amount_negative]])
-					written_cells.append(f"{cell_address} (Наличные {cash_name}: {cash_amount_negative} {cash_currency})")
+					worksheet.update(cell_address, [[cash_amount]])
+					written_cells.append(f"{cell_address} (Наличные {cash_name}: {cash_amount} {cash_currency})")
 					column_rows[column] = empty_row
 					operations_history.append({
 						"cell": cell_address,
-						"value": cash_amount_negative,
+						"value": cash_amount,
 						"type": "cash",
 						"cash_name": cash_name,
 						"currency": cash_currency
 					})
-					logger.info(f"✅ Записано {cash_amount_negative} {cash_currency} в ячейку {cell_address} (наличные: {cash_name})")
+					logger.info(f"✅ Записано {cash_amount} {cash_currency} в ячейку {cell_address} (наличные: {cash_name})")
 			elif not column:
 				failed_writes.append(f"Наличные {cash_name}: {cash_amount} {cash_currency} (не указан адрес столбца)")
 				logger.warning(f"⚠️ Не записано {cash_amount} {cash_currency} для наличных {cash_name} - не указан адрес столбца")

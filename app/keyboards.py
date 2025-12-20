@@ -824,20 +824,22 @@ def add_data_type_kb(
 	if mode == "rate":
 		kb.button(text="📝 Примечание", callback_data=f"add_data:note:{mode}")
 	
-	# Объединяем все последние используемые элементы в один список (до 6 элементов)
-	# Формат: (type, display_name, callback_data)
-	recent_items_combined = []
+	# Подготавливаем отдельные списки для каждого типа
+	# Формат: (display_name, callback_data)
+	crypto_items = []
+	card_items = []
+	cash_items = []
 	
-	# Добавляем криптовалюты
+	# Формируем список криптовалют (ограничиваем до 3 элементов)
 	if recent_cryptos:
-		for crypto_id in recent_cryptos:
+		for crypto_id in recent_cryptos[:3]:  # Берем только первые 3 криптовалюты
 			if crypto_id.startswith("XMR-"):
 				display_name = crypto_id  # "XMR-1", "XMR-2", "XMR-3"
 			else:
 				display_name = crypto_id  # "BTC", "LTC", "USDT", etc.
-			recent_items_combined.append(("crypto", display_name, f"add_data:quick:crypto:{crypto_id}:{mode}"))
+			crypto_items.append((display_name, f"add_data:quick:crypto:{crypto_id}:{mode}"))
 	
-	# Добавляем карты
+	# Формируем список карт
 	if recent_cards:
 		for card_tuple in recent_cards:
 			card_id = card_tuple[0]
@@ -848,9 +850,9 @@ def add_data_type_kb(
 				display_name = f"{card_name} ({group_name})"
 			else:
 				display_name = card_name
-			recent_items_combined.append(("card", display_name, f"add_data:quick:card:{card_id}:{mode}"))
+			card_items.append((display_name, f"add_data:quick:card:{card_id}:{mode}"))
 	
-	# Добавляем наличные
+	# Формируем список наличных
 	if recent_cash:
 		for cash_tuple in recent_cash:
 			if isinstance(cash_tuple, tuple) and len(cash_tuple) == 2:
@@ -859,10 +861,89 @@ def add_data_type_kb(
 				# Обратная совместимость: если передан просто cash_name
 				cash_name = cash_tuple
 				display_name = cash_name
-			recent_items_combined.append(("cash", display_name, f"add_data:quick:cash:{cash_name}:{mode}"))
+			cash_items.append((display_name, f"add_data:quick:cash:{cash_name}:{mode}"))
 	
-	# Ограничиваем до 6 элементов и добавляем кнопки
-	for _, display_name, callback_data in recent_items_combined[:6]:
+	# Формируем кнопки по столбцам:
+	# Столбец 1: криптовалюты
+	# Столбец 2: карты (первые половина, если карт > 3, иначе все)
+	# Столбец 3: карты (вторая половина, если карт > 3, иначе наличные)
+	
+	# Разделяем карты на две части для столбцов 2 и 3
+	# Столбец 2: первые карты (по количеству строк крипты)
+	# Столбец 3: остальные карты
+	card_items_col2 = []
+	card_items_col3 = []
+	
+	# Распределяем карты на два столбца
+	# Распределяем так, чтобы максимально заполнить все 3 строки
+	# Если карт >= 6, то по 3 в каждом столбце
+	# Если карт < 6, то распределяем так, чтобы в каждом столбце было примерно поровну
+	card_items_col2 = []
+	card_items_col3 = []
+	
+	if len(card_items) > 0:
+		# Ограничиваем до 6 карт максимум (по 3 в каждом столбце для 3 строк)
+		card_items_limited = card_items[:6]
+		
+		# Делим пополам: первые идут в столбец 2, вторые в столбец 3
+		# Это обеспечит максимальное заполнение всех строк
+		mid = (len(card_items_limited) + 1) // 2
+		card_items_col2 = card_items_limited[:mid]
+		card_items_col3 = card_items_limited[mid:]
+	
+	# Вычисляем максимальное количество строк
+	# Всегда 3 строки, если есть хотя бы одна крипта
+	if len(crypto_items) > 0:
+		max_rows = 3
+	else:
+		# Если нет крипт, используем максимум из остальных столбцов, но не больше 3
+		max_rows = min(3, max(len(card_items_col2), len(card_items_col3), len(cash_items)))
+	
+	recent_items_combined = []
+	total_items = 0
+	max_total = 9
+	
+	# Список для хранения количества элементов в каждой строке
+	rows_sizes = []
+	
+	# Индекс для наличных
+	cash_idx = 0
+	
+	for row in range(max_rows):
+		if total_items >= max_total:
+			break
+		
+		row_items = []
+		
+		# Столбец 1: криптовалюта
+		if row < len(crypto_items) and total_items < max_total:
+			row_items.append(crypto_items[row])
+			total_items += 1
+		
+		# Столбец 2: карта (по номеру строки)
+		if row < len(card_items_col2) and total_items < max_total:
+			row_items.append(card_items_col2[row])
+			total_items += 1
+		
+		# Столбец 3: карта (по номеру строки) или наличные
+		if total_items < max_total:
+			# Сначала пытаемся взять карту из столбца 3
+			if row < len(card_items_col3):
+				row_items.append(card_items_col3[row])
+				total_items += 1
+			# Если карт в столбце 3 нет, пытаемся взять наличные
+			elif cash_idx < len(cash_items):
+				row_items.append(cash_items[cash_idx])
+				cash_idx += 1
+				total_items += 1
+		
+		# Добавляем все элементы строки (даже если строка неполная)
+		if row_items:
+			recent_items_combined.extend(row_items)
+			rows_sizes.append(len(row_items))
+	
+	# Добавляем кнопки
+	for display_name, callback_data in recent_items_combined:
 		kb.button(text=display_name, callback_data=callback_data)
 	
 	# Подтвердить и Назад
@@ -873,22 +954,17 @@ def add_data_type_kb(
 	# saved_blocks + 1 (текущий блок) строк по 3 кнопки
 	# затем 1 кнопка "+"
 	# затем 1 кнопка "Примечание" (если rate)
-	# затем до 6 кнопок быстрого доступа (по 3 в ряд) - криптовалюты, карты, наличные
+	# затем до 9 кнопок быстрого доступа (по 3 в ряд) - криптовалюты, карты, наличные
 	# затем 2 кнопки ("Подтвердить" и "Назад")
 	adjust_list = [3] * (len(saved_blocks) + 1) + [1]  # Блоки + "+"
 	if mode == "rate":
 		adjust_list.append(1)  # Кнопка "Примечание"
 	
-	# Быстрый доступ (до 6 элементов, по 3 в ряд)
-	recent_count = len(recent_items_combined[:6])
-	if recent_count > 0:
-		# Разбиваем на ряды по 3 элемента
-		full_rows = recent_count // 3
-		remainder = recent_count % 3
-		for _ in range(full_rows):
-			adjust_list.append(3)
-		if remainder > 0:
-			adjust_list.append(remainder)
+	# Быстрый доступ (до 9 элементов, по 3 в ряд)
+	# Используем реальные размеры строк для правильного формирования adjust_list
+	if rows_sizes:
+		for row_size in rows_sizes:
+			adjust_list.append(row_size)
 	
 	# Подтвердить и Назад
 	adjust_list.append(2)
