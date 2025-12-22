@@ -1,5 +1,5 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, TelegramObject
+from aiogram.types import Message, CallbackQuery, TelegramObject, FSInputFile
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter, Command
@@ -13,6 +13,12 @@ import re
 from html import escape
 import asyncio
 import json
+import matplotlib
+matplotlib.use('Agg')  # Используем неинтерактивный backend
+import matplotlib.pyplot as plt
+import numpy as np
+import os
+import tempfile
 from app.keyboards import (
 	admin_menu_kb,
 	cards_list_kb,
@@ -5040,6 +5046,92 @@ async def stat_u_menu(cb: CallbackQuery):
 	await cb.answer()
 
 
+async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]) -> Optional[str]:
+	"""
+	Генерирует график балансов и оборотов за месяц по группам и банкам.
+	Исключает группу "РАШКА".
+	
+	Args:
+		graph_data: Словарь {group_name: {card_name: {"balance": float, "month": float, "bank": str}}}
+	
+	Returns:
+		Путь к временному файлу с графиком или None при ошибке
+	"""
+	try:
+		# Собираем уникальные группы (люди) и банки
+		people = sorted([p for p in graph_data.keys() if p.upper() != "РАШКА"])
+		if not people:
+			return None
+		
+		# Собираем все уникальные банки из всех карт
+		all_banks = set()
+		for group_data in graph_data.values():
+			for card_data in group_data.values():
+				bank = card_data.get("bank", "")
+				if bank:
+					all_banks.add(bank)
+		banks = sorted(list(all_banks))
+		
+		if not banks:
+			return None
+		
+		# Инициализируем структуры данных
+		balance = {p: {b: 0.0 for b in banks} for p in people}
+		month = {p: {b: 0.0 for b in banks} for p in people}
+		
+		# Заполняем данные из graph_data
+		for person in people:
+			if person not in graph_data:
+				continue
+			for card_name, card_data in graph_data[person].items():
+				bank = card_data.get("bank", "")
+				if bank in banks:
+					balance[person][bank] += card_data.get("balance", 0.0)
+					month[person][bank] += card_data.get("month", 0.0)
+		
+		# Создаем график
+		x = np.arange(len(people))
+		w = 0.35
+		
+		fig = plt.figure(figsize=(7.2, 12.8), dpi=150)  # ~1080x1920
+		ax = plt.gca()
+		
+		bottom_bal = np.zeros(len(people))
+		bottom_mon = np.zeros(len(people))
+		
+		# Цвета для банков (используем цветовую палитру matplotlib)
+		colors = plt.cm.tab20(np.linspace(0, 1, len(banks)))
+		
+		for i, b in enumerate(banks):
+			yb = np.array([balance[p][b] for p in people])
+			ym = np.array([month[p][b] for p in people])
+			
+			ax.bar(x - w/2, yb, w, bottom=bottom_bal, label=b, color=colors[i])
+			ax.bar(x + w/2, ym, w, bottom=bottom_mon, color=colors[i], alpha=0.7)
+			
+			bottom_bal += yb
+			bottom_mon += ym
+		
+		ax.set_title("Балансы и оборот за месяц", fontsize=18)
+		ax.set_xticks(x)
+		ax.set_xticklabels(people, rotation=0)
+		ax.legend(ncols=2, fontsize=10, loc="upper left", bbox_to_anchor=(1.02, 1))
+		ax.grid(axis="y", alpha=0.3)
+		
+		plt.tight_layout()
+		
+		# Сохраняем во временный файл
+		fd, temp_path = tempfile.mkstemp(suffix='.png', prefix='cards_chart_')
+		os.close(fd)
+		plt.savefig(temp_path, bbox_inches="tight")
+		plt.close(fig)
+		
+		return temp_path
+	except Exception as e:
+		logger.exception(f"❌ Ошибка генерации графика: {e}")
+		return None
+
+
 @admin_router.message(Command("stat_bk"))
 async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	"""Обработчик команды /stat_bk для отображения балансов всех карт"""
@@ -5113,62 +5205,89 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 		except Exception as e:
 			logger.exception(f"Ошибка batch чтения балансов: {e}")
 	
-	# Формируем результат с группировкой
-	lines = ["<b>💳 Балансы карт</b>"]
+	# Формируем результат с группировкой (новый короткий формат)
+	lines = ["💳 Балансы карт"]
+	
+	# Собираем данные для графика (исключая группу "РАШКА")
+	graph_data = {}  # {group_name: {card_name: {"balance": float, "month": float, "bank": str}}}
 	
 	# Добавляем карты по группам (сортируем по названию группы)
 	sorted_groups = sorted(cards_by_group.keys(), key=lambda gid: group_names.get(gid, f"Группа {gid}"))
 	for group_id in sorted_groups:
 		group_name = group_names.get(group_id, f"Группа {group_id}")
 		lines.append("")
-		lines.append(f"❇️<ins><b>{group_name}:</b></ins>")
+		lines.append(f"❇️{group_name}:")
+		
+		# Инициализируем данные группы для графика (если не "РАШКА")
+		if group_name.upper() != "РАШКА":
+			if group_name not in graph_data:
+				graph_data[group_name] = {}
 		
 		for card_id, card_name, column, cell_address in cards_by_group[group_id]:
 			balance = balances.get(cell_address)
+			balance_value = float(balance) if balance and balance != "—" else 0.0
 			balance_str = balance if balance else "—"
-			lines.append(f"▶️<b> {card_name} ({column}{balance_row}) = {balance_str}</b>")
 			
 			# Получаем статистику пополнений для карты
+			month_total = 0.0
+			all_time_total = 0.0
 			try:
 				replenishment_stats = await db.get_card_replenishment_stats(card_id)
 				if replenishment_stats:
 					month_total = replenishment_stats.get("month_total", 0.0)
 					all_time_total = replenishment_stats.get("all_time_total", 0.0)
-					# Форматируем числа (убираем лишние нули после запятой)
-					month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
-					all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
-					lines.append(f" 〰️<i>Месяц: {month_str}. Общее: {all_time_str}</i>\n")
 			except Exception as e:
 				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+			
+			# Форматируем числа (убираем лишние нули после запятой)
+			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+			all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+			
+			# Новый короткий формат: баланс(месяц;общее)
+			lines.append(f" ▶️ {card_name} ({column}{balance_row}) = {balance_str}({month_str};{all_time_str})")
+			
+			# Сохраняем данные для графика (исключая группу "РАШКА")
+			if group_name.upper() != "РАШКА" and balance_str != "—":
+				# Извлекаем банк из названия карты (первое слово или часть до первого пробела)
+				bank = card_name.split()[0].upper() if card_name.split() else card_name.upper()
+				graph_data[group_name][card_name] = {
+					"balance": balance_value,
+					"month": month_total,
+					"bank": bank
+				}
 	
 	# Добавляем карты без группы
 	if cards_without_group:
 		lines.append("")
-		lines.append("<b>Без группы:</b>")
+		lines.append("❇️БЕЗ ГРУППЫ:")
 		for card_id, card_name, column, cell_address in cards_without_group:
 			balance = balances.get(cell_address)
+			balance_value = float(balance) if balance and balance != "—" else 0.0
 			balance_str = balance if balance else "—"
-			lines.append(f"<b> {card_name} ({column}{balance_row}) = {balance_str}</b>")
 			
 			# Получаем статистику пополнений для карты
+			month_total = 0.0
+			all_time_total = 0.0
 			try:
 				replenishment_stats = await db.get_card_replenishment_stats(card_id)
 				if replenishment_stats:
 					month_total = replenishment_stats.get("month_total", 0.0)
 					all_time_total = replenishment_stats.get("all_time_total", 0.0)
-					# Форматируем числа (убираем лишние нули после запятой)
-					month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
-					all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
-					lines.append(f" 〰️<i>Месяц: {month_str}. Общее: {all_time_str}</i>")
 			except Exception as e:
 				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+			
+			# Форматируем числа
+			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+			all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+			
+			lines.append(f" ▶️ {card_name} ({column}{balance_row}) = {balance_str}({month_str};{all_time_str})")
 	
 	# Добавляем карты без привязки к столбцу
 	if cards_without_column:
 		lines.append("")
-		lines.append("<b>⚠️ Карты без привязки к столбцу:</b>")
+		lines.append("⚠️ Карты без привязки к столбцу:")
 		for card_name in cards_without_column:
-			lines.append(f"<code>💳 {card_name}</code>")
+			lines.append(f"💳 {card_name}")
 	
 	if not cards_by_group and not cards_without_group and not cards_without_column:
 		lines.append("Нет данных о картах.")
@@ -5177,15 +5296,31 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	total_cards_with_balance = sum(len(cards) for cards in cards_by_group.values()) + len(cards_without_group)
 	logger.info(f"📊 Отправка балансов карт: групп={len(cards_by_group)}, карт с балансом={total_cards_with_balance}, без столбца={len(cards_without_column)}")
 	try:
-		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"))
 		logger.info("✅ Сообщение с балансами карт успешно отправлено")
 	except Exception as e:
 		logger.exception(f"❌ Ошибка отправки сообщения с балансами карт: {e}")
 		# Если не удалось обновить, отправляем новое сообщение
 		try:
-			await msg.answer(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+			await msg.answer(text, reply_markup=simple_back_kb("admin:back"))
 		except Exception as e2:
 			logger.exception(f"❌ Ошибка отправки нового сообщения с балансами карт: {e2}")
+	
+	# Генерируем и отправляем график (исключая группу "РАШКА")
+	if graph_data:
+		try:
+			chart_path = await _generate_cards_chart(graph_data)
+			if chart_path:
+				photo = FSInputFile(chart_path)
+				await bot.send_photo(msg.chat.id, photo, reply_markup=simple_back_kb("admin:back"))
+				# Удаляем временный файл
+				import os
+				try:
+					os.remove(chart_path)
+				except Exception:
+					pass
+		except Exception as e:
+			logger.exception(f"❌ Ошибка генерации/отправки графика: {e}")
 
 
 @admin_router.message(Command("stat_k"))
