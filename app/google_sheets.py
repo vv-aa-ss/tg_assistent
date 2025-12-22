@@ -1034,7 +1034,9 @@ async def write_all_to_google_sheet_one_row(
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
 	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
 	mode: str = "add",  # Режим: "add" или "move"
-	sheet_name: Optional[str] = None
+	sheet_name: Optional[str] = None,
+	bot: Optional[Any] = None,  # Bot объект для отправки уведомлений
+	chat_id: Optional[int] = None  # ID чата для отправки уведомлений
 ) -> Dict[str, Any]:
 	"""
 	Записывает все данные в одну строку Google Sheets.
@@ -1139,22 +1141,126 @@ async def write_all_to_google_sheet_one_row(
 			
 			logger.info(f"📅 День недели: {day_name}, start_row={start_row}, max_row={max_row}, delete_range={delete_range}")
 		
-		# Выполняем синхронную запись в отдельном потоке
-		return await asyncio.to_thread(
-			_write_all_to_google_sheet_one_row_sync,
-			sheet_id,
-			credentials_path,
-			crypto_list,
-			xmr_list,
-			cash_list,
-			card_cash_pairs,
-			crypto_columns,
-			xmr_columns,
-			start_row,
-			max_row,
-			delete_range,
-			sheet_name
-		)
+		# Выполняем синхронную запись в отдельном потоке с retry логикой
+		max_retries = 5
+		last_error = None
+		
+		for attempt in range(1, max_retries + 1):
+			try:
+				# Отправляем уведомление о попытке (кроме первой)
+				if attempt > 1 and bot and chat_id:
+					try:
+						await bot.send_message(
+							chat_id=chat_id,
+							text=f"🔄 Попытка {attempt} из {max_retries}..."
+						)
+					except Exception:
+						pass  # Игнорируем ошибки отправки уведомлений
+				
+				result = await asyncio.to_thread(
+					_write_all_to_google_sheet_one_row_sync,
+					sheet_id,
+					credentials_path,
+					crypto_list,
+					xmr_list,
+					cash_list,
+					card_cash_pairs,
+					crypto_columns,
+					xmr_columns,
+					start_row,
+					max_row,
+					delete_range,
+					sheet_name
+				)
+				
+				# Если успешно, возвращаем результат
+				if result.get("success"):
+					return result
+				
+				# Если не успешно, но это не исключение, возвращаем результат без retry
+				# (например, если не найдена свободная строка)
+				return result
+				
+			except gspread.exceptions.APIError as e:
+				last_error = e
+				error_code = None
+				if hasattr(e, 'response') and e.response is not None:
+					error_code = getattr(e.response, 'status_code', None)
+				
+				# Обрабатываем только ошибки 503 (сервис недоступен) и другие временные ошибки
+				if error_code in [503, 429, 500, 502, 504] or "unavailable" in str(e).lower():
+					if bot and chat_id:
+						try:
+							if attempt == 1:
+								await bot.send_message(
+									chat_id=chat_id,
+									text="⚠️ Не могу связаться с Google Sheets API, пробуем еще раз..."
+								)
+							else:
+								await bot.send_message(
+									chat_id=chat_id,
+									text=f"⚠️ Попытка {attempt} из {max_retries} не удалась. Пробуем еще раз..."
+								)
+						except Exception:
+							pass  # Игнорируем ошибки отправки уведомлений
+					
+					logger.warning(f"⚠️ Ошибка Google Sheets API (попытка {attempt}/{max_retries}): {e}")
+					
+					# Если это не последняя попытка, ждем перед повтором
+					if attempt < max_retries:
+						await asyncio.sleep(2 * attempt)  # Экспоненциальная задержка
+						continue
+					else:
+						# Последняя попытка не удалась
+						if bot and chat_id:
+							try:
+								await bot.send_message(
+									chat_id=chat_id,
+									text=f"❌ Не удалось связаться с Google Sheets API после {max_retries} попыток. Ошибка: {e}"
+								)
+							except Exception:
+								pass
+						logger.error(f"❌ Все попытки исчерпаны. Последняя ошибка: {e}")
+						return {"success": False, "error": str(e)}
+				else:
+					# Для других ошибок не делаем retry
+					logger.error(f"❌ Ошибка Google Sheets API (не retry): {e}")
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"❌ Ошибка Google Sheets API: {e}"
+							)
+						except Exception:
+							pass
+					return {"success": False, "error": str(e)}
+			except Exception as e:
+				last_error = e
+				logger.exception(f"Ошибка записи всех данных в Google Sheet (попытка {attempt}/{max_retries}): {e}")
+				if attempt < max_retries:
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"⚠️ Ошибка (попытка {attempt}/{max_retries}). Пробуем еще раз..."
+							)
+						except Exception:
+							pass
+					await asyncio.sleep(2 * attempt)
+					continue
+				else:
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"❌ Не удалось записать данные после {max_retries} попыток. Ошибка: {e}"
+							)
+						except Exception:
+							pass
+					return {"success": False, "error": str(e)}
+		
+		# Если дошли сюда, все попытки исчерпаны
+		return {"success": False, "error": str(last_error) if last_error else "Unknown error"}
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
 		return {"success": False}
@@ -1642,7 +1748,9 @@ async def write_to_google_sheet_rate_mode(
 	cash_list: list,  # [{"currency": "RUB", "value": 5000}, ...] - для наличных без карты
 	card_cash_pairs: list,  # [{"card": {...}, "cash": {...}}, ...] - пары карта-наличные
 	sheet_name: Optional[str] = None,
-	note: Optional[str] = None
+	note: Optional[str] = None,
+	bot: Optional[Any] = None,  # Bot объект для отправки уведомлений
+	chat_id: Optional[int] = None  # ID чата для отправки уведомлений
 ) -> Dict[str, Any]:
 	"""
 	Записывает данные в режиме rate: каждая запись идет в первую пустую ячейку соответствующего столбца,
@@ -1745,21 +1853,128 @@ async def write_to_google_sheet_rate_mode(
 		rate_start_row_str = await db.get_google_sheets_setting("rate_start_row", "348")
 		rate_start_row = int(rate_start_row_str) if rate_start_row_str else 348
 		
-		# Выполняем синхронную запись в отдельном потоке
-		result = await asyncio.to_thread(
-			_write_to_google_sheet_rate_mode_sync,
-			sheet_id,
-			credentials_path,
-			crypto_list,
-			xmr_list,
-			cash_list,
-			card_cash_pairs,
-			crypto_columns,
-			xmr_columns,
-			rate_max_row,
-			rate_start_row,
-			sheet_name
-		)
+		# Выполняем синхронную запись в отдельном потоке с retry логикой
+		max_retries = 5
+		last_error = None
+		
+		for attempt in range(1, max_retries + 1):
+			try:
+				# Отправляем уведомление о попытке (кроме первой)
+				if attempt > 1 and bot and chat_id:
+					try:
+						await bot.send_message(
+							chat_id=chat_id,
+							text=f"🔄 Попытка {attempt} из {max_retries}..."
+						)
+					except Exception:
+						pass  # Игнорируем ошибки отправки уведомлений
+				
+				result = await asyncio.to_thread(
+					_write_to_google_sheet_rate_mode_sync,
+					sheet_id,
+					credentials_path,
+					crypto_list,
+					xmr_list,
+					cash_list,
+					card_cash_pairs,
+					crypto_columns,
+					xmr_columns,
+					rate_max_row,
+					rate_start_row,
+					sheet_name
+				)
+				
+				# Если успешно, возвращаем результат
+				if result.get("success"):
+					return result
+				
+				# Если не успешно, но это не исключение, возвращаем результат без retry
+				# (например, если не найдена свободная ячейка)
+				return result
+				
+			except gspread.exceptions.APIError as e:
+				last_error = e
+				error_code = None
+				if hasattr(e, 'response') and e.response is not None:
+					error_code = getattr(e.response, 'status_code', None)
+				
+				# Обрабатываем только ошибки 503 (сервис недоступен) и другие временные ошибки
+				if error_code in [503, 429, 500, 502, 504] or "unavailable" in str(e).lower():
+					if bot and chat_id:
+						try:
+							if attempt == 1:
+								await bot.send_message(
+									chat_id=chat_id,
+									text="⚠️ Не могу связаться с Google Sheets API, пробуем еще раз..."
+								)
+							else:
+								await bot.send_message(
+									chat_id=chat_id,
+									text=f"⚠️ Попытка {attempt} из {max_retries} не удалась. Пробуем еще раз..."
+								)
+						except Exception:
+							pass  # Игнорируем ошибки отправки уведомлений
+					
+					logger.warning(f"⚠️ Ошибка Google Sheets API (попытка {attempt}/{max_retries}): {e}")
+					
+					# Если это не последняя попытка, ждем перед повтором
+					if attempt < max_retries:
+						await asyncio.sleep(2 * attempt)  # Экспоненциальная задержка
+						continue
+					else:
+						# Последняя попытка не удалась
+						if bot and chat_id:
+							try:
+								await bot.send_message(
+									chat_id=chat_id,
+									text=f"❌ Не удалось связаться с Google Sheets API после {max_retries} попыток. Ошибка: {e}"
+								)
+							except Exception:
+								pass
+						logger.error(f"❌ Все попытки исчерпаны. Последняя ошибка: {e}")
+						return {"success": False, "error": str(e)}
+				else:
+					# Для других ошибок не делаем retry
+					logger.error(f"❌ Ошибка Google Sheets API (не retry): {e}")
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"❌ Ошибка Google Sheets API: {e}"
+							)
+						except Exception:
+							pass
+					return {"success": False, "error": str(e)}
+			except Exception as e:
+				last_error = e
+				logger.exception(f"Ошибка записи данных в Google Sheet (попытка {attempt}/{max_retries}): {e}")
+				if attempt < max_retries:
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"⚠️ Ошибка (попытка {attempt}/{max_retries}). Пробуем еще раз..."
+							)
+						except Exception:
+							pass
+					await asyncio.sleep(2 * attempt)
+					continue
+				else:
+					if bot and chat_id:
+						try:
+							await bot.send_message(
+								chat_id=chat_id,
+								text=f"❌ Не удалось записать данные после {max_retries} попыток. Ошибка: {e}"
+							)
+						except Exception:
+							pass
+					return {"success": False, "error": str(e)}
+		
+		# Если дошли сюда, все попытки исчерпаны
+		if last_error:
+			result = {"success": False, "error": str(last_error)}
+		else:
+			result = {"success": False, "error": "Unknown error"}
 		
 		# В режиме rate всегда начинаем с rate_start_row (по умолчанию 407), не сохраняем последние использованные строки
 		# (убрано сохранение rate_last_row_{column} для каждого столбца)

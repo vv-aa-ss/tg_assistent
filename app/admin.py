@@ -2553,7 +2553,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				cash_list,
 				card_cash_pairs,
 				settings.google_sheet_name,
-				note=note
+				note=note,
+				bot=bot,
+				chat_id=cb.message.chat.id
 			)
 		elif mode == "move":
 			# Для режима move получаем настройки из БД
@@ -2571,7 +2573,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				cash_list,
 				card_cash_pairs,
 				mode=mode,
-				sheet_name=settings.google_sheet_name
+				sheet_name=settings.google_sheet_name,
+				bot=bot,
+				chat_id=cb.message.chat.id
 			)
 		else:
 			# Для режима add определяем диапазон строк по дню недели из БД
@@ -2638,7 +2642,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				cash_list,
 				card_cash_pairs,
 				mode="add",
-				sheet_name=settings.google_sheet_name
+				sheet_name=settings.google_sheet_name,
+				bot=bot,
+				chat_id=cb.message.chat.id
 			)
 			
 			# Проверяем, есть ли свободная строка в диапазоне
@@ -5115,12 +5121,25 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 	for group_id in sorted_groups:
 		group_name = group_names.get(group_id, f"Группа {group_id}")
 		lines.append("")
-		lines.append(f"<b>{group_name}:</b>")
+		lines.append(f"❇️<ins><b>{group_name}:</b></ins>")
 		
 		for card_id, card_name, column, cell_address in cards_by_group[group_id]:
 			balance = balances.get(cell_address)
 			balance_str = balance if balance else "—"
-			lines.append(f"<code> {card_name} ({column}{balance_row}) = {balance_str}</code>")
+			lines.append(f"▶️<b> {card_name} ({column}{balance_row}) = {balance_str}</b>")
+			
+			# Получаем статистику пополнений для карты
+			try:
+				replenishment_stats = await db.get_card_replenishment_stats(card_id)
+				if replenishment_stats:
+					month_total = replenishment_stats.get("month_total", 0.0)
+					all_time_total = replenishment_stats.get("all_time_total", 0.0)
+					# Форматируем числа (убираем лишние нули после запятой)
+					month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+					all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+					lines.append(f" 〰️<i>Месяц: {month_str}. Общее: {all_time_str}</i>\n")
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
 	
 	# Добавляем карты без группы
 	if cards_without_group:
@@ -5129,7 +5148,20 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 		for card_id, card_name, column, cell_address in cards_without_group:
 			balance = balances.get(cell_address)
 			balance_str = balance if balance else "—"
-			lines.append(f"<code> {card_name} ({column}{balance_row}) = {balance_str}</code>")
+			lines.append(f"<b> {card_name} ({column}{balance_row}) = {balance_str}</b>")
+			
+			# Получаем статистику пополнений для карты
+			try:
+				replenishment_stats = await db.get_card_replenishment_stats(card_id)
+				if replenishment_stats:
+					month_total = replenishment_stats.get("month_total", 0.0)
+					all_time_total = replenishment_stats.get("all_time_total", 0.0)
+					# Форматируем числа (убираем лишние нули после запятой)
+					month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+					all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+					lines.append(f" 〰️<i>Месяц: {month_str}. Общее: {all_time_str}</i>")
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
 	
 	# Добавляем карты без привязки к столбцу
 	if cards_without_column:
