@@ -50,6 +50,7 @@ async def main() -> None:
 		BotCommand(command="stat_bk", description="Балансы карт"),
 		BotCommand(command="stat_k", description="Баланс крипты"),
 		BotCommand(command="stat_u", description="Статистика пользователей"),
+		BotCommand(command="cons", description="Статистика расходов"),
 		BotCommand(command="start", description="Меню"),
 	]
 	

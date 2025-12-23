@@ -54,6 +54,7 @@ USERS_PER_PAGE = 6
 async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optional[Dict[str, Any]] = None, back_to: str = "admin:back"):
 	"""
 	Получает клавиатуру add_data_type_kb с последними используемыми криптовалютами и картами.
+	Оптимизированная версия с batch запросами к БД.
 	
 	Args:
 		admin_id: ID администратора
@@ -70,10 +71,11 @@ async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optio
 	# Получаем последние используемые элементы всех типов
 	recent_items = await db.get_recent_items_by_admin(admin_id, limit=9)
 	
-	# Разделяем по типам
+	# Разделяем по типам и собираем ID для batch запросов
 	recent_cryptos = []
-	recent_cards = []
-	recent_cash = []
+	card_ids_to_fetch = []
+	cash_names_to_fetch = []
+	item_id_to_type = {}  # {item_id: item_type} для маппинга
 	
 	for item in recent_items:
 		item_type = item["item_type"]
@@ -85,36 +87,54 @@ async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optio
 			# Извлекаем card_id из формата "card_id_{card_id}"
 			if item_id.startswith("card_id_"):
 				card_id = int(item_id.replace("card_id_", ""))
-				card_info = await db.get_card_by_id(card_id)
-				if card_info:
-					group_name = None
-					if card_info.get("group_id"):
-						group = await db.get_card_group_by_id(card_info["group_id"])
-						if group:
-							group_name = group["name"]
-					recent_cards.append((card_id, card_info["name"], group_name))
+				card_ids_to_fetch.append(card_id)
+				item_id_to_type[card_id] = "card"
 		elif item_type == "cash":
-			# Получаем display_name для наличных
-			cash_info = await db.get_cash_column(item_id)
+			cash_names_to_fetch.append(item_id)
+			item_id_to_type[item_id] = "cash"
+	
+	# Batch запросы для карт
+	recent_cards = []
+	if card_ids_to_fetch:
+		# Получаем все карты и группы одним batch запросом
+		cards_dict = await db.get_cards_by_ids_batch(card_ids_to_fetch)
+		card_groups_info = await db.get_cards_groups_batch(card_ids_to_fetch)
+		# Формируем список карт
+		for card_id in card_ids_to_fetch:
+			card_info = cards_dict.get(card_id)
+			if card_info:
+				group_name = card_groups_info.get(card_id)
+				recent_cards.append((card_id, card_info["name"], group_name))
+	
+	# Batch запрос для наличных
+	recent_cash = []
+	if cash_names_to_fetch:
+		cash_columns_dict = await db.get_cash_columns_batch(cash_names_to_fetch)
+		for cash_name in cash_names_to_fetch:
+			cash_info = cash_columns_dict.get(cash_name)
 			if cash_info:
-				display_name = cash_info.get("display_name", "") or item_id
-				recent_cash.append((item_id, display_name))
+				display_name = cash_info.get("display_name", "") or cash_name
+				recent_cash.append((cash_name, display_name))
 			else:
-				recent_cash.append((item_id, item_id))
+				recent_cash.append((cash_name, cash_name))
 	
 	# Если элементов меньше 9, дополняем картами из старого метода
 	if len(recent_cryptos) + len(recent_cards) + len(recent_cash) < 9:
 		recent_cards_raw = await db.get_recent_cards_by_admin(admin_id, limit=9)
 		existing_card_ids = {card[0] for card in recent_cards}
+		additional_card_ids = []
 		for card_id, card_name in recent_cards_raw:
 			if card_id not in existing_card_ids and len(recent_cards) + len(recent_cryptos) + len(recent_cash) < 9:
-				card_info = await db.get_card_by_id(card_id)
+				additional_card_ids.append(card_id)
+		
+		# Batch запрос для дополнительных карт
+		if additional_card_ids:
+			additional_cards = await db.get_cards_by_ids_batch(additional_card_ids)
+			additional_groups = await db.get_cards_groups_batch(additional_card_ids)
+			for card_id in additional_card_ids:
+				card_info = additional_cards.get(card_id)
 				if card_info:
-					group_name = None
-					if card_info.get("group_id"):
-						group = await db.get_card_group_by_id(card_info["group_id"])
-						if group:
-							group_name = group["name"]
+					group_name = additional_groups.get(card_id)
 					recent_cards.append((card_id, card_info["name"], group_name))
 	
 	return add_data_type_kb(
@@ -2703,6 +2723,12 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 							except Exception as e:
 								logger.warning(f"⚠️ Ошибка сохранения пополнения card_id={card_id}, amount={cash_value}: {e}")
 			
+			# Отправляем промежуточное уведомление о формировании отчета
+			try:
+				await cb.message.edit_text("⏳ Формирование отчета...", reply_markup=None)
+			except Exception:
+				pass
+			
 			# Формируем отчет о записи
 			from app.google_sheets import read_card_balance, read_profit
 			current_date = datetime.now().strftime("%d.%m.%Y")
@@ -2747,20 +2773,20 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 						balance_cell_addresses.append(cell_address)
 						card_mapping[cell_address] = (card_name, column, card_id)
 			
-			# Получаем информацию о группах для всех карт
+			# Получаем информацию о группах для всех карт (оптимизированно - одним запросом)
 			card_groups_info = {}  # {card_id: group_name}
+			# Собираем все уникальные card_id
+			card_ids = []
 			for pair in card_cash_pairs:
 				card_data = pair.get("card")
 				if card_data:
 					card_id = card_data.get("card_id")
-					if card_id and card_id not in card_groups_info:
-						card_info = await db.get_card_by_id(card_id)
-						if card_info:
-							group_id = card_info.get("group_id")
-							if group_id:
-								group_info = await db.get_card_group(group_id)
-								if group_info:
-									card_groups_info[card_id] = group_info.get("name", "")
+					if card_id and card_id not in card_ids:
+						card_ids.append(card_id)
+			
+			# Получаем все карты с группами одним batch запросом
+			if card_ids:
+				card_groups_info = await db.get_cards_groups_batch(card_ids)
 			
 			# Читаем все балансы одним batch запросом
 			if balance_cell_addresses:
@@ -2804,15 +2830,22 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				)
 				profits = profits_dict
 			
-			# Читаем балансы для наличных
+			# Читаем балансы для наличных (оптимизированно - batch запрос)
 			cash_balances = {}
 			cash_balance_cell_addresses = []
 			cash_mapping = {}  # {cell_address: (cash_name, column)}
 			
+			# Собираем все cash_name и получаем столбцы одним запросом
+			cash_names = [cash.get("cash_name", "") for cash in cash_list if cash.get("cash_name")]
+			cash_columns_dict = {}
+			if cash_names:
+				cash_columns_dict = await db.get_cash_columns_batch(cash_names)
+			
 			for cash in cash_list:
 				cash_name = cash.get("cash_name", "")
-				# Получаем столбец для наличных из базы данных
-				cash_column_info = await db.get_cash_column(cash_name)
+				if cash_name:
+					# Получаем столбец из batch результата
+					cash_column_info = cash_columns_dict.get(cash_name)
 				if cash_column_info:
 					column = cash_column_info.get("column")
 					if column:
@@ -2832,29 +2865,45 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					if balance:
 						cash_balances[cash_name] = balance
 			
-			# Читаем балансы для криптовалют
+			# Читаем балансы для криптовалют (оптимизированно - batch запрос)
 			crypto_balances = {}
 			crypto_balance_cell_addresses = []
 			crypto_mapping = {}  # {cell_address: (crypto_type, column)}
 			
+			# Собираем все crypto_type и получаем столбцы одним запросом
+			crypto_types = []
 			# Обрабатываем обычные криптовалюты (BTC, LTC и т.д.)
 			for crypto in crypto_list:
 				crypto_type = crypto.get("currency", "")
 				if crypto_type:
-					# Получаем столбец для криптовалюты из базы данных
-					column = await db.get_crypto_column(crypto_type)
-					if column:
-						cell_address = f"{column}{balance_row}"
-						crypto_balance_cell_addresses.append(cell_address)
-						crypto_mapping[cell_address] = (crypto_type, column)
+					crypto_types.append(crypto_type)
 			
 			# Обрабатываем XMR (формат XMR-1, XMR-2, XMR-3)
 			for xmr in xmr_list:
 				xmr_number = xmr.get("xmr_number")
 				if xmr_number:
+					crypto_types.append(f"XMR-{xmr_number}")
+			
+			# Получаем все столбцы одним batch запросом
+			crypto_columns_dict = {}
+			if crypto_types:
+				crypto_columns_dict = await db.get_crypto_columns_batch(crypto_types)
+			
+			# Формируем cell_addresses на основе полученных столбцов
+			for crypto in crypto_list:
+				crypto_type = crypto.get("currency", "")
+				if crypto_type:
+					column = crypto_columns_dict.get(crypto_type)
+					if column:
+						cell_address = f"{column}{balance_row}"
+						crypto_balance_cell_addresses.append(cell_address)
+						crypto_mapping[cell_address] = (crypto_type, column)
+			
+			for xmr in xmr_list:
+				xmr_number = xmr.get("xmr_number")
+				if xmr_number:
 					crypto_type = f"XMR-{xmr_number}"
-					# Получаем столбец для XMR из базы данных
-					column = await db.get_crypto_column(crypto_type)
+					column = crypto_columns_dict.get(crypto_type)
 					if column:
 						cell_address = f"{column}{balance_row}"
 						crypto_balance_cell_addresses.append(cell_address)
@@ -2896,6 +2945,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				# Добавляем статистику пополнений после всех балансов (только для mode == "add")
 				if mode == "add" and card_balances:
 					replenishment_lines = []
+					# Собираем все card_id для batch запроса
+					card_ids_for_stats = []
+					card_name_to_id = {}  # {card_name: card_id}
 					for card_name, data in card_balances.items():
 						# Находим card_id для этой карты из card_mapping
 						card_id = None
@@ -2904,26 +2956,37 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 								card_id = mapped_card_id
 								break
 						
-						# Получаем статистику пополнений
 						if card_id:
-							try:
-								replenishment_stats = await db.get_card_replenishment_stats(card_id)
-								if replenishment_stats:
-									month_total = replenishment_stats.get("month_total", 0.0)
-									all_time_total = replenishment_stats.get("all_time_total", 0.0)
-									# Форматируем числа (убираем лишние нули после запятой)
-									month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
-									all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
-									
-									group_name = data.get("group_name", "")
-									if group_name:
-										replenishment_lines.append(f"  💳 {card_name} ({group_name}):")
-									else:
-										replenishment_lines.append(f"  💳 {card_name}:")
-									replenishment_lines.append(f"    💳❇️ Пополнение за месяц: <code>{month_str}</code>")
-									replenishment_lines.append(f"    💳✳️ Общее пополнение: <code>{all_time_str}</code>")
-							except Exception as e:
-								logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+							card_ids_for_stats.append(card_id)
+							card_name_to_id[card_name] = card_id
+					
+					# Получаем статистику пополнений одним batch запросом
+					replenishment_stats_dict = {}
+					if card_ids_for_stats:
+						try:
+							replenishment_stats_dict = await db.get_cards_replenishment_stats_batch(card_ids_for_stats)
+						except Exception as e:
+							logger.warning(f"⚠️ Ошибка batch получения статистики пополнений: {e}")
+					
+					# Формируем строки статистики
+					for card_name, data in card_balances.items():
+						card_id = card_name_to_id.get(card_name)
+						if card_id:
+							replenishment_stats = replenishment_stats_dict.get(card_id)
+							if replenishment_stats:
+								month_total = replenishment_stats.get("month_total", 0.0)
+								all_time_total = replenishment_stats.get("all_time_total", 0.0)
+								# Форматируем числа (убираем лишние нули после запятой)
+								month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
+								all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
+								
+								group_name = data.get("group_name", "")
+								if group_name:
+									replenishment_lines.append(f"  💳 {card_name} ({group_name}):")
+								else:
+									replenishment_lines.append(f"  💳 {card_name}:")
+								replenishment_lines.append(f"    💳❇️ Пополнение за месяц: <code>{month_str}</code>")
+								replenishment_lines.append(f"    💳✳️ Общее пополнение: <code>{all_time_str}</code>")
 					
 					# Добавляем статистику пополнений в отчет, если есть данные
 					if replenishment_lines:
@@ -5192,6 +5255,77 @@ async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]
 	except Exception as e:
 		logger.exception(f"❌ Ошибка генерации графика: {e}")
 		return None
+
+
+@admin_router.message(Command("cons"))
+async def admin_cons_command(msg: Message, state: FSMContext):
+	"""Обработчик команды /cons для отображения статистики расходов"""
+	# Очищаем состояние FSM, чтобы не мешало другим командам
+	await state.clear()
+	
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(msg.from_user.id, msg.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import read_card_balances_batch
+	
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await msg.answer("❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Получаем адрес ячейки расходов из БД
+	expenses_cell = await db.get_google_sheets_setting("expenses_cell", "BD420")
+	
+	if not expenses_cell:
+		expenses_cell = "BD420"
+	
+	# Отправляем сообщение о загрузке
+	loading_msg = await msg.answer("⏳ Загрузка статистики расходов...", reply_markup=simple_back_kb("admin:back"))
+	
+	try:
+		# Читаем значение из Google Sheets
+		expenses_dict = await read_card_balances_batch(
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			[expenses_cell],
+			settings.google_sheet_name
+		)
+		
+		expenses_value = expenses_dict.get(expenses_cell)
+		
+		if expenses_value is None or expenses_value == "":
+			expenses_value = "0"
+		
+		# Форматируем значение (убираем лишние нули после запятой, если есть)
+		try:
+			expenses_float = float(expenses_value.replace(",", "."))
+			if expenses_float == int(expenses_float):
+				expenses_display = str(int(expenses_float))
+			else:
+				expenses_display = f"{expenses_float:.2f}".rstrip('0').rstrip('.')
+		except (ValueError, AttributeError):
+			expenses_display = expenses_value
+		
+		# Формируем текст ответа
+		text = (
+			"📊 <b>Статистика расходов</b>\n\n"
+			f"💰 <b>Сумма расходов:</b> <code>{expenses_display}</code>\n\n"
+			f"📍 <i>Ячейка: {expenses_cell}</i>"
+		)
+		
+		await loading_msg.edit_text(text, reply_markup=simple_back_kb("admin:back"), parse_mode="HTML")
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка получения статистики расходов: {e}")
+		await loading_msg.edit_text(
+			f"❌ Ошибка получения статистики расходов: {e}",
+			reply_markup=simple_back_kb("admin:back")
+		)
 
 
 @admin_router.message(Command("stat_bk"))

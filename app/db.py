@@ -988,6 +988,36 @@ class Database:
 			"user_message": row[3],
 			"group_id": row[4] if len(row) > 4 else None,
 		}
+	
+	async def get_cards_by_ids_batch(self, card_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+		"""
+		Получает информацию о картах по списку ID одним запросом.
+		
+		Args:
+			card_ids: Список ID карт
+		
+		Returns:
+			Словарь {card_id: {"card_id": int, "name": str, "details": str, "user_message": str, "group_id": int}}
+		"""
+		assert self._db
+		if not card_ids:
+			return {}
+		
+		placeholders = ",".join("?" * len(card_ids))
+		query = f"SELECT id, name, details, user_message, group_id FROM cards WHERE id IN ({placeholders})"
+		cur = await self._db.execute(query, card_ids)
+		rows = await cur.fetchall()
+		result = {}
+		for row in rows:
+			card_id = row[0]
+			result[card_id] = {
+				"card_id": card_id,
+				"name": row[1],
+				"details": row[2],
+				"user_message": row[3],
+				"group_id": row[4] if len(row) > 4 else None,
+			}
+		return result
 
 	async def delete_user(self, user_id: int) -> None:
 		assert self._db
@@ -1145,6 +1175,29 @@ class Database:
 			return row[0]
 		_logger.debug(f"❌ Не найден адрес столбца для crypto_type='{crypto_type}'")
 		return None
+	
+	async def get_crypto_columns_batch(self, crypto_types: List[str]) -> Dict[str, str]:
+		"""
+		Получает адреса столбцов для списка криптовалют одним запросом.
+		
+		Args:
+			crypto_types: Список типов криптовалют
+		
+		Returns:
+			Словарь {crypto_type: column}
+		"""
+		assert self._db
+		if not crypto_types:
+			return {}
+		
+		placeholders = ",".join("?" * len(crypto_types))
+		query = f"SELECT crypto_type, column FROM crypto_columns WHERE crypto_type IN ({placeholders})"
+		cur = await self._db.execute(query, crypto_types)
+		rows = await cur.fetchall()
+		result = {}
+		for row in rows:
+			result[row[0]] = row[1]
+		return result
 
 	async def set_crypto_column(self, crypto_type: str, column: str) -> int:
 		"""
@@ -1223,6 +1276,33 @@ class Database:
 			}
 		_logger.debug(f"Cash column not found for cash_name='{cash_name}'")
 		return None
+	
+	async def get_cash_columns_batch(self, cash_names: List[str]) -> Dict[str, Dict[str, Any]]:
+		"""
+		Получает информацию о наличных для списка имен одним запросом.
+		
+		Args:
+			cash_names: Список названий наличных
+		
+		Returns:
+			Словарь {cash_name: {"column": str, "currency": str, "display_name": str}}
+		"""
+		assert self._db
+		if not cash_names:
+			return {}
+		
+		placeholders = ",".join("?" * len(cash_names))
+		query = f"SELECT cash_name, column, currency, display_name FROM cash_columns WHERE cash_name IN ({placeholders})"
+		cur = await self._db.execute(query, cash_names)
+		rows = await cur.fetchall()
+		result = {}
+		for row in rows:
+			result[row[0]] = {
+				"column": row[1],
+				"currency": row[2] or "RUB",
+				"display_name": row[3] or ""
+			}
+		return result
 
 	async def set_cash_column(self, cash_name: str, column: str, currency: Optional[str] = None, display_name: Optional[str] = None) -> int:
 		"""
@@ -1423,6 +1503,37 @@ class Database:
 			"name": row[1],
 			"created_at": row[2],
 		}
+	
+	async def get_cards_groups_batch(self, card_ids: List[int]) -> Dict[int, str]:
+		"""
+		Получает информацию о группах для списка карт одним запросом.
+		
+		Args:
+			card_ids: Список ID карт
+		
+		Returns:
+			Словарь {card_id: group_name}
+		"""
+		assert self._db
+		if not card_ids:
+			return {}
+		
+		placeholders = ",".join("?" * len(card_ids))
+		query = f"""
+			SELECT c.id, cg.name
+			FROM cards c
+			LEFT JOIN card_groups cg ON c.group_id = cg.id
+			WHERE c.id IN ({placeholders})
+		"""
+		cur = await self._db.execute(query, card_ids)
+		rows = await cur.fetchall()
+		result = {}
+		for row in rows:
+			card_id = row[0]
+			group_name = row[1] if row[1] else ""
+			if group_name:
+				result[card_id] = group_name
+		return result
 
 	async def set_card_group(self, card_id: int, group_id: Optional[int]) -> None:
 		"""
@@ -1715,6 +1826,9 @@ class Database:
 			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
 			)
+			await self._db.execute(
+				"INSERT INTO google_sheets_settings(key, value) VALUES('expenses_cell', 'BD420')"
+			)
 			# Добавляем настройки дней недели
 			day_settings = [
 				('add_monday_start', '5'), ('add_monday_max', '54'),
@@ -1783,6 +1897,10 @@ class Database:
 			if 'profit_column' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+				)
+			if 'expenses_cell' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('expenses_cell', 'BD420')"
 				)
 			
 			# Добавляем настройки дней недели, если их нет
@@ -2002,4 +2120,58 @@ class Database:
 			"month_total": float(month_total),
 			"all_time_total": float(all_time_total)
 		}
+	
+	async def get_cards_replenishment_stats_batch(self, card_ids: List[int]) -> Dict[int, Dict[str, float]]:
+		"""
+		Получает статистику пополнений для списка карт одним запросом.
+		
+		Args:
+			card_ids: Список ID карт
+		
+		Returns:
+			Словарь {card_id: {"month_total": float, "all_time_total": float}}
+		"""
+		assert self._db
+		from datetime import datetime
+		
+		if not card_ids:
+			return {}
+		
+		# Получаем начало текущего месяца
+		now = datetime.now()
+		month_start = datetime(now.year, now.month, 1)
+		month_start_ts = int(month_start.timestamp())
+		
+		placeholders = ",".join("?" * len(card_ids))
+		
+		# Суммы за текущий месяц
+		query_month = f"""
+			SELECT card_id, COALESCE(SUM(amount), 0)
+			FROM card_replenishments
+			WHERE card_id IN ({placeholders}) AND created_at >= ?
+			GROUP BY card_id
+		"""
+		cur_month = await self._db.execute(query_month, card_ids + [month_start_ts])
+		rows_month = await cur_month.fetchall()
+		month_stats = {row[0]: float(row[1]) for row in rows_month}
+		
+		# Суммы за все время
+		query_all = f"""
+			SELECT card_id, COALESCE(SUM(amount), 0)
+			FROM card_replenishments
+			WHERE card_id IN ({placeholders})
+			GROUP BY card_id
+		"""
+		cur_all = await self._db.execute(query_all, card_ids)
+		rows_all = await cur_all.fetchall()
+		all_time_stats = {row[0]: float(row[1]) for row in rows_all}
+		
+		# Объединяем результаты
+		result = {}
+		for card_id in card_ids:
+			result[card_id] = {
+				"month_total": month_stats.get(card_id, 0.0),
+				"all_time_total": all_time_stats.get(card_id, 0.0)
+			}
+		return result
 	
