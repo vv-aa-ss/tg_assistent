@@ -405,6 +405,7 @@ class DeleteMoveStates(StatesGroup):
 async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None):
 	"""
 	Безопасно редактирует текст сообщения, игнорируя ошибку "message is not modified".
+	Если сообщение не содержит текста (например, это фото), отправляет новое сообщение.
 	
 	Args:
 		message: Объект сообщения (Message или CallbackQuery.message)
@@ -415,8 +416,14 @@ async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None)
 	try:
 		await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
 	except Exception as e:
+		error_str = str(e).lower()
 		# Игнорируем ошибку "message is not modified", если содержимое не изменилось
-		if "message is not modified" not in str(e).lower():
+		if "message is not modified" in error_str:
+			return
+		# Если сообщение не содержит текста, отправляем новое сообщение
+		if "there is no text in the message to edit" in error_str or "no text" in error_str:
+			await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+		else:
 			raise
 
 
@@ -1261,7 +1268,7 @@ async def delete_rate_second_confirmation_no(cb: CallbackQuery, state: FSMContex
 @admin_router.callback_query(F.data == "admin:back")
 async def admin_back(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
-	await cb.message.edit_text("Админ-панель:", reply_markup=admin_menu_kb())
+	await safe_edit_text(cb.message, "Админ-панель:", reply_markup=admin_menu_kb())
 	await cb.answer()
 
 
@@ -5078,6 +5085,9 @@ async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]
 		# Инициализируем структуры данных
 		balance = {p: {b: 0.0 for b in banks} for p in people}
 		month = {p: {b: 0.0 for b in banks} for p in people}
+		# Храним карты для каждого сегмента столбца
+		cards_by_segment_bal = {p: {b: [] for b in banks} for p in people}
+		cards_by_segment_mon = {p: {b: [] for b in banks} for p in people}
 		
 		# Заполняем данные из graph_data
 		for person in people:
@@ -5086,8 +5096,14 @@ async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]
 			for card_name, card_data in graph_data[person].items():
 				bank = card_data.get("bank", "")
 				if bank in banks:
-					balance[person][bank] += card_data.get("balance", 0.0)
-					month[person][bank] += card_data.get("month", 0.0)
+					bal_val = card_data.get("balance", 0.0)
+					mon_val = card_data.get("month", 0.0)
+					balance[person][bank] += bal_val
+					month[person][bank] += mon_val
+					if bal_val > 0:
+						cards_by_segment_bal[person][bank].append((card_name, bal_val))
+					if mon_val > 0:
+						cards_by_segment_mon[person][bank].append((card_name, mon_val))
 		
 		# Создаем график
 		x = np.arange(len(people))
@@ -5099,6 +5115,12 @@ async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]
 		bottom_bal = np.zeros(len(people))
 		bottom_mon = np.zeros(len(people))
 		
+		# Вычисляем общую высоту каждого столбца (сумма всех банков для каждого человека)
+		total_heights_bal = np.array([sum(balance[p][b] for b in banks) for p in people])
+		total_heights_mon = np.array([sum(month[p][b] for b in banks) for p in people])
+		max_total_bal = max(total_heights_bal) if len(total_heights_bal) > 0 and max(total_heights_bal) > 0 else 1
+		max_total_mon = max(total_heights_mon) if len(total_heights_mon) > 0 and max(total_heights_mon) > 0 else 1
+		
 		# Цвета для банков (используем цветовую палитру matplotlib)
 		colors = plt.cm.tab20(np.linspace(0, 1, len(banks)))
 		
@@ -5109,13 +5131,53 @@ async def _generate_cards_chart(graph_data: Dict[str, Dict[str, Dict[str, Any]]]
 			ax.bar(x - w/2, yb, w, bottom=bottom_bal, label=b, color=colors[i])
 			ax.bar(x + w/2, ym, w, bottom=bottom_mon, color=colors[i], alpha=0.7)
 			
+			# Добавляем подписи карт на столбцы балансов
+			for j, person in enumerate(people):
+				if yb[j] > 0:
+					# Проверяем несколько условий:
+					# 1. Сегмент должен быть не менее 10% от высоты всего столбца этого человека
+					# 2. Сегмент должен быть не менее 1.5% от максимального столбца
+					segment_height_ratio = yb[j] / total_heights_bal[j] if total_heights_bal[j] > 0 else 0
+					segment_to_max_ratio = yb[j] / max_total_bal if max_total_bal > 0 else 0
+					
+					if segment_height_ratio >= 0.10 and segment_to_max_ratio >= 0.015:
+						cards = cards_by_segment_bal[person][b]
+						if cards:
+							# Вычисляем позицию для подписи (середина сегмента)
+							label_y = bottom_bal[j] + yb[j] / 2
+							# Формируем текст из названий карт
+							card_labels = [cn for cn, _ in cards]
+							label_text = "\n".join(card_labels) if len(card_labels) <= 2 else f"{len(card_labels)} карт"
+							ax.text(x[j] - w/2, label_y, label_text, 
+									ha='center', va='center', fontsize=8, 
+									color='white' if colors[i][:3].mean() < 0.5 else 'black',
+									weight='bold', rotation=0)
+			
+			# Добавляем подписи карт на столбцы оборотов за месяц
+			for j, person in enumerate(people):
+				if ym[j] > 0:
+					segment_height_ratio = ym[j] / total_heights_mon[j] if total_heights_mon[j] > 0 else 0
+					segment_to_max_ratio = ym[j] / max_total_mon if max_total_mon > 0 else 0
+					
+					if segment_height_ratio >= 0.10 and segment_to_max_ratio >= 0.015:
+						cards = cards_by_segment_mon[person][b]
+						if cards:
+							label_y = bottom_mon[j] + ym[j] / 2
+							card_labels = [cn for cn, _ in cards]
+							label_text = "\n".join(card_labels) if len(card_labels) <= 2 else f"{len(card_labels)} карт"
+							ax.text(x[j] + w/2, label_y, label_text,
+									ha='center', va='center', fontsize=6,
+									color='white' if colors[i][:3].mean() < 0.5 else 'black',
+									weight='bold', rotation=0)
+			
 			bottom_bal += yb
 			bottom_mon += ym
 		
 		ax.set_title("Балансы и оборот за месяц", fontsize=18)
 		ax.set_xticks(x)
 		ax.set_xticklabels(people, rotation=0)
-		ax.legend(ncols=2, fontsize=10, loc="upper left", bbox_to_anchor=(1.02, 1))
+		# Убираем легенду справа, так как карты подписаны на графике
+		# ax.legend(ncols=2, fontsize=10, loc="upper left", bbox_to_anchor=(1.02, 1))
 		ax.grid(axis="y", alpha=0.3)
 		
 		plt.tight_layout()
@@ -5243,8 +5305,11 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
 			all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
 			
+			# Для группы "РАШКА" показываем только первую букву названия карты
+			display_name = card_name[0] if group_name.upper() == "РАШКА" and card_name else card_name
+			
 			# Новый короткий формат: баланс(месяц;общее)
-			lines.append(f" ▶️ {card_name} ({column}{balance_row}) = {balance_str}({month_str};{all_time_str})")
+			lines.append(f" ▶️ {display_name} ({column}{balance_row}) = <i>{balance_str}</i>➖({month_str};{all_time_str})")
 			
 			# Сохраняем данные для графика (исключая группу "РАШКА")
 			if group_name.upper() != "РАШКА" and balance_str != "—":
