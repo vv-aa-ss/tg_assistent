@@ -14,6 +14,7 @@ class Settings(BaseModel):
 	google_sheet_id: str = ""
 	google_credentials_path: str = ""
 	google_sheet_name: str = ""  # Название листа в таблице (если пусто, используется первый лист)
+	log_level: str = "INFO"  # DEBUG/INFO/WARNING/ERROR
 
 	@field_validator("admin_ids", mode="before")
 	@classmethod
@@ -59,4 +60,5 @@ def get_settings() -> Settings:
 		google_sheet_id=os.getenv("GOOGLE_SHEET_ID", ""),
 		google_credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", ""),
 		google_sheet_name=os.getenv("GOOGLE_SHEET_NAME", ""),
+		log_level=os.getenv("LOG_LEVEL", "INFO"),
 	)

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from aiogram.filters import CommandStart, StateFilter, Command
@@ -18,14 +19,31 @@ from app.di import set_dependencies
 
 async def main() -> None:
 	os.makedirs("logs", exist_ok=True)
-	logging.basicConfig(
-		level=logging.DEBUG,  # Увеличиваем уровень для детального логирования
-		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-		handlers=[logging.FileHandler("logs/bot.log", encoding="utf-8")],
-	)
-	logger = logging.getLogger("app.start")
-
 	settings = get_settings()
+
+	# Настройка логирования (с ротацией, чтобы logs/bot.log не раздувался)
+	log_level_name = (settings.log_level or "INFO").upper()
+	log_level = getattr(logging, log_level_name, logging.INFO)
+
+	log_file_handler = RotatingFileHandler(
+		"logs/bot.log",
+		maxBytes=5 * 1024 * 1024,  # 5 MB
+		backupCount=5,
+		encoding="utf-8",
+	)
+
+	logging.basicConfig(
+		level=log_level,
+		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+		handlers=[log_file_handler],
+	)
+
+	# Приглушаем сторонние библиотеки (они часто шумят на DEBUG)
+	logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+	logging.getLogger("urllib3").setLevel(logging.WARNING)
+	logging.getLogger("gspread").setLevel(logging.WARNING)
+
+	logger = logging.getLogger("app.start")
 	logger.debug(f"Loaded settings: db={settings.database_path}, admins={settings.admin_ids}")
 	if not settings.telegram_bot_token:
 		raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Создайте .env с токеном.")
@@ -65,7 +83,8 @@ async def main() -> None:
 	class LoggingMiddleware:
 		async def __call__(self, handler, event, data):
 			if isinstance(event, Message):
-				logger.info(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', user_id={event.from_user.id if event.from_user else None}")
+				# Чтобы не раздувать лог, пишем это на DEBUG (и только если включен DEBUG)
+				logger.debug(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', user_id={event.from_user.id if event.from_user else None}")
 			return await handler(event, data)
 	
 	dp.message.middleware(LoggingMiddleware())
@@ -113,7 +132,7 @@ async def main() -> None:
 		~(F.text.startswith("/") if F.text else False)
 	)
 	async def register_user_on_any_message(message: Message):
-		logger.info(f"🟡 MAIN register_user_on_any_message: message_id={message.message_id}, text='{message.text}', user_id={message.from_user.id if message.from_user else None}")
+		logger.debug(f"🟡 MAIN register_user_on_any_message: message_id={message.message_id}, text='{message.text}', user_id={message.from_user.id if message.from_user else None}")
 		
 		from app.di import get_db
 		logger_msg = logging.getLogger("app.msg")
