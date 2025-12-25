@@ -3,6 +3,7 @@
 """
 import logging
 import asyncio
+import time
 import re
 from typing import Optional, Dict, Any, List
 import gspread
@@ -300,6 +301,7 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
 	"""
 	try:
+		t0 = time.perf_counter()
 		batch_size = 50
 		row = start_row
 		
@@ -315,86 +317,37 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 			range_str = f"{column}{row}:{column}{end_row}"
 			
 			try:
-				values = sheet.get(range_str)
-				# values - это список списков, например [['1'], ['2'], [], ...]
-				# Если весь диапазон пустой, API может вернуть None или пустой список
+				# ВАЖНО: pad_values=True гарантирует сохранение "пустых" строк внутри диапазона,
+				# чтобы не приходилось делать медленные acell() в цикле.
+				try:
+					values = sheet.get(range_str, pad_values=True)
+				except TypeError:
+					# fallback на старую сигнатуру gspread (на всякий случай)
+					values = sheet.get(range_str)
+
 				expected_rows = end_row - row + 1
 				received_rows = len(values) if values else 0
 				logger.debug(f"🔍 Прочитан диапазон {range_str}: ожидалось {expected_rows} строк, получено {received_rows} значений")
-				
-				# Детальное логирование всех полученных значений
-				if values:
-					logger.debug(f"📋 Детализация значений в диапазоне {range_str}:")
-					for i, cell_list in enumerate(values):
-						current_row = row + i
-						if cell_list and len(cell_list) > 0:
-							cell_value = cell_list[0]
-							cell_str = str(cell_value) if cell_value else ""
-							cell_length = len(cell_str)
-							logger.debug(f"  Строка {current_row}: значение='{cell_value}' (длина: {cell_length}, тип: {type(cell_value).__name__})")
-						else:
-							logger.debug(f"  Строка {current_row}: ПУСТАЯ (пустой список)")
-				else:
-					logger.debug(f"📋 Диапазон {range_str}: values = None или пустой список")
 				
 				# Если values пустой или None, значит все ячейки в диапазоне пустые
 				if not values or len(values) == 0:
 					logger.debug(f"✅ Диапазон {range_str} полностью пустой, возвращаем первую строку {row}")
 					return row
-				
-				# Если получено меньше значений, чем ожидалось, нужно проверить каждую строку по отдельности,
-				# так как Google Sheets API может вернуть только непустые значения, и они могут быть не в начале диапазона
-				if received_rows < expected_rows:
-					logger.debug(f"⚠️ Получено меньше значений ({received_rows} из {expected_rows}), проверяем каждую строку по отдельности")
-					# Проверяем каждую строку в диапазоне, начиная с start_row
-					for check_row in range(row, end_row + 1):
-						if max_row is not None and check_row > max_row:
-							logger.warning(f"⚠️ Достигнут лимит строки {max_row} в столбце {column}")
-							return max_row + 1
-						try:
-							check_value = sheet.acell(f"{column}{check_row}").value
-							if check_value is None or str(check_value).strip() == "":
-								logger.debug(f"✅ Найдена первая пустая ячейка в строке {check_row}")
-								return check_row
-							else:
-								logger.debug(f"  Строка {check_row}: заполнена значением '{check_value}' (длина: {len(str(check_value))})")
-						except Exception as e:
-							logger.warning(f"⚠️ Ошибка проверки строки {check_row}: {e}, считаем пустой")
-							return check_row
-					# Если все строки в диапазоне заполнены, продолжаем поиск дальше
-					first_empty_row = end_row + 1
-					if max_row is not None and first_empty_row > max_row:
-						logger.warning(f"⚠️ Первая пустая ячейка {first_empty_row} превышает лимит {max_row}")
-						return max_row + 1
-					logger.debug(f"✅ Все строки в диапазоне {range_str} заполнены, продолжаем поиск с строки {first_empty_row}")
-					row = first_empty_row
-					continue
-				
-				# Проверяем каждую полученную ячейку
-				for i, cell_list in enumerate(values):
+
+				# Проверяем каждую строку диапазона, сохраняя индексы (pad_values=True)
+				for i in range(expected_rows):
 					current_row = row + i
+					cell_list = values[i] if i < len(values) else []
 					
 					# Проверяем, не превысили ли лимит
 					if max_row is not None and current_row > max_row:
 						logger.warning(f"⚠️ Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
 						return max_row + 1  # Возвращаем значение больше лимита, чтобы показать, что места нет
 					
-					# Если список пустой или содержит пустую строку, значит ячейка пустая
-					if not cell_list or len(cell_list) == 0:
-						logger.debug(f"✅ Найдена пустая ячейка в строке {current_row} (пустой список)")
-						return current_row
-					
-					cell_value = cell_list[0] if cell_list else None
-					
-					# Проверяем, является ли значение пустым (None, пустая строка, или только пробелы)
-					if cell_value is None:
-						logger.info(f"✅ Найдена пустая ячейка в строке {current_row} (None)")
-						return current_row
-					
-					# Преобразуем в строку и убираем пробелы для проверки
-					cell_str = str(cell_value).strip() if cell_value else ""
+					cell_value = cell_list[0] if cell_list and len(cell_list) > 0 else None
+					cell_str = str(cell_value).strip() if cell_value is not None else ""
 					if cell_str == "":
-						logger.info(f"✅ Найдена пустая ячейка в строке {current_row} (пустая строка или пробелы)")
+						logger.debug(f"✅ Найдена пустая ячейка в строке {current_row}")
 						return current_row
 					
 					logger.debug(f"Строка {current_row}: значение='{cell_value}' (тип: {type(cell_value)})")
@@ -403,16 +356,12 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 				row = end_row + 1
 				
 			except Exception as e:
-				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной ячейке")
-				# Fallback: читаем по одной ячейке
+				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}")
 				if max_row is not None and row > max_row:
 					logger.warning(f"Достигнут лимит строки {max_row} в столбце {column}, начиная с {start_row}")
 					return max_row + 1
-				
-				cell_value = sheet.acell(f"{column}{row}").value
-				if cell_value is None or cell_value == "":
-					return row
-				row += 1
+				# если чтение сломалось, продолжаем со следующего batch (не делаем acell() в цикле)
+				row = end_row + 1
 		
 		logger.warning(f"Не найдена пустая ячейка в столбце {column}, начиная с {start_row} до {search_limit}")
 		return search_limit + 1
@@ -420,6 +369,10 @@ def _find_empty_cell_in_column(sheet: gspread.Worksheet, column: str, start_row:
 	except Exception as e:
 		logger.exception(f"Ошибка поиска пустой ячейки: {e}")
 		return start_row
+	finally:
+		dt = time.perf_counter() - t0
+		if dt > 1.0:
+			logger.info(f"⏱️ Поиск пустой ячейки {column}: заняло {dt:.2f}s (start_row={start_row}, max_row={max_row})")
 
 
 def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row: int, max_row: int) -> Optional[int]:
@@ -437,6 +390,7 @@ def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row
 		Номер первой пустой строки или None, если не найдена
 	"""
 	try:
+		t0 = time.perf_counter()
 		# Извлекаем начальный и конечный столбцы из диапазона (например, "A:BB" -> "A" и "BB")
 		parts = range_str.split(":")
 		if len(parts) != 2:
@@ -455,7 +409,10 @@ def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row
 			range_to_check = f"{start_col}{row}:{end_col}{end_row}"
 			
 			try:
-				values = sheet.get(range_to_check)
+				try:
+					values = sheet.get(range_to_check, pad_values=True)
+				except TypeError:
+					values = sheet.get(range_to_check)
 				logger.debug(f"🔍 Проверка диапазона {range_to_check}: получено {len(values) if values else 0} строк")
 				
 				# Если values пустой или None, значит все строки в диапазоне пустые
@@ -464,26 +421,21 @@ def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row
 					return row
 				
 				# Проверяем каждую строку в batch
-				for i in range(end_row - row + 1):
+				expected_rows = end_row - row + 1
+				for i in range(expected_rows):
 					current_row = row + i
 					
 					if current_row > max_row:
 						logger.warning(f"⚠️ Достигнут лимит строки {max_row}")
 						return None
 					
-					# Проверяем, есть ли данные для этой строки
-					# values - это список списков, где каждый внутренний список - это строка
-					# Если строка полностью пустая, то либо её нет в values, либо все ячейки пустые
+					row_data = values[i] if i < len(values) else []
 					row_is_empty = True
-					
-					if i < len(values):
-						row_data = values[i]
-						# Проверяем, есть ли хотя бы одна непустая ячейка в строке
-						if row_data:
-							for cell_value in row_data:
-								if cell_value is not None and str(cell_value).strip() != "":
-									row_is_empty = False
-									break
+					if row_data:
+						for cell_value in row_data:
+							if cell_value is not None and str(cell_value).strip() != "":
+								row_is_empty = False
+								break
 					
 					if row_is_empty:
 						logger.debug(f"✅ Найдена пустая строка {current_row} в диапазоне {range_str}")
@@ -493,31 +445,9 @@ def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row
 				row = end_row + 1
 				
 			except Exception as e:
-				logger.warning(f"⚠️ Ошибка чтения диапазона {range_to_check}: {e}, пробуем по одной строке")
-				# Fallback: проверяем по одной строке
-				for check_row in range(row, min(row + batch_size, max_row + 1)):
-					try:
-						row_range = f"{start_col}{check_row}:{end_col}{check_row}"
-						row_values = sheet.get(row_range)
-						
-						# Проверяем, пуста ли строка
-						is_empty = True
-						if row_values and len(row_values) > 0:
-							row_data = row_values[0] if row_values else []
-							if row_data:
-								for cell_value in row_data:
-									if cell_value is not None and str(cell_value).strip() != "":
-										is_empty = False
-										break
-						
-						if is_empty:
-							logger.debug(f"✅ Найдена пустая строка {check_row} в диапазоне {range_str}")
-							return check_row
-					except Exception as e2:
-						logger.warning(f"⚠️ Ошибка проверки строки {check_row}: {e2}")
-						continue
-				
-				row += batch_size
+				logger.warning(f"⚠️ Ошибка чтения диапазона {range_to_check}: {e}")
+				# без дорогостоящих построчных запросов просто продолжаем поиск дальше
+				row = end_row + 1
 		
 		logger.warning(f"⚠️ Не найдена пустая строка в диапазоне {range_str}, строки {start_row}-{max_row}")
 		return None
@@ -525,6 +455,10 @@ def _find_empty_row_in_range(sheet: gspread.Worksheet, range_str: str, start_row
 	except Exception as e:
 		logger.exception(f"❌ Ошибка поиска пустой строки в диапазоне {range_str}: {e}")
 		return None
+	finally:
+		dt = time.perf_counter() - t0
+		if dt > 1.0:
+			logger.info(f"⏱️ Поиск пустой строки в {range_str}: заняло {dt:.2f}s (start_row={start_row}, max_row={max_row})")
 
 
 def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: int = 5) -> int:
@@ -540,6 +474,7 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 		max_row: Максимальный номер строки для поиска (если None, ищет до start_row + 1000)
 	"""
 	try:
+		t0 = time.perf_counter()
 		batch_size = 50
 		row = start_row
 		
@@ -555,11 +490,16 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 			range_str = f"{column}{row}:{column}{end_row}"
 			
 			try:
-				values = sheet.get(range_str)
+				try:
+					values = sheet.get(range_str, pad_values=True)
+				except TypeError:
+					values = sheet.get(range_str)
 				# values - это список списков, например [['1'], ['2'], ['0'], ...]
-				
-				for i, cell_list in enumerate(values):
+
+				expected_rows = end_row - row + 1
+				for i in range(expected_rows):
 					current_row = row + i
+					cell_list = values[i] if values and i < len(values) else []
 					# Если список пустой или содержит пустую строку, значит ячейка пустая
 					if not cell_list or len(cell_list) == 0:
 						return current_row
@@ -584,11 +524,8 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 				
 			except Exception as e:
 				logger.warning(f"Ошибка чтения диапазона {range_str}: {e}, пробуем по одной ячейке")
-				# Fallback: читаем по одной ячейке
-				cell_value = sheet.acell(f"{column}{row}").value
-				if cell_value is None or cell_value == "" or (isinstance(cell_value, (int, float)) and float(cell_value) == 0):
-					return row
-				row += 1
+				# без дорогостоящих acell() просто продолжаем поиск дальше
+				row = end_row + 1
 		
 		logger.warning(f"Не найдена свободная строка в столбце {column}, начиная с {start_row} до {search_limit}")
 		return search_limit + 1
@@ -596,6 +533,10 @@ def _find_empty_row_in_column(sheet: gspread.Worksheet, column: str, start_row: 
 	except Exception as e:
 		logger.exception(f"Ошибка поиска свободной строки: {e}")
 		return start_row
+	finally:
+		dt = time.perf_counter() - t0
+		if dt > 1.0:
+			logger.info(f"⏱️ Поиск свободной строки в столбце {column}: заняло {dt:.2f}s (start_row={start_row})")
 
 
 async def get_card_column(card_name: str, user_name: Optional[str] = None) -> Optional[str]:

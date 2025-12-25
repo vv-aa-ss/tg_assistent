@@ -5400,6 +5400,28 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 			)
 		except Exception as e:
 			logger.exception(f"Ошибка batch чтения балансов: {e}")
+
+	# Получаем статистику пополнений для всех карт одним batch запросом (ускорение)
+	replenishment_stats_dict = {}
+	try:
+		card_ids_for_stats = []
+		for group_cards in cards_by_group.values():
+			for card_id, _card_name, _column, _cell_address in group_cards:
+				card_ids_for_stats.append(card_id)
+		for card_id, _card_name, _column, _cell_address in cards_without_group:
+			card_ids_for_stats.append(card_id)
+		# уникализируем, сохраняя порядок
+		seen_ids = set()
+		card_ids_for_stats_unique = []
+		for cid in card_ids_for_stats:
+			if cid not in seen_ids:
+				seen_ids.add(cid)
+				card_ids_for_stats_unique.append(cid)
+
+		if card_ids_for_stats_unique:
+			replenishment_stats_dict = await db.get_cards_replenishment_stats_batch(card_ids_for_stats_unique)
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка batch получения статистики пополнений для /stat_bk: {e}")
 	
 	# Формируем результат с группировкой (новый короткий формат)
 	lines = ["💳 Балансы карт"]
@@ -5424,16 +5446,10 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 			balance_value = float(balance) if balance and balance != "—" else 0.0
 			balance_str = balance if balance else "—"
 			
-			# Получаем статистику пополнений для карты
-			month_total = 0.0
-			all_time_total = 0.0
-			try:
-				replenishment_stats = await db.get_card_replenishment_stats(card_id)
-				if replenishment_stats:
-					month_total = replenishment_stats.get("month_total", 0.0)
-					all_time_total = replenishment_stats.get("all_time_total", 0.0)
-			except Exception as e:
-				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+			# Статистика пополнений (из batch)
+			stats = replenishment_stats_dict.get(card_id, {}) if replenishment_stats_dict else {}
+			month_total = stats.get("month_total", 0.0) if stats else 0.0
+			all_time_total = stats.get("all_time_total", 0.0) if stats else 0.0
 			
 			# Форматируем числа (убираем лишние нули после запятой)
 			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
@@ -5464,16 +5480,10 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 			balance_value = float(balance) if balance and balance != "—" else 0.0
 			balance_str = balance if balance else "—"
 			
-			# Получаем статистику пополнений для карты
-			month_total = 0.0
-			all_time_total = 0.0
-			try:
-				replenishment_stats = await db.get_card_replenishment_stats(card_id)
-				if replenishment_stats:
-					month_total = replenishment_stats.get("month_total", 0.0)
-					all_time_total = replenishment_stats.get("all_time_total", 0.0)
-			except Exception as e:
-				logger.warning(f"⚠️ Ошибка получения статистики пополнений для card_id={card_id}: {e}")
+			# Статистика пополнений (из batch)
+			stats = replenishment_stats_dict.get(card_id, {}) if replenishment_stats_dict else {}
+			month_total = stats.get("month_total", 0.0) if stats else 0.0
+			all_time_total = stats.get("all_time_total", 0.0) if stats else 0.0
 			
 			# Форматируем числа
 			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
