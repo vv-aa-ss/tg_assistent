@@ -1818,9 +1818,6 @@ class Database:
 				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '348')"
-			)
-			await self._db.execute(
 				"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
 			)
 			await self._db.execute(
@@ -1881,15 +1878,11 @@ class Database:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
 				)
-			if 'rate_start_row' not in existing_keys:
+			# Миграция: если есть старый ключ rate_last_row, удаляем его
+			if 'rate_last_row' in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '348')"
+					"DELETE FROM google_sheets_settings WHERE key = 'rate_last_row'"
 				)
-				# Миграция: если есть старый ключ rate_last_row, удаляем его
-				if 'rate_last_row' in existing_keys:
-					await self._db.execute(
-						"DELETE FROM google_sheets_settings WHERE key = 'rate_last_row'"
-					)
 			if 'balance_row' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"

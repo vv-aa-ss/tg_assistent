@@ -1849,9 +1849,9 @@ async def write_to_google_sheet_rate_mode(
 		rate_max_row_str = await db.get_google_sheets_setting("rate_max_row", "355")
 		rate_max_row = int(rate_max_row_str) if rate_max_row_str else 355
 		
-		# Получаем начальную строку для режима rate (по умолчанию 348)
-		rate_start_row_str = await db.get_google_sheets_setting("rate_start_row", "348")
-		rate_start_row = int(rate_start_row_str) if rate_start_row_str else 348
+		# Получаем начальную строку для режима rate (по умолчанию 407)
+		rate_start_row_str = await db.get_google_sheets_setting("rate_start_row", "407")
+		rate_start_row = int(rate_start_row_str) if rate_start_row_str else 407
 		
 		# Выполняем синхронную запись в отдельном потоке с retry логикой
 		max_retries = 5
