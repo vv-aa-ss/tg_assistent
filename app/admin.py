@@ -21,6 +21,7 @@ import os
 import tempfile
 from app.keyboards import (
 	admin_menu_kb,
+	admin_settings_kb,
 	cards_list_kb,
 	cards_groups_kb,
 	users_list_kb,
@@ -790,6 +791,66 @@ async def cmd_admin(message: Message, state: FSMContext):
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
 
 
+@admin_router.message(Command("user_add"))
+async def cmd_user_add(message: Message):
+	"""Добавить доступ пользователю по tg_id или @username."""
+	db = get_db()
+	args = (message.text or "").split(maxsplit=1)
+	if len(args) < 2 or not args[1].strip():
+		await message.answer("Использование: /user_add <tg_id|@username>")
+		return
+	value = args[1].strip()
+	tg_id: Optional[int] = None
+	username: Optional[str] = None
+	if value.lstrip("@").isdigit():
+		# tg_id
+		tg_id = int(value.lstrip("@"))
+	else:
+		username = value
+	await db.grant_user_access(tg_id=tg_id, username=username)
+	await message.answer("✅ Доступ выдан")
+
+
+@admin_router.message(Command("user_del"))
+async def cmd_user_del(message: Message):
+	"""Забрать доступ у пользователя по tg_id или @username."""
+	db = get_db()
+	args = (message.text or "").split(maxsplit=1)
+	if len(args) < 2 or not args[1].strip():
+		await message.answer("Использование: /user_del <tg_id|@username>")
+		return
+	value = args[1].strip()
+	tg_id: Optional[int] = None
+	username: Optional[str] = None
+	if value.lstrip("@").isdigit():
+		tg_id = int(value.lstrip("@"))
+	else:
+		username = value
+	await db.revoke_user_access(tg_id=tg_id, username=username)
+	await message.answer("✅ Доступ забран")
+
+
+@admin_router.message(Command("user_list"))
+async def cmd_user_list(message: Message):
+	"""Показать список пользователей, у которых есть доступ."""
+	db = get_db()
+	rows = await db.list_allowed_users()
+	if not rows:
+		await message.answer("Список доступа пуст.")
+		return
+	lines = ["<b>Пользователи с доступом:</b>"]
+	for r in rows[:100]:
+		label_parts = []
+		if r.get("tg_id") is not None:
+			label_parts.append(f"<code>{r['tg_id']}</code>")
+		if r.get("username"):
+			label_parts.append(f"@{escape(r['username'])}")
+		lines.append(" • " + " ".join(label_parts) if label_parts else " • (пусто)")
+	if len(rows) > 100:
+		lines.append(f"\n…и ещё {len(rows) - 100}")
+	await message.answer("\n".join(lines))
+
+
 
 
 @admin_router.message(Command("del"))
@@ -1290,6 +1351,154 @@ async def admin_back(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
 	await safe_edit_text(cb.message, "Админ-панель:", reply_markup=admin_menu_kb())
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "admin:settings")
+async def admin_settings(cb: CallbackQuery, state: FSMContext):
+	await state.clear()
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb())
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "settings:users")
+async def settings_users(cb: CallbackQuery):
+	"""Показывает последнюю заявку (последнего написавшего), у кого доступа ещё нет."""
+	db = get_db()
+	admin_ids = get_admin_ids()
+	pending = await db.get_latest_pending_user(exclude_tg_ids=admin_ids)
+	if not pending:
+		await safe_edit_text(cb.message, "Заявок нет.", reply_markup=simple_back_kb("admin:settings"))
+		await cb.answer()
+		return
+
+	parts = []
+	if pending.get("full_name"):
+		parts.append(pending["full_name"])
+	if pending.get("username"):
+		parts.append(f"@{pending['username']}")
+	if pending.get("tg_id"):
+		parts.append(f"(tg_id: {pending['tg_id']})")
+	label = " ".join(parts) if parts else f"ID {pending.get('user_id')}"
+
+	kb = InlineKeyboardBuilder()
+	kb.button(text=f"🆕 {label}", callback_data=f"settings:users:view:{pending['user_id']}")
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	await safe_edit_text(cb.message, "Новая заявка:", reply_markup=kb.as_markup())
+	await cb.answer()
+
+
+def _allow_deny_kb(user_id: int, allowed: bool) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	allow_text = "✅ Разрешить" if allowed else "Разрешить"
+	deny_text = "✅ Запретить" if not allowed else "Запретить"
+	kb.button(text=allow_text, callback_data=f"settings:users:set:{user_id}:allow")
+	kb.button(text=deny_text, callback_data=f"settings:users:set:{user_id}:deny")
+	kb.button(text="⬅️ Назад", callback_data="settings:users")
+	kb.adjust(2, 1)
+	return kb
+
+
+@admin_router.callback_query(F.data.startswith("settings:users:view:"))
+async def settings_users_view(cb: CallbackQuery):
+	db = get_db()
+	try:
+		user_id = int(cb.data.split(":")[-1])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	allowed = await db.is_allowed_user(user.get("tg_id"), user.get("username"))
+
+	parts = []
+	if user.get("full_name"):
+		parts.append(user["full_name"])
+	if user.get("username"):
+		parts.append(f"@{user['username']}")
+	if user.get("tg_id"):
+		parts.append(f"(tg_id: {user['tg_id']})")
+	title = " ".join(parts) if parts else f"ID {user_id}"
+
+	text = f"Заявка:\n{title}\n\nСтатус: {'✅ Разрешено' if allowed else '❌ Запрещено'}"
+	await safe_edit_text(cb.message, text, reply_markup=_allow_deny_kb(user_id, allowed).as_markup())
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:users:set:"))
+async def settings_users_set(cb: CallbackQuery, bot: Bot):
+	db = get_db()
+	parts = cb.data.split(":")
+	# Формат: settings:users:set:{user_id}:{allow|deny}
+	if len(parts) < 5:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	action = parts[4]
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	tg_id = user.get("tg_id")
+	username = user.get("username")
+	if tg_id is None and not username:
+		await cb.answer("Нет tg_id/username", show_alert=True)
+		return
+
+	was_allowed = await db.is_allowed_user(tg_id, username)
+	if action == "allow":
+		await db.grant_user_access(tg_id=tg_id, username=username)
+		allowed = True
+		if not was_allowed and tg_id is not None:
+			# Пользователь уже писал боту, значит можно отправить приветствие и меню
+			from app.keyboards import client_menu_kb
+			try:
+				# Выставляем команды пользователю, чтобы появилась кнопка "Меню"
+				from aiogram.types import BotCommand, BotCommandScopeChat
+				await bot.set_my_commands(
+					commands=[
+						BotCommand(command="start", description="Меню"),
+						BotCommand(command="buy", description="Купить"),
+						BotCommand(command="sell", description="Продать"),
+					],
+					scope=BotCommandScopeChat(chat_id=tg_id),
+				)
+				await bot.send_message(
+					chat_id=tg_id,
+					text="🔒 Сервис не поддерживает подозрительные или незаконные транзакции.\n"
+					     "🔞 Только для пользователей старше 18 лет.\n\n"
+					     "✅Выберите нужную функцию в меню ниже, чтобы начать работу.",
+					reply_markup=client_menu_kb()
+				)
+			except Exception as e:
+				logger.warning(f"Не удалось отправить сообщение пользователю tg_id={tg_id}: {e}")
+		alert = "Разрешено ✅"
+	elif action == "deny":
+		await db.revoke_user_access(tg_id=tg_id, username=username)
+		allowed = False
+		alert = "Запрещено ✅"
+	else:
+		await cb.answer("Неизвестное действие", show_alert=True)
+		return
+
+	# Обновляем интерфейс с галочкой
+	parts_title = []
+	if user.get("full_name"):
+		parts_title.append(user["full_name"])
+	if user.get("username"):
+		parts_title.append(f"@{user['username']}")
+	if user.get("tg_id"):
+		parts_title.append(f"(tg_id: {user['tg_id']})")
+	title = " ".join(parts_title) if parts_title else f"ID {user_id}"
+	text = f"Заявка:\n{title}\n\nСтатус: {'✅ Разрешено' if allowed else '❌ Запрещено'}"
+	await safe_edit_text(cb.message, text, reply_markup=_allow_deny_kb(user_id, allowed).as_markup())
+	await cb.answer(alert)
 
 
 def format_add_data_text(data: dict) -> str:
@@ -5598,6 +5807,8 @@ async def user_view(cb: CallbackQuery, bot: Bot):
 	if not user:
 		await cb.answer("Пользователь не найден", show_alert=True)
 		return
+
+	has_access = await db.is_allowed_user(user.get("tg_id"), user.get("username"))
 	
 	# Формируем информацию о пользователе для заголовка
 	parts_text = []
@@ -5626,6 +5837,8 @@ async def user_view(cb: CallbackQuery, bot: Bot):
 			text += f"\n• {card['card_name']}{group_name}"
 	else:
 		text += "\n\nНе привязан к карте"
+
+	text += f"\n\nДоступ к боту: {'✅ есть' if has_access else '❌ нет'}"
 	
 	text += "\n\nЧто хотите сделать?"
 	
@@ -5636,16 +5849,82 @@ async def user_view(cb: CallbackQuery, bot: Bot):
 		await bot.send_message(
 			chat_id=cb.message.chat.id,
 			text=text,
-			reply_markup=user_action_kb(user_id, back_to)
+			reply_markup=user_action_kb(user_id, back_to, has_access=has_access)
 		)
 	else:
 		# Если нет card_id - это возврат из списка карт, редактируем существующее сообщение
 		back_to = "admin:back"
 		await cb.message.edit_text(
 			text,
-			reply_markup=user_action_kb(user_id, back_to)
+			reply_markup=user_action_kb(user_id, back_to, has_access=has_access)
 		)
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("user:access:toggle:"))
+async def user_access_toggle(cb: CallbackQuery):
+	db = get_db()
+	try:
+		user_id = int(cb.data.split(":")[-1])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	tg_id = user.get("tg_id")
+	username = user.get("username")
+	if tg_id is None and not username:
+		await cb.answer("Нельзя выдать доступ: нет tg_id/username", show_alert=True)
+		return
+	has_access = await db.is_allowed_user(tg_id, username)
+	if has_access:
+		await db.revoke_user_access(tg_id=tg_id, username=username)
+		has_access = False
+		alert = "Доступ забран ✅"
+	else:
+		await db.grant_user_access(tg_id=tg_id, username=username)
+		has_access = True
+		alert = "Доступ выдан ✅"
+
+	# Обновляем сообщение: используем тот же рендер, что и в user_view (без card_id)
+	parts_text = []
+	if user.get("full_name"):
+		parts_text.append(user["full_name"])
+	if user.get("username"):
+		parts_text.append(f"@{user['username']}")
+	if user.get("tg_id"):
+		parts_text.append(f"(tg_id: {user['tg_id']})")
+	if not parts_text:
+		text = f"ID: {user.get('user_id')}"
+	else:
+		text = " ".join(parts_text)
+
+	# Перечитаем привязки
+	user_fresh = await db.get_user_by_id(user_id)
+	if user_fresh and user_fresh.get("cards"):
+		text += "\n\nТекущие привязки:"
+		for card in user_fresh["cards"]:
+			card_info = await db.get_card_by_id(card["card_id"])
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group(card_info["group_id"])
+				if group:
+					group_name = f" ({group['name']})"
+			text += f"\n• {card['card_name']}{group_name}"
+	else:
+		text += "\n\nНе привязан к карте"
+
+	text += f"\n\nДоступ к боту: {'✅ есть' if has_access else '❌ нет'}"
+	text += "\n\nЧто хотите сделать?"
+
+	try:
+		await cb.message.edit_text(text, reply_markup=user_action_kb(user_id, "admin:back", has_access=has_access))
+	except Exception:
+		# fallback: просто ответим алертом
+		pass
+	await cb.answer(alert)
 
 
 @admin_router.callback_query(F.data.startswith("user:back_to_requisites:"))
@@ -5927,13 +6206,16 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 			text += f"\n• {card['card_name']}{group_name}"
 	else:
 		text += "\n\nНе привязан к карте"
+
+	has_access = await db.is_allowed_user(user.get("tg_id"), user.get("username"))
+	text += f"\n\nДоступ к боту: {'✅ есть' if has_access else '❌ нет'}"
 	
 	text += f"\n\n{action_text}"
 	text += "\n\nЧто хотите сделать?"
 	# Возвращаем в меню пользователя после привязки/отвязки карты
 	await cb.message.edit_text(
 		text,
-		reply_markup=user_action_kb(user_id, "admin:back"),
+		reply_markup=user_action_kb(user_id, "admin:back", has_access=has_access),
 	)
 	await cb.answer(alert_text)
 

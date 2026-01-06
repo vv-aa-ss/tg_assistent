@@ -1,6 +1,11 @@
 
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+	InlineKeyboardMarkup,
+	InlineKeyboardButton,
+	ReplyKeyboardMarkup,
+	KeyboardButton,
+)
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Any
 
 
@@ -10,7 +15,70 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb.button(text="📇 Безнал", callback_data="admin:cards")
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
 	kb.button(text="₿ Крипта", callback_data="admin:crypto")
-	kb.adjust(2, 2)
+	kb.button(text="⚙️ Настройки", callback_data="admin:settings")
+	kb.adjust(2, 2, 1)
+	return kb.as_markup()
+
+
+def client_menu_kb() -> ReplyKeyboardMarkup:
+	"""Меню для пользователей из группы 'Пользователи' (широкие кнопки снизу, как на скрине)."""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="🚀 Купить"),
+				KeyboardButton(text="⚡ Продать"),
+			]
+		],
+		resize_keyboard=True,
+	)
+
+
+def buy_country_kb() -> ReplyKeyboardMarkup:
+	"""Подменю 'Купить': выбор страны."""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="🇷🇺 Россия"),
+				KeyboardButton(text="🇧🇾 Беларусь"),
+			],
+			[
+				KeyboardButton(text="⬅️ Назад"),
+			],
+		],
+		resize_keyboard=True,
+	)
+
+
+def buy_crypto_kb() -> ReplyKeyboardMarkup:
+	"""Подменю 'Купить': выбор криптовалюты после выбора страны."""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="Bitcoin - BTC"),
+			],
+			[
+				KeyboardButton(text="Litecoin - LTC"),
+			],
+			[
+				KeyboardButton(text="USDT - TRC20"),
+			],
+			[
+				KeyboardButton(text="Monero - XMR"),
+			],
+			[
+				KeyboardButton(text="⬅️ Назад"),
+			],
+		],
+		resize_keyboard=True,
+		one_time_keyboard=False,
+	)
+
+
+def admin_settings_kb() -> InlineKeyboardMarkup:
+	kb = InlineKeyboardBuilder()
+	kb.button(text="👥 Пользователи", callback_data="settings:users")
+	kb.button(text="⬅️ Назад", callback_data="admin:back")
+	kb.adjust(1)
 	return kb.as_markup()
 
 
@@ -259,9 +327,16 @@ def user_card_select_kb(
 	return kb.as_markup()
 
 
-def user_action_kb(user_id: int, back_to: str = "admin:users") -> InlineKeyboardMarkup:
+def user_action_kb(user_id: int, back_to: str = "admin:users", has_access: Optional[bool] = None) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="Карты", callback_data=f"user:bind:{user_id}")
+	if has_access is None:
+		kb.button(text="🔑 Доступ", callback_data=f"user:access:toggle:{user_id}")
+	else:
+		kb.button(
+			text=("🚫 Забрать доступ" if has_access else "✅ Дать доступ"),
+			callback_data=f"user:access:toggle:{user_id}",
+		)
 	kb.button(text="🗑️ Удалить пользователя", callback_data=f"user:delete:{user_id}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
 	kb.adjust(1)
