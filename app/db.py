@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS message_card (
 	card_id INTEGER NOT NULL,
 	FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
 );
+
+-- Список доступа к боту (вторая группа: "Пользователи")
+-- tg_id предпочтительнее (стабильный), username поддерживаем как запасной вариант.
+CREATE TABLE IF NOT EXISTS access_list (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	tg_id INTEGER UNIQUE,
+	username TEXT UNIQUE,
+	role TEXT NOT NULL,
+	created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_access_list_role ON access_list(role);
 """
 
 _logger = logging.getLogger("app.db")
@@ -83,6 +94,7 @@ class Database:
 		await self._ensure_menu_user()
 		await self._ensure_item_usage_log()
 		await self._ensure_card_replenishments()
+		await self._ensure_orders_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -665,6 +677,115 @@ class Database:
 		
 		_logger.warning(f"❌ get_user_by_full_name: пользователь с full_name '{full_name}' не найден")
 		return None
+
+	@staticmethod
+	def _normalize_username(username: Optional[str]) -> Optional[str]:
+		if not username:
+			return None
+		u = str(username).strip().lstrip("@")
+		return u.lower() if u else None
+
+	async def is_allowed_user(self, tg_id: Optional[int], username: Optional[str]) -> bool:
+		"""
+		Проверяет, добавлен ли пользователь в группу "Пользователи" (access_list.role='user').
+		"""
+		assert self._db
+		uname = self._normalize_username(username)
+		if tg_id is None and not uname:
+			return False
+		cur = await self._db.execute(
+			"SELECT 1 FROM access_list WHERE role = 'user' AND (tg_id = ? OR username = ?) LIMIT 1",
+			(tg_id, uname),
+		)
+		return (await cur.fetchone()) is not None
+
+	async def grant_user_access(self, tg_id: Optional[int] = None, username: Optional[str] = None) -> None:
+		"""
+		Добавляет пользователя в группу "Пользователи".
+		Можно передать tg_id и/или username.
+		"""
+		assert self._db
+		uname = self._normalize_username(username)
+		if tg_id is None and not uname:
+			return
+		# INSERT OR REPLACE удобен: если запись уже есть по tg_id/username — обновится.
+		await self._db.execute(
+			"INSERT OR REPLACE INTO access_list(tg_id, username, role) VALUES(?, ?, 'user')",
+			(tg_id, uname),
+		)
+		await self._db.commit()
+
+	async def revoke_user_access(self, tg_id: Optional[int] = None, username: Optional[str] = None) -> None:
+		"""
+		Удаляет пользователя из группы "Пользователи".
+		Можно передать tg_id и/или username.
+		"""
+		assert self._db
+		uname = self._normalize_username(username)
+		if tg_id is None and not uname:
+			return
+		if tg_id is not None and uname:
+			await self._db.execute("DELETE FROM access_list WHERE tg_id = ? OR username = ?", (tg_id, uname))
+		elif tg_id is not None:
+			await self._db.execute("DELETE FROM access_list WHERE tg_id = ?", (tg_id,))
+		else:
+			await self._db.execute("DELETE FROM access_list WHERE username = ?", (uname,))
+		await self._db.commit()
+
+	async def list_allowed_users(self) -> List[Dict[str, Any]]:
+		"""Возвращает список пользователей, у которых есть доступ (role='user')."""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT tg_id, username, created_at FROM access_list WHERE role = 'user' ORDER BY created_at DESC"
+		)
+		rows = await cur.fetchall()
+		return [{"tg_id": r[0], "username": r[1], "created_at": r[2]} for r in rows]
+
+	async def get_latest_pending_user(self, exclude_tg_ids: Optional[List[int]] = None) -> Optional[Dict[str, Any]]:
+		"""
+		Возвращает последнего пользователя, написавшего боту, который:
+		- не админ (исключается через exclude_tg_ids),
+		- не имеет доступа (нет записи access_list.role='user'),
+		- имеет tg_id и last_interaction_at.
+		"""
+		assert self._db
+		exclude_tg_ids = [int(x) for x in (exclude_tg_ids or []) if x is not None]
+
+		where_exclude = ""
+		params: List[Any] = []
+		if exclude_tg_ids:
+			where_exclude = " AND u.tg_id NOT IN (" + ",".join("?" * len(exclude_tg_ids)) + ")"
+			params.extend(exclude_tg_ids)
+
+		query = f"""
+			SELECT u.id, u.tg_id, u.username, u.full_name, u.last_interaction_at
+			FROM users u
+			LEFT JOIN access_list a
+				ON a.role = 'user'
+				AND (
+					a.tg_id = u.tg_id
+					OR (a.username IS NOT NULL AND a.username = LOWER(REPLACE(COALESCE(u.username,''), '@', '')))
+				)
+			WHERE
+				u.tg_id IS NOT NULL
+				AND u.tg_id != -1
+				AND u.last_interaction_at IS NOT NULL
+				AND a.id IS NULL
+				{where_exclude}
+			ORDER BY u.last_interaction_at DESC
+			LIMIT 1
+		"""
+		cur = await self._db.execute(query, params)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"user_id": row[0],
+			"tg_id": row[1],
+			"username": row[2],
+			"full_name": row[3],
+			"last_interaction_at": row[4],
+		}
 
 	async def find_similar_users_by_name(self, name: str, limit: int = 10) -> List[Dict[str, Any]]:
 		"""
@@ -1854,6 +1975,28 @@ class Database:
 			cur = await self._db.execute("SELECT key FROM google_sheets_settings")
 			existing_keys = {row[0] for row in await cur.fetchall()}
 			
+			# Добавляем коэффициенты для расчета стоимости (если их нет)
+			if 'multiplier_byn' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('multiplier_byn', '1.15')"
+				)
+			if 'multiplier_rub' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('multiplier_rub', '1.15')"
+				)
+			
+			# Добавляем проценты наценки (если их нет)
+			# markup_percent_small - для заказов < 100 USD (по умолчанию 20%)
+			# markup_percent_large - для заказов >= 100 USD (по умолчанию 15%)
+			if 'markup_percent_small' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('markup_percent_small', '20')"
+				)
+			if 'markup_percent_large' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO google_sheets_settings(key, value) VALUES('markup_percent_large', '15')"
+				)
+			
 			if 'delete_range' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO google_sheets_settings(key, value) VALUES('delete_range', 'A:BB')"
@@ -2167,4 +2310,162 @@ class Database:
 				"all_time_total": all_time_stats.get(card_id, 0.0)
 			}
 		return result
+	
+	async def _ensure_orders_table(self) -> None:
+		"""Создает таблицу для хранения заявок на покупку"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='orders'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE orders (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					order_number INTEGER NOT NULL,
+					user_tg_id INTEGER NOT NULL,
+					user_name TEXT,
+					user_username TEXT,
+					crypto_type TEXT NOT NULL,
+					crypto_display TEXT NOT NULL,
+					amount REAL NOT NULL,
+					wallet_address TEXT NOT NULL,
+					amount_currency REAL NOT NULL,
+					currency_symbol TEXT NOT NULL,
+					delivery_method TEXT,
+					proof_photo_file_id TEXT,
+					proof_document_file_id TEXT,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					completed_at INTEGER,
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_orders_user_tg_id ON orders(user_tg_id)"
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)"
+			)
+			_logger.debug("Created table orders")
+		else:
+			# Проверяем наличие полей и добавляем их, если нужно
+			cur = await self._db.execute("PRAGMA table_info(orders)")
+			columns = [row[1] for row in await cur.fetchall()]
+			if 'order_message_id' not in columns:
+				await self._db.execute("ALTER TABLE orders ADD COLUMN order_message_id INTEGER")
+				_logger.debug("Added column order_message_id to orders table")
+			if 'proof_request_message_id' not in columns:
+				await self._db.execute("ALTER TABLE orders ADD COLUMN proof_request_message_id INTEGER")
+				_logger.debug("Added column proof_request_message_id to orders table")
+			if 'proof_confirmation_message_id' not in columns:
+				await self._db.execute("ALTER TABLE orders ADD COLUMN proof_confirmation_message_id INTEGER")
+				_logger.debug("Added column proof_confirmation_message_id to orders table")
+	
+	async def create_order(
+		self,
+		user_tg_id: int,
+		user_name: str,
+		user_username: str,
+		crypto_type: str,
+		crypto_display: str,
+		amount: float,
+		wallet_address: str,
+		amount_currency: float,
+		currency_symbol: str,
+		delivery_method: str,
+		proof_photo_file_id: str = None,
+		proof_document_file_id: str = None,
+		order_message_id: int = None,
+		proof_request_message_id: int = None,
+		proof_confirmation_message_id: int = None,
+	) -> int:
+		"""
+		Создает новую заявку и возвращает её ID.
+		Номер заявки - это количество заявок за сегодня + 1.
+		"""
+		assert self._db
+		
+		# Получаем количество заявок за сегодня
+		today_start = int(time.time()) - (int(time.time()) % 86400)  # Начало дня (00:00:00)
+		cur = await self._db.execute(
+			"SELECT COUNT(*) FROM orders WHERE created_at >= ?",
+			(today_start,)
+		)
+		today_orders_count = (await cur.fetchone())[0]
+		order_number = today_orders_count + 1
+		
+		# Создаем заявку
+		cur = await self._db.execute(
+			"""
+			INSERT INTO orders (
+				order_number, user_tg_id, user_name, user_username,
+				crypto_type, crypto_display, amount, wallet_address,
+				amount_currency, currency_symbol, delivery_method,
+				proof_photo_file_id, proof_document_file_id, order_message_id,
+				proof_request_message_id, proof_confirmation_message_id
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			""",
+			(
+				order_number, user_tg_id, user_name, user_username,
+				crypto_type, crypto_display, amount, wallet_address,
+				amount_currency, currency_symbol, delivery_method,
+				proof_photo_file_id, proof_document_file_id, order_message_id,
+				proof_request_message_id, proof_confirmation_message_id
+			)
+		)
+		await self._db.commit()
+		order_id = cur.lastrowid
+		_logger.debug(f"Created order: id={order_id}, order_number={order_number}, user_tg_id={user_tg_id}")
+		return order_id
+	
+	async def get_order_by_id(self, order_id: int) -> Optional[Dict[str, Any]]:
+		"""Получает заявку по ID"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id, order_number, user_tg_id, user_name, user_username,
+			       crypto_type, crypto_display, amount, wallet_address,
+			       amount_currency, currency_symbol, delivery_method,
+			       proof_photo_file_id, proof_document_file_id,
+			       created_at, completed_at, order_message_id,
+			       proof_request_message_id, proof_confirmation_message_id
+			FROM orders WHERE id = ?
+			""",
+			(order_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"id": row[0],
+			"order_number": row[1],
+			"user_tg_id": row[2],
+			"user_name": row[3],
+			"user_username": row[4],
+			"crypto_type": row[5],
+			"crypto_display": row[6],
+			"amount": row[7],
+			"wallet_address": row[8],
+			"amount_currency": row[9],
+			"currency_symbol": row[10],
+			"delivery_method": row[11],
+			"proof_photo_file_id": row[12],
+			"proof_document_file_id": row[13],
+			"created_at": row[14],
+			"completed_at": row[15],
+			"order_message_id": row[16] if len(row) > 16 else None,
+			"proof_request_message_id": row[17] if len(row) > 17 else None,
+			"proof_confirmation_message_id": row[18] if len(row) > 18 else None,
+		}
+	
+	async def complete_order(self, order_id: int) -> bool:
+		"""Отмечает заявку как выполненную"""
+		assert self._db
+		cur = await self._db.execute(
+			"UPDATE orders SET completed_at = ? WHERE id = ?",
+			(int(time.time()), order_id)
+		)
+		await self._db.commit()
+		return cur.rowcount > 0
 	

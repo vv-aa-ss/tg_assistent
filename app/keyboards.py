@@ -1076,3 +1076,84 @@ def add_data_xmr_select_kb(mode: str = "add", back_to: str = "add_data:back") ->
 	
 	kb.adjust(3, 1)
 	return kb.as_markup()
+
+
+def multipliers_settings_kb(multiplier_byn: float, multiplier_rub: float) -> InlineKeyboardMarkup:
+	"""Клавиатура для настройки коэффициентов"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text=f"🇧🇾 BYN: {multiplier_byn}", callback_data="settings:multiplier:byn")
+	kb.button(text=f"🇷🇺 RUB: {multiplier_rub}", callback_data="settings:multiplier:rub")
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def markup_percents_settings_kb(percent_small: float, percent_large: float) -> InlineKeyboardMarkup:
+	"""Клавиатура для настройки процентов наценки"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text=f"📉 Меньше $100: {percent_small}%", callback_data="settings:markup_percent:small")
+	kb.button(text=f"📈 Больше $100: {percent_large}%", callback_data="settings:markup_percent:large")
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def buy_confirmation_kb() -> ReplyKeyboardMarkup:
+	"""Клавиатура для подтверждения покупки криптовалюты"""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="✅ Согласен"),
+				KeyboardButton(text="❌ Не согласен"),
+			]
+		],
+		resize_keyboard=True,
+	)
+
+
+def buy_delivery_method_kb(currency_symbol: str, is_byn: bool) -> ReplyKeyboardMarkup:
+	"""Клавиатура для выбора способа доставки"""
+	keyboard = [
+		[
+			KeyboardButton(text=f"VIP (1-25 минут) (+4 {currency_symbol})" if is_byn else f"VIP (1-25 минут) (+1000 {currency_symbol})"),
+		],
+		[
+			KeyboardButton(text="Обычная (25-80 минут)"),
+		],
+		[
+			KeyboardButton(text="⬅️ Назад"),
+		],
+	]
+	return ReplyKeyboardMarkup(
+		keyboard=keyboard,
+		resize_keyboard=True,
+	)
+
+
+def buy_payment_confirmed_kb() -> ReplyKeyboardMarkup:
+	"""Клавиатура с кнопкой подтверждения оплаты"""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="ОПЛАТА СОВЕРШЕНА"),
+			]
+		],
+		resize_keyboard=True,
+	)
+
+
+def order_action_kb(order_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для действий с заявкой админом."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="✅ Выполнил", callback_data=f"order:completed:{order_id}")
+	kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}")
+	kb.adjust(2)
+	return kb.as_markup()
+
+
+def delete_message_kb() -> InlineKeyboardMarkup:
+	"""Клавиатура с кнопкой 'Удалить' для удаления сообщения"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="🗑️ Удалить", callback_data="delete_message")
+	kb.adjust(1)
+	return kb.as_markup()

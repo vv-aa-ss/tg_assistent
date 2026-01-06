@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import os
+import re
+import time
 from logging.handlers import RotatingFileHandler
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -15,13 +17,19 @@ from aiogram import F
 from app.config import get_settings
 from app.db import Database
 from app.admin import admin_router, is_admin
-from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb
+from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb
+from app.di import get_admin_ids
 from app.di import set_dependencies
 
 
 class BuyStates(StatesGroup):
 	"""Состояния для процесса покупки криптовалюты"""
 	waiting_crypto_amount = State()  # Ожидание ввода суммы
+	waiting_confirmation = State()  # Ожидание подтверждения сделки
+	waiting_wallet_address = State()  # Ожидание ввода адреса кошелька
+	waiting_delivery_method = State()  # Ожидание выбора способа доставки
+	waiting_payment_confirmation = State()  # Ожидание подтверждения оплаты
+	waiting_payment_proof = State()  # Ожидание скриншота/чека оплаты
 
 
 async def delete_previous_bot_message(bot: Bot, chat_id: int, message_id: int | None):
@@ -55,6 +63,60 @@ async def delete_user_message(message: Message):
 	except Exception as e:
 		# Игнорируем ошибки удаления (сообщение слишком старое, уже удалено и т.д.)
 		pass
+
+
+def validate_wallet_address(address: str, crypto_type: str) -> bool:
+	"""
+	Валидирует адрес кошелька для указанной криптовалюты.
+	
+	Args:
+		address: Адрес кошелька
+		crypto_type: Тип криптовалюты (BTC, LTC, USDT, XMR)
+	
+	Returns:
+		True если адрес валиден, False иначе
+	"""
+	address = address.strip()
+	
+	if crypto_type == "BTC":
+		# Bitcoin адреса: начинаются с 1, 3, или bc1, длина 26-62 символа
+		# Legacy (P2PKH): начинается с 1, 26-35 символов
+		# P2SH: начинается с 3, 26-35 символов
+		# Bech32 (P2WPKH/P2WSH): начинается с bc1, 14-74 символа
+		if re.match(r'^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$', address):
+			return True
+		if re.match(r'^bc1[a-z0-9]{13,62}$', address, re.IGNORECASE):
+			return True
+		return False
+	
+	elif crypto_type == "LTC":
+		# Litecoin адреса: начинаются с L, M, или ltc1, длина 26-62 символа
+		# Legacy: начинается с L, 26-34 символа
+		# P2SH: начинается с M, 26-34 символа
+		# Bech32: начинается с ltc1, 14-62 символа
+		if re.match(r'^[LM][a-km-zA-HJ-NP-Z1-9]{25,33}$', address):
+			return True
+		if re.match(r'^ltc1[a-z0-9]{13,62}$', address, re.IGNORECASE):
+			return True
+		return False
+	
+	elif crypto_type == "USDT":
+		# USDT TRC20 использует адреса Tron (TRX)
+		# Tron адреса: начинаются с T, 34 символа
+		if re.match(r'^T[A-Za-z1-9]{33}$', address):
+			return True
+		return False
+	
+	elif crypto_type == "XMR":
+		# Monero адреса: начинаются с 4, 95 символов (стандартные) или 106 (интегрированные)
+		# Формат: 95 символов (стандартный) или 106 (интегрированный)
+		if re.match(r'^4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}$', address):
+			return True
+		if re.match(r'^4[0-9AB][1-9A-HJ-NP-Za-km-z]{104}$', address):
+			return True
+		return False
+	
+	return False
 
 
 async def send_and_save_message(message: Message, text: str, reply_markup=None, state: FSMContext = None):
@@ -325,14 +387,18 @@ async def main() -> None:
 			return
 		# Удаляем сообщение пользователя
 		await delete_user_message(message)
+		# Сохраняем выбранную страну
+		selected_country = "RUB" if message.text == "🇷🇺 Россия" else "BYN"
 		# Сохраняем last_bot_message_id перед очисткой состояния
 		data = await state.get_data()
 		last_bot_message_id = data.get("last_bot_message_id")
 		# Очищаем предыдущее состояние при выборе страны
 		await state.clear()
-		# Восстанавливаем last_bot_message_id после очистки
+		# Восстанавливаем last_bot_message_id и сохраняем выбранную страну
 		if last_bot_message_id:
-			await state.update_data(last_bot_message_id=last_bot_message_id)
+			await state.update_data(last_bot_message_id=last_bot_message_id, selected_country=selected_country)
+		else:
+			await state.update_data(selected_country=selected_country)
 		from app.keyboards import buy_crypto_kb
 		await send_and_save_message(message, "Выберите криптовалюту:", reply_markup=buy_crypto_kb(), state=state)
 
@@ -388,18 +454,703 @@ async def main() -> None:
 		
 		# Получаем данные о выбранной криптовалюте
 		data = await state.get_data()
-		crypto_name = data.get("selected_crypto", "криптовалюте")
-		crypto_display = data.get("crypto_display", "криптовалюте")
+		crypto_name = data.get("selected_crypto", "")
+		crypto_display = data.get("crypto_display", "")
+		
+		# Валидация и обработка введенной суммы
+		amount_str = message.text.strip().replace(",", ".")  # Заменяем запятую на точку
+		
+		try:
+			amount = float(amount_str)
+			if amount <= 0:
+				await send_and_save_message(message, "❌ Сумма должна быть больше нуля. Введите корректную сумму:", state=state)
+				return
+		except ValueError:
+			await send_and_save_message(message, "❌ Неверный формат суммы. Введите число (например: 0.008 или 100):", state=state)
+			return
+		
+		# Определяем тип криптовалюты для получения курса
+		crypto_type = None
+		if "BTC" in crypto_name or "Bitcoin" in crypto_name:
+			crypto_type = "BTC"
+			crypto_symbol = "₿"
+		elif "LTC" in crypto_name or "Litecoin" in crypto_name:
+			crypto_type = "LTC"
+			crypto_symbol = "Ł"
+		elif "USDT" in crypto_name:
+			crypto_type = "USDT"
+			crypto_symbol = "₮"
+		elif "XMR" in crypto_name or "Monero" in crypto_name:
+			crypto_type = "XMR"
+			crypto_symbol = "ɱ"
+		
+		# Получаем курс криптовалюты в USD
+		from app.google_sheets import get_btc_price_usd, get_ltc_price_usd, get_xmr_price_usd
+		
+		crypto_price_usd = None
+		if crypto_type == "BTC":
+			crypto_price_usd = await get_btc_price_usd()
+		elif crypto_type == "LTC":
+			crypto_price_usd = await get_ltc_price_usd()
+		elif crypto_type == "USDT":
+			crypto_price_usd = 1.0  # USDT равен 1 USD
+		elif crypto_type == "XMR":
+			crypto_price_usd = await get_xmr_price_usd()
+		
+		if crypto_price_usd is None:
+			await send_and_save_message(message, "❌ Не удалось получить курс криптовалюты. Попробуйте позже.", state=state)
+			return
+		
+		# Получаем выбранную страну из состояния
+		selected_country = data.get("selected_country", "RUB")
+		
+		# Получаем курс USD к валюте (сколько единиц валюты за 1 USD)
+		# Формула: (цена_монеты_в_USD + процент) × количество_монет × курс_валюты_к_USD
+		if selected_country == "BYN":
+			# Курс USD к BYN (1 USD = 3.00 BYN)
+			usd_to_currency_rate = 3.0  # Можно получать из API
+			currency_symbol = "Br"
+		else:  # RUB
+			# Курс USD к RUB (1 USD = ~95 RUB)
+			usd_to_currency_rate = 95.0  # Можно получать из API
+			currency_symbol = "₽"
+		
+		# Рассчитываем сумму заказа в USD для определения процента наценки
+		amount_usd = amount * crypto_price_usd
+		
+		# Определяем процент наценки в зависимости от суммы заказа
+		# Если сумма < 100 USD: используем markup_percent_small (по умолчанию 20%)
+		# Если сумма >= 100 USD: используем markup_percent_large (по умолчанию 15%)
+		if amount_usd < 100:
+			markup_percent_key = "markup_percent_small"
+			default_markup = 20
+		else:
+			markup_percent_key = "markup_percent_large"
+			default_markup = 15
+		
+		# Получаем процент наценки из БД
+		markup_percent_str = await db_local.get_google_sheets_setting(markup_percent_key, str(default_markup))
+		try:
+			markup_percent = float(markup_percent_str) if markup_percent_str else default_markup
+		except (ValueError, TypeError):
+			markup_percent = default_markup
+		
+		# Рассчитываем цену монеты с наценкой: цена_USD × (1 + процент/100)
+		crypto_price_with_markup = crypto_price_usd * (1 + markup_percent / 100)
+		
+		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты
+		amount_currency = crypto_price_with_markup * amount * usd_to_currency_rate
+		
+		# Логируем расчет для отладки
+		logger = logging.getLogger("app.main")
+		logger.debug(f"Расчет: ({crypto_price_usd} USD + {markup_percent}%) × {amount} {crypto_type} × {usd_to_currency_rate} {currency_symbol}/USD = {amount_currency} {currency_symbol}")
+		
+		# Сохраняем данные о сделке
+		await state.update_data(
+			amount=amount,
+			amount_currency=amount_currency,
+			crypto_type=crypto_type,
+			crypto_symbol=crypto_symbol,
+			crypto_price_usd=crypto_price_usd,
+			crypto_price_with_markup=crypto_price_with_markup,
+			markup_percent=markup_percent,
+			selected_country=selected_country,
+			currency_symbol=currency_symbol,
+			usd_to_currency_rate=usd_to_currency_rate
+		)
+		
+		# Формируем сообщение с расчетом
+		# Форматируем сумму с правильным количеством знаков после запятой
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		confirmation_text = (
+			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+		)
+		
+		# Показываем сообщение с кнопками подтверждения
+		from app.keyboards import buy_confirmation_kb
+		await state.set_state(BuyStates.waiting_confirmation)
+		# Для inline-клавиатуры используем обычный answer
+		bot = message.bot
+		chat_id = message.chat.id
+		
+		# Получаем ID предыдущего сообщения из состояния
+		previous_message_id = None
+		if state:
+			data = await state.get_data()
+			previous_message_id = data.get("last_bot_message_id")
+		
+		# Удаляем предыдущее сообщение
+		if previous_message_id:
+			try:
+				await bot.delete_message(chat_id=chat_id, message_id=previous_message_id)
+			except:
+				pass
+		
+		# Отправляем новое сообщение с inline-клавиатурой
+		sent_message = await bot.send_message(
+			chat_id=chat_id,
+			text=confirmation_text,
+			reply_markup=buy_confirmation_kb()
+		)
+		
+		# Сохраняем ID нового сообщения
+		if state:
+			await state.update_data(last_bot_message_id=sent_message.message_id)
+
+	@dp.message(BuyStates.waiting_confirmation, F.text == "✅ Согласен")
+	async def on_buy_confirm_yes(message: Message, state: FSMContext):
+		"""Обработчик подтверждения покупки"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем данные о заказе
+		data = await state.get_data()
+		amount = data.get("amount", 0)
+		amount_currency = data.get("amount_currency", 0)
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
+		currency_symbol = data.get("currency_symbol", "")
+		selected_country = data.get("selected_country", "RUB")
+		
+		# Форматируем суммы
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Показываем уведомление о заказе
+		order_notification = (
+			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+		)
+		
+		# Сохраняем ID предыдущего сообщения для удаления
 		last_bot_message_id = data.get("last_bot_message_id")
 		
-		# Здесь можно добавить логику обработки введенной суммы
-		amount = message.text.strip()
-		await send_and_save_message(message, f"Вы ввели сумму: {amount} для {crypto_display}", state=state)
+		# Переходим в состояние ожидания адреса кошелька
+		await state.set_state(BuyStates.waiting_wallet_address)
 		
-		# Очищаем состояние после обработки, но сохраняем last_bot_message_id
+		# Объединяем уведомление о заказе и запрос адреса в одно сообщение
+		wallet_request = f"Введите адрес кошелька для {crypto_display}:"
+		combined_message = f"{order_notification}\n\n{wallet_request}"
+		await send_and_save_message(message, combined_message, state=state)
+	
+	@dp.message(BuyStates.waiting_confirmation, F.text == "❌ Не согласен")
+	async def on_buy_confirm_no(message: Message, state: FSMContext):
+		"""Обработчик отказа от покупки"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Возвращаемся в главное меню
+		from app.keyboards import client_menu_kb
 		await state.clear()
-		if last_bot_message_id:
-			await state.update_data(last_bot_message_id=last_bot_message_id)
+		await send_and_save_message(message, "Выберите действие:", reply_markup=client_menu_kb(), state=state)
+	
+	@dp.message(BuyStates.waiting_wallet_address)
+	async def on_wallet_address_entered(message: Message, state: FSMContext):
+		"""Обработчик ввода адреса кошелька"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем данные о заказе
+		data = await state.get_data()
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
+		amount = data.get("amount", 0)
+		amount_currency = data.get("amount_currency", 0)
+		currency_symbol = data.get("currency_symbol", "")
+		selected_country = data.get("selected_country", "RUB")
+		
+		# Валидируем адрес кошелька
+		wallet_address = message.text.strip()
+		if not validate_wallet_address(wallet_address, crypto_type):
+			await send_and_save_message(
+				message,
+				f"❌ Неверный формат адреса кошелька для {crypto_display}. Пожалуйста, введите корректный адрес:",
+				state=state
+			)
+			return
+		
+		# Сохраняем адрес кошелька
+		await state.update_data(wallet_address=wallet_address)
+		
+		# Форматируем суммы для отображения
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Формируем сообщение с информацией о заказе
+		order_info = (
+			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}\n\n"
+			f"Выберите способ доставки:"
+		)
+		
+		# Показываем клавиатуру выбора способа доставки
+		is_byn = selected_country == "BYN"
+		await state.set_state(BuyStates.waiting_delivery_method)
+		await send_and_save_message(
+			message,
+			order_info,
+			reply_markup=buy_delivery_method_kb(currency_symbol, is_byn),
+			state=state
+		)
+	
+	@dp.message(BuyStates.waiting_delivery_method)
+	async def on_delivery_method_selected(message: Message, state: FSMContext):
+		"""Обработчик выбора способа доставки"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем данные о заказе
+		data = await state.get_data()
+		delivery_text = message.text
+		
+		# Определяем тип доставки по тексту кнопки
+		if delivery_text == "⬅️ Назад":
+			# Возвращаемся к вводу адреса кошелька
+			crypto_display = data.get("crypto_display", "")
+			await state.set_state(BuyStates.waiting_wallet_address)
+			await send_and_save_message(message, f"Введите адрес кошелька для {crypto_display}:", state=state)
+			return
+		
+		# Определяем тип доставки
+		delivery_type = "normal"
+		if "VIP" in delivery_text or "vip" in delivery_text.lower():
+			delivery_type = "vip"
+		
+		# Сохраняем выбранный способ доставки
+		await state.update_data(delivery_method=delivery_type)
+		
+		# Получаем данные о заказе
+		amount = data.get("amount", 0)
+		amount_currency = data.get("amount_currency", 0)
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
+		wallet_address = data.get("wallet_address", "")
+		currency_symbol = data.get("currency_symbol", "")
+		selected_country = data.get("selected_country", "RUB")
+		
+		# Рассчитываем сумму с учетом VIP
+		final_amount = amount_currency
+		if delivery_type == "vip":
+			if selected_country == "BYN":
+				final_amount += 4
+			else:  # RUB
+				final_amount += 1000
+		
+		# Получаем реквизиты пользователя
+		user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
+		requisites_text = ""
+		
+		if user_cards:
+			# Берем первую карту пользователя
+			card = user_cards[0]
+			card_id = card["card_id"]
+			
+			# Получаем реквизиты из таблицы card_requisites
+			requisites = await db_local.list_card_requisites(card_id)
+			
+			# Формируем текст реквизитов
+			requisites_list = []
+			for req in requisites:
+				requisites_list.append(req["requisite_text"])
+			
+			# Добавляем user_message, если есть
+			if card.get("user_message") and card["user_message"].strip():
+				requisites_list.append(card["user_message"])
+			
+			if requisites_list:
+				requisites_text = "\n".join(requisites_list)
+		
+		# Форматируем суммы для отображения
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Формируем финальное сообщение
+		# Определяем сокращенное название криптовалюты
+		crypto_short = ""
+		if "BTC" in crypto_type or "Bitcoin" in crypto_display:
+			crypto_short = "btc"
+		elif "LTC" in crypto_type or "Litecoin" in crypto_display:
+			crypto_short = "ltc"
+		elif "USDT" in crypto_type:
+			crypto_short = "usdt"
+		elif "XMR" in crypto_type or "Monero" in crypto_display:
+			crypto_short = "xmr"
+		
+		# Формируем сообщение
+		order_message = (
+			f"☑️Заявка успешно создана.\n"
+			f"Вы получаете: {amount_str} {crypto_short}\n"
+			f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
+			f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
+			f"Реквизиты для оплаты:\n\n"
+		)
+		
+		if requisites_text:
+			order_message += requisites_text + "\n\n"
+		else:
+			order_message += "Реквизиты не найдены. Обратитесь к администратору.\n\n"
+		
+		# Сохраняем время создания заявки (15 минут)
+		order_created_at = int(time.time())
+		order_expires_at = order_created_at + 15 * 60  # 15 минут
+		
+		order_message += f"⏰Заявка действительна: 15 минут\n"
+		order_message += f"✅После оплаты необходимо нажать на кнопку 'ОПЛАТА СОВЕРШЕНА'"
+		
+		# Сохраняем данные о заявке
+		await state.update_data(
+			final_amount=final_amount,
+			order_created_at=order_created_at,
+			order_expires_at=order_expires_at
+		)
+		
+		# Отправляем финальное сообщение
+		await state.set_state(BuyStates.waiting_payment_confirmation)
+		final_message = await send_and_save_message(
+			message,
+			order_message,
+			reply_markup=buy_payment_confirmed_kb(),
+			state=state
+		)
+		# Сохраняем ID сообщения с заявкой в состоянии для последующего сохранения в БД
+		await state.update_data(order_message_id=final_message.message_id)
+	
+	@dp.message(BuyStates.waiting_payment_confirmation, F.text == "ОПЛАТА СОВЕРШЕНА")
+	async def on_payment_confirmed(message: Message, state: FSMContext):
+		"""Обработчик подтверждения оплаты"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем данные о заказе
+		data = await state.get_data()
+		order_expires_at = data.get("order_expires_at", 0)
+		
+		# Проверяем, не истекла ли заявка
+		current_time = int(time.time())
+		if current_time > order_expires_at:
+			# Возвращаемся в главное меню
+			from app.keyboards import client_menu_kb
+			await state.clear()
+			await send_and_save_message(
+				message,
+				"❌ Время действия заявки истекло. Пожалуйста, создайте новую заявку.\n\n"
+				"🔒 Сервис не поддерживает подозрительные или незаконные транзакции.\n"
+				"🔞 Только для пользователей старше 18 лет.\n\n"
+				"✅Выберите нужную функцию в меню ниже, чтобы начать работу.",
+				reply_markup=client_menu_kb(),
+				state=state
+			)
+			return
+		
+		# Переходим в состояние ожидания скриншота/чека
+		await state.set_state(BuyStates.waiting_payment_proof)
+		
+		# Запрашиваем скриншот/чек оплаты
+		proof_request_message = await send_and_save_message(
+			message,
+			"Отправьте скрин перевода, либо чек оплаты.",
+			state=state
+		)
+		# Сохраняем ID сообщения с запросом скриншота
+		await state.update_data(proof_request_message_id=proof_request_message.message_id)
+	
+	@dp.message(BuyStates.waiting_payment_proof)
+	async def on_payment_proof_received(message: Message, state: FSMContext):
+		"""Обработчик получения скриншота/чека оплаты"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Проверяем, что пользователь отправил фото или документ
+		has_photo = message.photo is not None and len(message.photo) > 0
+		has_document = message.document is not None
+		
+		if not has_photo and not has_document:
+			# Пользователь отправил текст вместо фото/документа
+			await delete_user_message(message)
+			await send_and_save_message(
+				message,
+				"❌ Пожалуйста, отправьте скриншот перевода или чек оплаты (фото или документ).",
+				state=state
+			)
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем данные о заказе
+		data = await state.get_data()
+		amount = data.get("amount", 0)
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
+		wallet_address = data.get("wallet_address", "")
+		amount_currency = data.get("final_amount", data.get("amount_currency", 0))
+		currency_symbol = data.get("currency_symbol", "")
+		delivery_method = data.get("delivery_method", "")
+		
+		# Получаем file_id для фото или документа
+		proof_photo_file_id = None
+		proof_document_file_id = None
+		if has_photo:
+			proof_photo_file_id = message.photo[-1].file_id  # Берем фото наибольшего размера
+		elif has_document:
+			proof_document_file_id = message.document.file_id
+		
+		# Получаем имя пользователя
+		user_name = message.from_user.full_name or ""
+		user_username = message.from_user.username or ""
+		
+		# Получаем ID сообщений из состояния
+		order_message_id = data.get("order_message_id")
+		proof_request_message_id = data.get("proof_request_message_id")
+		
+		# Отправляем сообщение об успешной отправке скриншота ПЕРЕД созданием заявки
+		proof_confirmation_message = await message.bot.send_message(
+			chat_id=message.chat.id,
+			text="✅ Спасибо! Ваш скриншот/чек получен. Ожидайте зачисления средств на указанный адрес кошелька."
+		)
+		proof_confirmation_message_id = proof_confirmation_message.message_id
+		
+		# Создаем заявку в БД
+		order_id = await db_local.create_order(
+			user_tg_id=message.from_user.id,
+			user_name=user_name,
+			user_username=user_username,
+			crypto_type=crypto_type,
+			crypto_display=crypto_display,
+			amount=amount,
+			wallet_address=wallet_address,
+			amount_currency=amount_currency,
+			currency_symbol=currency_symbol,
+			delivery_method=delivery_method,
+			proof_photo_file_id=proof_photo_file_id,
+			proof_document_file_id=proof_document_file_id,
+			order_message_id=order_message_id,
+			proof_request_message_id=proof_request_message_id,
+			proof_confirmation_message_id=proof_confirmation_message_id,
+		)
+		
+		# Получаем заявку для получения номера
+		order = await db_local.get_order_by_id(order_id)
+		order_number = order["order_number"] if order else order_id
+		
+		# Форматируем сумму для отображения
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Формируем сообщение для админа
+		admin_message_text = (
+			f"Номер заявки за сегодня: {order_number}\n"
+			f"Имя пользователя: {user_name or 'Не указано'}\n"
+			f"Username: @{user_username}\n\n"
+			f"Количество монет: {amount_str} {crypto_display}\n"
+			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Адрес кошелька: <code>{wallet_address}</code>"
+		)
+		
+		# Отправляем заявку всем админам
+		admin_ids = get_admin_ids()
+		for admin_id in admin_ids:
+			try:
+				# Отправляем текст заявки
+				admin_msg = await message.bot.send_message(
+					chat_id=admin_id,
+					text=admin_message_text,
+					parse_mode=ParseMode.HTML,
+					reply_markup=order_action_kb(order_id)
+				)
+				
+				# Отправляем скриншот/чек
+				if proof_photo_file_id:
+					await message.bot.send_photo(
+						chat_id=admin_id,
+						photo=proof_photo_file_id,
+						reply_to_message_id=admin_msg.message_id
+					)
+				elif proof_document_file_id:
+					await message.bot.send_document(
+						chat_id=admin_id,
+						document=proof_document_file_id,
+						reply_to_message_id=admin_msg.message_id
+					)
+			except Exception as e:
+				logging.getLogger("app.main").error(f"Ошибка отправки заявки админу {admin_id}: {e}")
+		
+		# Очищаем состояние
+		await state.clear()
+	
+	@dp.callback_query(F.data.startswith("order:completed:"))
+	async def on_order_completed(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик нажатия кнопки 'Выполнил'"""
+		if not cb.from_user:
+			return
+		from app.di import get_db, get_admin_ids
+		from app.admin import is_admin
+		db_local = get_db()
+		admin_ids = get_admin_ids()
+		
+		# Проверяем, что это админ
+		if not is_admin(cb.from_user.id, cb.from_user.username, admin_ids, []):
+			await cb.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
+			return
+		
+		# Получаем ID заявки
+		order_id = int(cb.data.split(":")[2])
+		
+		# Получаем данные заявки
+		order = await db_local.get_order_by_id(order_id)
+		if not order:
+			await cb.answer("❌ Заявка не найдена.", show_alert=True)
+			return
+		
+		# Отмечаем заявку как выполненную
+		await db_local.complete_order(order_id)
+		
+		# Форматируем сумму для отображения
+		amount = order["amount"]
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Формируем сообщение для пользователя
+		user_message = (
+			"✅ Ваша заявка успешно выполнена!\n"
+			f"Вам зачислено: {amount_str} {order['crypto_display']}"
+		)
+		
+		# Если это BTC, добавляем ссылку на mempool.space
+		if order["crypto_type"] == "BTC":
+			wallet_address = order["wallet_address"]
+			mempool_link = f"https://mempool.space/address/{wallet_address}"
+			user_message += f"\n\n🔗 Проверить транзакцию: {mempool_link}"
+		
+		# Удаляем все сообщения у пользователя, связанные с заявкой
+		user_tg_id = order["user_tg_id"]
+		messages_to_delete = []
+		
+		# Сообщение с заявкой
+		order_message_id = order.get("order_message_id")
+		if order_message_id:
+			messages_to_delete.append(order_message_id)
+		
+		# Сообщение с запросом скриншота
+		proof_request_message_id = order.get("proof_request_message_id")
+		if proof_request_message_id:
+			messages_to_delete.append(proof_request_message_id)
+		
+		# Сообщение с подтверждением получения скриншота
+		proof_confirmation_message_id = order.get("proof_confirmation_message_id")
+		if proof_confirmation_message_id:
+			messages_to_delete.append(proof_confirmation_message_id)
+		
+		# Удаляем все сообщения
+		for msg_id in messages_to_delete:
+			try:
+				await cb.bot.delete_message(
+					chat_id=user_tg_id,
+					message_id=msg_id
+				)
+			except Exception as e:
+				logging.getLogger("app.main").debug(f"Не удалось удалить сообщение {msg_id} у пользователя {user_tg_id}: {e}")
+		
+		# Отправляем сообщение пользователю с кнопкой "Удалить"
+		from app.keyboards import delete_message_kb
+		try:
+			await cb.bot.send_message(
+				chat_id=order["user_tg_id"],
+				text=user_message,
+				reply_markup=delete_message_kb()
+			)
+		except Exception as e:
+			logging.getLogger("app.main").error(f"Ошибка отправки сообщения пользователю {order['user_tg_id']}: {e}")
+		
+		# Обновляем сообщение админа
+		await cb.answer("✅ Заявка отмечена как выполненная!")
+		await cb.message.edit_text(
+			f"{cb.message.text}\n\n✅ Выполнено",
+			reply_markup=None
+		)
+	
+	@dp.callback_query(F.data == "delete_message")
+	async def on_delete_message(cb: CallbackQuery):
+		"""Обработчик кнопки 'Удалить' для удаления сообщения"""
+		if not cb.from_user or not cb.message:
+			return
+		
+		try:
+			# Проверяем, что пользователь пытается удалить свое сообщение
+			if cb.message.chat.id == cb.from_user.id:
+				# Удаляем сообщение
+				await cb.message.delete()
+				await cb.answer("✅ Сообщение удалено")
+				
+				# Отправляем главное меню с кнопками "Купить" и "Продать" без текста
+				from app.keyboards import client_menu_kb
+				from app.di import get_db
+				db_local = get_db()
+				if await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+					await cb.bot.send_message(
+						chat_id=cb.from_user.id,
+						text=" ",
+						reply_markup=client_menu_kb()
+					)
+			else:
+				await cb.answer("❌ Вы можете удалять только свои сообщения", show_alert=True)
+		except Exception as e:
+			logging.getLogger("app.main").error(f"Ошибка при удалении сообщения: {e}")
+			await cb.answer("❌ Не удалось удалить сообщение", show_alert=True)
 
 	@dp.message(Command("buy"))
 	async def cmd_buy(message: Message, state: FSMContext):

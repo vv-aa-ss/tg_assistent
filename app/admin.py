@@ -43,6 +43,8 @@ from app.keyboards import (
 	delete_confirmation_kb,
 	stat_u_menu_kb,
 	user_menu_button_kb,
+	multipliers_settings_kb,
+	markup_percents_settings_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -397,6 +399,14 @@ class CryptoColumnEditStates(StatesGroup):
 	waiting_crypto_name = State()
 	waiting_crypto_column = State()
 	waiting_rename = State()
+
+
+class MultiplierEditStates(StatesGroup):
+	waiting_multiplier = State()
+
+
+class MarkupPercentEditStates(StatesGroup):
+	waiting_percent = State()
 
 
 class CardGroupStates(StatesGroup):
@@ -1358,6 +1368,221 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
 	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb())
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "settings:multipliers")
+async def settings_multipliers(cb: CallbackQuery):
+	"""Показывает настройки коэффициентов"""
+	db = get_db()
+	multiplier_byn_str = await db.get_google_sheets_setting("multiplier_byn", "1.15")
+	multiplier_rub_str = await db.get_google_sheets_setting("multiplier_rub", "1.15")
+	
+	try:
+		multiplier_byn = float(multiplier_byn_str) if multiplier_byn_str else 1.15
+	except (ValueError, TypeError):
+		multiplier_byn = 1.15
+	
+	try:
+		multiplier_rub = float(multiplier_rub_str) if multiplier_rub_str else 1.15
+	except (ValueError, TypeError):
+		multiplier_rub = 1.15
+	
+	await safe_edit_text(
+		cb.message,
+		"💰 Настройки коэффициентов:\n\n"
+		f"🇧🇾 Коэффициент для BYN: {multiplier_byn}\n"
+		f"🇷🇺 Коэффициент для RUB: {multiplier_rub}\n\n"
+		"Выберите коэффициент для редактирования:",
+		reply_markup=multipliers_settings_kb(multiplier_byn, multiplier_rub)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:multiplier:"))
+async def settings_multiplier_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование коэффициента"""
+	parts = cb.data.split(":")
+	currency = parts[2]  # "byn" или "rub"
+	
+	db = get_db()
+	if currency == "byn":
+		current_value = await db.get_google_sheets_setting("multiplier_byn", "1.15")
+		currency_name = "BYN"
+		multiplier_key = "multiplier_byn"
+	else:  # rub
+		current_value = await db.get_google_sheets_setting("multiplier_rub", "1.15")
+		currency_name = "RUB"
+		multiplier_key = "multiplier_rub"
+	
+	await state.update_data(multiplier_key=multiplier_key, currency_name=currency_name)
+	await state.set_state(MultiplierEditStates.waiting_multiplier)
+	
+	await safe_edit_text(
+		cb.message,
+		f"💰 Введите новый коэффициент для {currency_name}:\n\n"
+		f"Текущее значение: {current_value}\n\n"
+		"Введите число (например: 1.15):",
+		reply_markup=simple_back_kb("admin:settings")
+	)
+	await cb.answer()
+
+
+@admin_router.message(MultiplierEditStates.waiting_multiplier)
+async def settings_multiplier_save(message: Message, state: FSMContext):
+	"""Сохраняет новый коэффициент"""
+	data = await state.get_data()
+	multiplier_key = data.get("multiplier_key")
+	currency_name = data.get("currency_name")
+	
+	# Валидация ввода
+	multiplier_str = message.text.strip().replace(",", ".")
+	try:
+		multiplier = float(multiplier_str)
+		if multiplier <= 0:
+			await message.answer("❌ Коэффициент должен быть больше нуля. Введите корректное значение:")
+			return
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число (например: 1.15):")
+		return
+	
+	# Сохраняем в БД
+	db = get_db()
+	await db.set_google_sheets_setting(multiplier_key, str(multiplier))
+	
+	await state.clear()
+	await message.answer(f"✅ Коэффициент для {currency_name} установлен: {multiplier}")
+	
+	# Возвращаемся к списку коэффициентов
+	multiplier_byn_str = await db.get_google_sheets_setting("multiplier_byn", "1.15")
+	multiplier_rub_str = await db.get_google_sheets_setting("multiplier_rub", "1.15")
+	
+	try:
+		multiplier_byn = float(multiplier_byn_str) if multiplier_byn_str else 1.15
+	except (ValueError, TypeError):
+		multiplier_byn = 1.15
+	
+	try:
+		multiplier_rub = float(multiplier_rub_str) if multiplier_rub_str else 1.15
+	except (ValueError, TypeError):
+		multiplier_rub = 1.15
+	
+	await message.answer(
+		"💰 Настройки коэффициентов:\n\n"
+		f"🇧🇾 Коэффициент для BYN: {multiplier_byn}\n"
+		f"🇷🇺 Коэффициент для RUB: {multiplier_rub}\n\n"
+		"Выберите коэффициент для редактирования:",
+		reply_markup=multipliers_settings_kb(multiplier_byn, multiplier_rub)
+	)
+
+
+@admin_router.callback_query(F.data == "settings:markup_percents")
+async def settings_markup_percents(cb: CallbackQuery):
+	"""Показывает настройки процентов наценки"""
+	db = get_db()
+	percent_small_str = await db.get_google_sheets_setting("markup_percent_small", "20")
+	percent_large_str = await db.get_google_sheets_setting("markup_percent_large", "15")
+	
+	try:
+		percent_small = float(percent_small_str) if percent_small_str else 20.0
+	except (ValueError, TypeError):
+		percent_small = 20.0
+	
+	try:
+		percent_large = float(percent_large_str) if percent_large_str else 15.0
+	except (ValueError, TypeError):
+		percent_large = 15.0
+	
+	await safe_edit_text(
+		cb.message,
+		"📊 Настройки процентов наценки:\n\n"
+		f"📉 Для заказов < 100$: {percent_small}%\n"
+		f"📈 Для заказов >= 100$: {percent_large}%\n\n"
+		"Формула: (цена_монеты_в_USD + процент) × количество_монет × курс_валюты\n\n"
+		"Выберите процент для редактирования:",
+		reply_markup=markup_percents_settings_kb(percent_small, percent_large)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:markup_percent:"))
+async def settings_markup_percent_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование процента наценки"""
+	parts = cb.data.split(":")
+	percent_type = parts[2]  # "small" или "large"
+	
+	db = get_db()
+	if percent_type == "small":
+		current_value = await db.get_google_sheets_setting("markup_percent_small", "20")
+		percent_name = "для заказов < 100$"
+		percent_key = "markup_percent_small"
+		default_value = 20.0
+	else:  # large
+		current_value = await db.get_google_sheets_setting("markup_percent_large", "15")
+		percent_name = "для заказов >= 100$"
+		percent_key = "markup_percent_large"
+		default_value = 15.0
+	
+	await state.update_data(percent_key=percent_key, percent_name=percent_name, default_value=default_value)
+	await state.set_state(MarkupPercentEditStates.waiting_percent)
+	
+	await safe_edit_text(
+		cb.message,
+		f"📊 Введите новый процент наценки {percent_name}:\n\n"
+		f"Текущее значение: {current_value}%\n\n"
+		"Введите число (например: 20):",
+		reply_markup=simple_back_kb("admin:settings")
+	)
+	await cb.answer()
+
+
+@admin_router.message(MarkupPercentEditStates.waiting_percent)
+async def settings_markup_percent_save(message: Message, state: FSMContext):
+	"""Сохраняет новый процент наценки"""
+	data = await state.get_data()
+	percent_key = data.get("percent_key")
+	percent_name = data.get("percent_name")
+	default_value = data.get("default_value", 20.0)
+	
+	# Валидация ввода
+	percent_str = message.text.strip().replace(",", ".")
+	try:
+		percent = float(percent_str)
+		if percent < 0 or percent > 100:
+			await message.answer("❌ Процент должен быть от 0 до 100. Введите корректное значение:")
+			return
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число (например: 20):")
+		return
+	
+	# Сохраняем в БД
+	db = get_db()
+	await db.set_google_sheets_setting(percent_key, str(percent))
+	
+	await state.clear()
+	await message.answer(f"✅ Процент наценки {percent_name} установлен: {percent}%")
+	
+	# Возвращаемся к списку процентов
+	percent_small_str = await db.get_google_sheets_setting("markup_percent_small", "20")
+	percent_large_str = await db.get_google_sheets_setting("markup_percent_large", "15")
+	
+	try:
+		percent_small = float(percent_small_str) if percent_small_str else 20.0
+	except (ValueError, TypeError):
+		percent_small = 20.0
+	
+	try:
+		percent_large = float(percent_large_str) if percent_large_str else 15.0
+	except (ValueError, TypeError):
+		percent_large = 15.0
+	
+	await message.answer(
+		"📊 Настройки процентов наценки:\n\n"
+		f"📉 Для заказов < 100$: {percent_small}%\n"
+		f"📈 Для заказов >= 100$: {percent_large}%\n\n"
+		"Формула: (цена_монеты_в_USD + процент) × количество_монет × курс_валюты\n\n"
+		"Выберите процент для редактирования:",
+		reply_markup=markup_percents_settings_kb(percent_small, percent_large)
+	)
 
 
 @admin_router.callback_query(F.data == "settings:users")
@@ -5879,6 +6104,7 @@ async def user_access_toggle(cb: CallbackQuery):
 		await cb.answer("Нельзя выдать доступ: нет tg_id/username", show_alert=True)
 		return
 	has_access = await db.is_allowed_user(tg_id, username)
+	was_allowed = has_access
 	if has_access:
 		await db.revoke_user_access(tg_id=tg_id, username=username)
 		has_access = False
@@ -5887,6 +6113,31 @@ async def user_access_toggle(cb: CallbackQuery):
 		await db.grant_user_access(tg_id=tg_id, username=username)
 		has_access = True
 		alert = "Доступ выдан ✅"
+		
+		# Отправляем сообщение пользователю при выдаче доступа
+		if tg_id is not None:
+			from app.keyboards import client_menu_kb
+			try:
+				# Выставляем команды пользователю
+				from aiogram.types import BotCommand, BotCommandScopeChat
+				await cb.bot.set_my_commands(
+					commands=[
+						BotCommand(command="start", description="Меню"),
+						BotCommand(command="buy", description="Купить"),
+						BotCommand(command="sell", description="Продать"),
+					],
+					scope=BotCommandScopeChat(chat_id=tg_id),
+				)
+				# Отправляем сообщение с кнопками
+				await cb.bot.send_message(
+					chat_id=tg_id,
+					text="🔒 Сервис не поддерживает подозрительные или незаконные транзакции.\n"
+					     "🔞 Только для пользователей старше 18 лет.\n\n"
+					     "✅Выберите нужную функцию в меню ниже, чтобы начать работу.",
+					reply_markup=client_menu_kb()
+				)
+			except Exception as e:
+				logger.warning(f"Не удалось отправить сообщение пользователю tg_id={tg_id}: {e}")
 
 	# Обновляем сообщение: используем тот же рендер, что и в user_view (без card_id)
 	parts_text = []
