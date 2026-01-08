@@ -16,7 +16,8 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
 	kb.button(text="👥 Пользователи", callback_data="admin:users")
 	kb.button(text="₿ Крипта", callback_data="admin:crypto")
 	kb.button(text="⚙️ Настройки", callback_data="admin:settings")
-	kb.adjust(2, 2, 1)
+	kb.button(text="💰 Расходы", callback_data="admin:expenses")
+	kb.adjust(2, 2, 2)
 	return kb.as_markup()
 
 
@@ -1155,5 +1156,13 @@ def delete_message_kb() -> InlineKeyboardMarkup:
 	"""Клавиатура с кнопкой 'Удалить' для удаления сообщения"""
 	kb = InlineKeyboardBuilder()
 	kb.button(text="🗑️ Удалить", callback_data="delete_message")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def user_access_request_kb(user_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для запроса доступа пользователя с кнопкой 'Разрешить'"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="✅ Разрешить", callback_data=f"settings:users:set:{user_id}:allow")
 	kb.adjust(1)
 	return kb.as_markup()

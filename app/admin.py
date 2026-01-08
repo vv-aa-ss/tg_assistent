@@ -1721,8 +1721,30 @@ async def settings_users_set(cb: CallbackQuery, bot: Bot):
 	if user.get("tg_id"):
 		parts_title.append(f"(tg_id: {user['tg_id']})")
 	title = " ".join(parts_title) if parts_title else f"ID {user_id}"
-	text = f"Заявка:\n{title}\n\nСтатус: {'✅ Разрешено' if allowed else '❌ Запрещено'}"
-	await safe_edit_text(cb.message, text, reply_markup=_allow_deny_kb(user_id, allowed).as_markup())
+	
+	# Проверяем, является ли это уведомлением о запросе доступа
+	is_access_request = "Новый запрос на доступ" in (cb.message.text or cb.message.caption or "")
+	
+	if is_access_request and action == "allow":
+		# Для уведомления о запросе доступа используем более понятный текст
+		text = (
+			f"✅ <b>Доступ разрешен</b>\n\n"
+			f"👤 Имя: {user.get('full_name') or 'Не указано'}\n"
+			f"📱 Username: @{user.get('username') or 'Не указано'}\n"
+			f"🆔 ID: <code>{user.get('tg_id') or 'Не указано'}</code>\n\n"
+			f"Пользователю отправлено приветственное сообщение."
+		)
+		from app.keyboards import user_access_request_kb
+		# Обновляем сообщение, убирая кнопку (или оставляя её, но с другим текстом)
+		kb = InlineKeyboardBuilder()
+		kb.button(text="✅ Разрешено", callback_data=f"settings:users:set:{user_id}:allow")
+		kb.adjust(1)
+		await safe_edit_text(cb.message, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+	else:
+		# Обычное обновление для настроек пользователей
+		text = f"Заявка:\n{title}\n\nСтатус: {'✅ Разрешено' if allowed else '❌ Запрещено'}"
+		await safe_edit_text(cb.message, text, reply_markup=_allow_deny_kb(user_id, allowed).as_markup())
+	
 	await cb.answer(alert)
 
 
@@ -3639,6 +3661,100 @@ async def cards_delete_group(cb: CallbackQuery):
 	except Exception as e:
 		logger.exception(f"Ошибка удаления группы {group_id}: {e}")
 		await cb.answer("❌ Ошибка при удалении группы", show_alert=True)
+
+
+@admin_router.callback_query(F.data == "admin:expenses")
+async def admin_expenses(cb: CallbackQuery):
+	"""Показывает расходы из ячейки BD420"""
+	await cb.answer()
+	
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import read_cell_value
+	
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await safe_edit_text(cb.message, "❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Получаем адрес ячейки расходов из настроек
+	expenses_cell = await db.get_google_sheets_setting("expenses_cell", "BD420")
+	
+	# Отправляем сообщение о загрузке
+	loading_msg = await cb.message.edit_text("⏳ Загрузка расходов...", reply_markup=simple_back_kb("admin:back"))
+	
+	try:
+		# Читаем значение ячейки
+		value = await read_cell_value(
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			expenses_cell,
+			settings.google_sheet_name
+		)
+		
+		if value is None:
+			text = f"❌ Не удалось прочитать значение ячейки {expenses_cell}"
+		else:
+			# Форматируем значение (если это число, форматируем его)
+			try:
+				num_value = float(value)
+				formatted_value = f"{num_value:,.2f}".replace(",", " ").replace(".", ",")
+				text = f"💰 <b>Расходы</b>\n\nЯчейка: {expenses_cell}\nЗначение: {formatted_value}"
+			except ValueError:
+				text = f"💰 <b>Расходы</b>\n\nЯчейка: {expenses_cell}\nЗначение: {value}"
+		
+		await safe_edit_text(loading_msg, text, reply_markup=simple_back_kb("admin:back"))
+	except Exception as e:
+		logger.exception(f"Ошибка получения расходов: {e}")
+		await safe_edit_text(loading_msg, f"❌ Ошибка получения расходов: {str(e)}", reply_markup=simple_back_kb("admin:back"))
+
+
+@admin_router.message(Command("cons"))
+async def admin_cons_command(msg: Message, bot: Bot, state: FSMContext):
+	"""Обработчик команды /cons для отображения расходов"""
+	await state.clear()
+	
+	db = get_db()
+	from app.config import get_settings
+	from app.google_sheets import read_cell_value
+	
+	settings = get_settings()
+	
+	if not settings.google_sheet_id or not settings.google_credentials_path:
+		await msg.answer("❌ Google Sheets не настроен", reply_markup=simple_back_kb("admin:back"))
+		return
+	
+	# Получаем адрес ячейки расходов из настроек
+	expenses_cell = await db.get_google_sheets_setting("expenses_cell", "BD420")
+	
+	# Отправляем сообщение о загрузке
+	loading_msg = await msg.answer("⏳ Загрузка расходов...", reply_markup=simple_back_kb("admin:back"))
+	
+	try:
+		# Читаем значение ячейки
+		value = await read_cell_value(
+			settings.google_sheet_id,
+			settings.google_credentials_path,
+			expenses_cell,
+			settings.google_sheet_name
+		)
+		
+		if value is None:
+			text = f"❌ Не удалось прочитать значение ячейки {expenses_cell}"
+		else:
+			# Форматируем значение (если это число, форматируем его)
+			try:
+				num_value = float(value)
+				formatted_value = f"{num_value:,.2f}".replace(",", " ").replace(".", ",")
+				text = f"💰 <b>Расходы</b>\n\nЯчейка: {expenses_cell}\nЗначение: {formatted_value}"
+			except ValueError:
+				text = f"💰 <b>Расходы</b>\n\nЯчейка: {expenses_cell}\nЗначение: {value}"
+		
+		await safe_edit_text(loading_msg, text, reply_markup=simple_back_kb("admin:back"))
+	except Exception as e:
+		logger.exception(f"Ошибка получения расходов: {e}")
+		await safe_edit_text(loading_msg, f"❌ Ошибка получения расходов: {str(e)}", reply_markup=simple_back_kb("admin:back"))
 
 
 @admin_router.callback_query(F.data == "admin:crypto")
@@ -5889,11 +6005,29 @@ async def admin_stat_bk_command(msg: Message, bot: Bot, state: FSMContext):
 			month_str = f"{month_total:.2f}".rstrip('0').rstrip('.') if month_total != int(month_total) else str(int(month_total))
 			all_time_str = f"{all_time_total:.2f}".rstrip('0').rstrip('.') if all_time_total != int(all_time_total) else str(int(all_time_total))
 			
-			# Для группы "РАШКА" показываем только первую букву названия карты
-			display_name = card_name[0] if group_name.upper() == "РАШКА" and card_name else card_name
+			# Для группы "РАШКА" показываем только первую букву названия карты и первую букву имени владельца
+			if group_name.upper() == "РАШКА" and card_name:
+				display_name = card_name[0]
+				# Извлекаем имя владельца из скобок (например, "ТИНЕК (ВАЩИК)" -> "В")
+				owner_initial = ""
+				match = re.search(r'\(([^)]+)\)', card_name)
+				if match:
+					owner_name = match.group(1).strip()
+					if owner_name:
+						# Берем первую букву имени (убираем пробелы)
+						owner_initial = owner_name.replace(" ", "")[0].upper()
+				# Формируем строку с инициалом владельца в скобках
+				if owner_initial:
+					display_name = f"{display_name} ({owner_initial})"
+			else:
+				display_name = card_name
 			
 			# Новый короткий формат: баланс(месяц;общее)
-			lines.append(f" ▶️ {display_name} ({column}{balance_row}) = <i>{balance_str}</i>➖({month_str};{all_time_str})")
+			# Для группы "РАШКА" убираем символ ➖ перед скобками
+			if group_name.upper() == "РАШКА":
+				lines.append(f" ▶️ {display_name} ({column}{balance_row}) = <i>{balance_str}</i>({month_str};{all_time_str})")
+			else:
+				lines.append(f" ▶️ {display_name} ({column}{balance_row}) = <i>{balance_str}</i>➖({month_str};{all_time_str})")
 			
 			# Сохраняем данные для графика (исключая группу "РАШКА")
 			if group_name.upper() != "РАШКА" and balance_str != "—":

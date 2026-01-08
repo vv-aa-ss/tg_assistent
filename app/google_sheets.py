@@ -2799,3 +2799,66 @@ async def read_profits_batch(
 		cell_addresses,
 		sheet_name
 	)
+
+
+def _read_cell_value_sync(
+	sheet_id: str,
+	credentials_path: str,
+	cell_address: str,
+	sheet_name: Optional[str] = None
+) -> Optional[str]:
+	"""
+	Синхронная функция для чтения значения одной ячейки из Google Sheets.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_address: Адрес ячейки (например, "BD420")
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Значение ячейки или None при ошибке
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return None
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		sheet = _get_worksheet(spreadsheet, sheet_name)
+		
+		cell_value = sheet.acell(cell_address).value
+		return cell_value if cell_value else None
+	except Exception as e:
+		logger.exception(f"Ошибка чтения ячейки {cell_address}: {e}")
+		return None
+
+
+async def read_cell_value(
+	sheet_id: str,
+	credentials_path: str,
+	cell_address: str,
+	sheet_name: Optional[str] = None
+) -> Optional[str]:
+	"""
+	Асинхронная функция для чтения значения одной ячейки из Google Sheets.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		cell_address: Адрес ячейки (например, "BD420")
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Значение ячейки или None при ошибке
+	"""
+	loop = asyncio.get_event_loop()
+	return await loop.run_in_executor(
+		None,
+		_read_cell_value_sync,
+		sheet_id,
+		credentials_path,
+		cell_address,
+		sheet_name
+	)

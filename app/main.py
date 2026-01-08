@@ -17,7 +17,7 @@ from aiogram import F
 from app.config import get_settings
 from app.db import Database
 from app.admin import admin_router, is_admin
-from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb
+from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb
 from app.di import get_admin_ids
 from app.di import set_dependencies
 
@@ -217,7 +217,7 @@ async def main() -> None:
 		BotCommand(command="stat_bk", description="Балансы карт"),
 		BotCommand(command="stat_k", description="Баланс крипты"),
 		BotCommand(command="stat_u", description="Статистика пользователей"),
-		BotCommand(command="cons", description="Статистика расходов"),
+		BotCommand(command="cons", description="Расходы"),
 		BotCommand(command="start", description="Меню"),
 	]
 
@@ -315,6 +315,44 @@ async def main() -> None:
 					state=state
 				)
 				return
+			else:
+				# Пользователь не разрешен - отправляем уведомление админам
+				logger.info(f"⚠️ Неразрешенный пользователь пытается получить доступ: tg_id={message.from_user.id}, username={message.from_user.username}")
+				
+				# Получаем user_id из БД
+				user_id = await db_local.get_user_id_by_tg(message.from_user.id)
+				if user_id:
+					# Формируем сообщение для админов
+					user_name = message.from_user.full_name or "Не указано"
+					user_username = message.from_user.username or "Не указано"
+					
+					admin_message_text = (
+						f"⚠️ <b>Новый запрос на доступ</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{message.from_user.id}</code>\n\n"
+						f"Пользователь пытается получить доступ к боту."
+					)
+					
+					# Отправляем уведомление всем админам
+					admin_ids = get_admin_ids()
+					logger_main = logging.getLogger("app.main")
+					logger_main.info(f"📤 Отправка уведомления о запросе доступа админам. Список админов: {admin_ids}")
+					
+					if admin_ids:
+						for admin_id in admin_ids:
+							try:
+								await message.bot.send_message(
+									chat_id=admin_id,
+									text=admin_message_text,
+									parse_mode=ParseMode.HTML,
+									reply_markup=user_access_request_kb(user_id)
+								)
+								logger_main.info(f"✅ Уведомление о запросе доступа отправлено админу {admin_id}")
+							except Exception as e:
+								logger_main.error(f"❌ Ошибка отправки уведомления админу {admin_id}: {e}", exc_info=True)
+					else:
+						logger_main.warning("⚠️ Список админов пустой, уведомление не отправлено")
 
 		# Остальные: игнор (без ответа)
 
@@ -1001,31 +1039,52 @@ async def main() -> None:
 		
 		# Отправляем заявку всем админам
 		admin_ids = get_admin_ids()
-		for admin_id in admin_ids:
-			try:
-				# Отправляем текст заявки
-				admin_msg = await message.bot.send_message(
-					chat_id=admin_id,
-					text=admin_message_text,
-					parse_mode=ParseMode.HTML,
-					reply_markup=order_action_kb(order_id)
-				)
-				
-				# Отправляем скриншот/чек
-				if proof_photo_file_id:
-					await message.bot.send_photo(
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"📤 Отправка заявки #{order_number} админам. Список админов: {admin_ids}")
+		
+		if not admin_ids:
+			logger_main.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Список админов пустой! Заявка не будет отправлена.")
+			# Отправляем сообщение пользователю об ошибке
+			await message.bot.send_message(
+				chat_id=message.chat.id,
+				text="⚠️ Произошла ошибка при отправке заявки администраторам. Пожалуйста, свяжитесь с поддержкой."
+			)
+		else:
+			success_count = 0
+			for admin_id in admin_ids:
+				try:
+					logger_main.info(f"📤 Отправка заявки #{order_number} админу {admin_id}")
+					# Отправляем текст заявки
+					admin_msg = await message.bot.send_message(
 						chat_id=admin_id,
-						photo=proof_photo_file_id,
-						reply_to_message_id=admin_msg.message_id
+						text=admin_message_text,
+						parse_mode=ParseMode.HTML,
+						reply_markup=order_action_kb(order_id)
 					)
-				elif proof_document_file_id:
-					await message.bot.send_document(
-						chat_id=admin_id,
-						document=proof_document_file_id,
-						reply_to_message_id=admin_msg.message_id
-					)
-			except Exception as e:
-				logging.getLogger("app.main").error(f"Ошибка отправки заявки админу {admin_id}: {e}")
+					logger_main.info(f"✅ Текст заявки отправлен админу {admin_id}, message_id={admin_msg.message_id}")
+					
+					# Отправляем скриншот/чек
+					if proof_photo_file_id:
+						await message.bot.send_photo(
+							chat_id=admin_id,
+							photo=proof_photo_file_id,
+							reply_to_message_id=admin_msg.message_id
+						)
+						logger_main.info(f"✅ Фото отправлено админу {admin_id}")
+					elif proof_document_file_id:
+						await message.bot.send_document(
+							chat_id=admin_id,
+							document=proof_document_file_id,
+							reply_to_message_id=admin_msg.message_id
+						)
+						logger_main.info(f"✅ Документ отправлен админу {admin_id}")
+					
+					success_count += 1
+					logger_main.info(f"✅ Заявка #{order_number} успешно отправлена админу {admin_id}")
+				except Exception as e:
+					logger_main.error(f"❌ Ошибка отправки заявки #{order_number} админу {admin_id}: {e}", exc_info=True)
+			
+			logger_main.info(f"📊 Итого: заявка #{order_number} отправлена {success_count} из {len(admin_ids)} админам")
 		
 		# Очищаем состояние
 		await state.clear()

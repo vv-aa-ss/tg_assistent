@@ -1142,11 +1142,25 @@ class Database:
 
 	async def delete_user(self, user_id: int) -> None:
 		assert self._db
+		# Получаем tg_id пользователя для удаления связанных заявок
+		cur = await self._db.execute("SELECT tg_id FROM users WHERE id = ?", (user_id,))
+		row = await cur.fetchone()
+		if not row:
+			_logger.warning(f"User not found: id={user_id}")
+			return
+		
+		tg_id = row[0]
+		
+		# Удаляем заявки пользователя (таблица orders ссылается на users(tg_id) без CASCADE)
+		if tg_id:
+			await self._db.execute("DELETE FROM orders WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted orders for user: id={user_id}, tg_id={tg_id}")
+		
 		# Удаление пользователя автоматически удалит связанные записи из user_card
 		# благодаря ON DELETE CASCADE во внешних ключах
 		await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
 		await self._db.commit()
-		_logger.debug(f"User deleted: id={user_id}")
+		_logger.debug(f"User deleted: id={user_id}, tg_id={tg_id}")
 
 	async def get_all_cards_with_columns_and_groups(self) -> List[Dict[str, Any]]:
 		"""
