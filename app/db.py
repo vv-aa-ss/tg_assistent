@@ -88,7 +88,7 @@ class Database:
 		await self._migrate_crypto_columns()
 		await self._ensure_cash_columns()
 		await self._ensure_card_groups()
-		await self._ensure_google_sheets_settings()
+		await self._ensure_settings()
 		await self._ensure_card_requisites()
 		await self._ensure_rate_history()
 		await self._ensure_menu_user()
@@ -1917,16 +1917,36 @@ class Database:
 			for row in rows
 		]
 
-	async def _ensure_google_sheets_settings(self) -> None:
-		"""Создает таблицу для хранения настроек Google Sheets"""
+	async def _ensure_settings(self) -> None:
+		"""Создает таблицу для хранения настроек"""
 		assert self._db
-		cur = await self._db.execute(
+		
+		# Проверяем наличие обеих таблиц
+		cur_new = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='settings'"
+		)
+		has_new_table = await cur_new.fetchone() is not None
+		
+		cur_old = await self._db.execute(
 			"SELECT name FROM sqlite_master WHERE type='table' AND name='google_sheets_settings'"
 		)
-		if not await cur.fetchone():
+		has_old_table = await cur_old.fetchone() is not None
+		
+		# Миграция: переименовываем старую таблицу, если она существует, а новой нет
+		if has_old_table and not has_new_table:
+			# Переименовываем старую таблицу в новую
+			await self._db.execute("ALTER TABLE google_sheets_settings RENAME TO settings")
+			await self._db.commit()
+			_logger.info("✅ Migrated table google_sheets_settings to settings")
+			has_new_table = True
+		elif has_old_table and has_new_table:
+			# Обе таблицы существуют - это не должно происходить, но на всякий случай логируем
+			_logger.warning("⚠️ Both google_sheets_settings and settings tables exist. Using settings table.")
+		
+		if not has_new_table:
 			await self._db.execute(
 				"""
-				CREATE TABLE google_sheets_settings (
+				CREATE TABLE settings (
 					id INTEGER PRIMARY KEY AUTOINCREMENT,
 					key TEXT NOT NULL UNIQUE,
 					value TEXT NOT NULL
@@ -1935,31 +1955,31 @@ class Database:
 			)
 			# Устанавливаем значения по умолчанию
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('delete_range', 'A:BB')"
+				"INSERT INTO settings(key, value) VALUES('delete_range', 'A:BB')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('zero_column', 'BC')"
+				"INSERT INTO settings(key, value) VALUES('zero_column', 'BC')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
+				"INSERT INTO settings(key, value) VALUES('start_row', '5')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+				"INSERT INTO settings(key, value) VALUES('add_max_row', '374')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+				"INSERT INTO settings(key, value) VALUES('rate_start_row', '407')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
+				"INSERT INTO settings(key, value) VALUES('rate_max_row', '419')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
+				"INSERT INTO settings(key, value) VALUES('balance_row', '4')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+				"INSERT INTO settings(key, value) VALUES('profit_column', 'BC')"
 			)
 			await self._db.execute(
-				"INSERT INTO google_sheets_settings(key, value) VALUES('expenses_cell', 'BD420')"
+				"INSERT INTO settings(key, value) VALUES('expenses_cell', 'BD420')"
 			)
 			# Добавляем настройки дней недели
 			day_settings = [
@@ -1981,22 +2001,22 @@ class Database:
 			]
 			for key, value in day_settings:
 				await self._db.execute(
-					f"INSERT INTO google_sheets_settings(key, value) VALUES('{key}', '{value}')"
+					f"INSERT INTO settings(key, value) VALUES('{key}', '{value}')"
 				)
-			_logger.debug("Created table google_sheets_settings with default values")
+			_logger.debug("Created table settings with default values")
 		else:
 			# Проверяем наличие всех необходимых ключей
-			cur = await self._db.execute("SELECT key FROM google_sheets_settings")
+			cur = await self._db.execute("SELECT key FROM settings")
 			existing_keys = {row[0] for row in await cur.fetchall()}
 			
 			# Добавляем коэффициенты для расчета стоимости (если их нет)
 			if 'multiplier_byn' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('multiplier_byn', '1.15')"
+					"INSERT INTO settings(key, value) VALUES('multiplier_byn', '1.15')"
 				)
 			if 'multiplier_rub' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('multiplier_rub', '1.15')"
+					"INSERT INTO settings(key, value) VALUES('multiplier_rub', '1.15')"
 				)
 			
 			# Добавляем проценты наценки (если их нет)
@@ -2004,53 +2024,53 @@ class Database:
 			# markup_percent_large - для заказов >= 100 USD (по умолчанию 15%)
 			if 'markup_percent_small' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('markup_percent_small', '20')"
+					"INSERT INTO settings(key, value) VALUES('markup_percent_small', '20')"
 				)
 			if 'markup_percent_large' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('markup_percent_large', '15')"
+					"INSERT INTO settings(key, value) VALUES('markup_percent_large', '15')"
 				)
 			
 			if 'delete_range' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('delete_range', 'A:BB')"
+					"INSERT INTO settings(key, value) VALUES('delete_range', 'A:BB')"
 				)
 			if 'zero_column' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('zero_column', 'BC')"
+					"INSERT INTO settings(key, value) VALUES('zero_column', 'BC')"
 				)
 			if 'start_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('start_row', '5')"
+					"INSERT INTO settings(key, value) VALUES('start_row', '5')"
 				)
 			if 'add_max_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('add_max_row', '374')"
+					"INSERT INTO settings(key, value) VALUES('add_max_row', '374')"
 				)
 			if 'rate_start_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_start_row', '407')"
+					"INSERT INTO settings(key, value) VALUES('rate_start_row', '407')"
 				)
 			if 'rate_max_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('rate_max_row', '419')"
+					"INSERT INTO settings(key, value) VALUES('rate_max_row', '419')"
 				)
 			# Миграция: если есть старый ключ rate_last_row, удаляем его
 			if 'rate_last_row' in existing_keys:
 				await self._db.execute(
-					"DELETE FROM google_sheets_settings WHERE key = 'rate_last_row'"
+					"DELETE FROM settings WHERE key = 'rate_last_row'"
 				)
 			if 'balance_row' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('balance_row', '4')"
+					"INSERT INTO settings(key, value) VALUES('balance_row', '4')"
 				)
 			if 'profit_column' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('profit_column', 'BC')"
+					"INSERT INTO settings(key, value) VALUES('profit_column', 'BC')"
 				)
 			if 'expenses_cell' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO google_sheets_settings(key, value) VALUES('expenses_cell', 'BD420')"
+					"INSERT INTO settings(key, value) VALUES('expenses_cell', 'BD420')"
 				)
 			
 			# Добавляем настройки дней недели, если их нет
@@ -2074,15 +2094,21 @@ class Database:
 			for key, default_value in day_settings:
 				if key not in existing_keys:
 					await self._db.execute(
-						f"INSERT INTO google_sheets_settings(key, value) VALUES('{key}', '{default_value}')"
+						f"INSERT INTO settings(key, value) VALUES('{key}', '{default_value}')"
 					)
+			
+			# Добавляем настройку количества пользователей на странице
+			if 'users_per_page' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('users_per_page', '10')"
+				)
 
-	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+	async def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
 		"""
-		Получает значение настройки Google Sheets.
+		Получает значение настройки.
 		
 		Args:
-			key: Ключ настройки (delete_range, zero_column, start_row)
+			key: Ключ настройки
 			default: Значение по умолчанию, если настройка не найдена
 		
 		Returns:
@@ -2090,7 +2116,7 @@ class Database:
 		"""
 		assert self._db
 		cur = await self._db.execute(
-			"SELECT value FROM google_sheets_settings WHERE key = ?",
+			"SELECT value FROM settings WHERE key = ?",
 			(key,)
 		)
 		row = await cur.fetchone()
@@ -2098,20 +2124,29 @@ class Database:
 			return row[0]
 		return default
 
-	async def set_google_sheets_setting(self, key: str, value: str) -> None:
+	async def set_setting(self, key: str, value: str) -> None:
 		"""
-		Устанавливает значение настройки Google Sheets.
+		Устанавливает значение настройки.
 		
 		Args:
-			key: Ключ настройки (delete_range, zero_column, start_row)
+			key: Ключ настройки
 			value: Значение настройки
 		"""
 		assert self._db
 		await self._db.execute(
-			"INSERT OR REPLACE INTO google_sheets_settings(key, value) VALUES(?, ?)",
+			"INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
 			(key, value)
 		)
 		await self._db.commit()
+	
+	# Обратная совместимость (deprecated)
+	async def get_google_sheets_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+		"""Устаревший метод, используйте get_setting"""
+		return await self.get_setting(key, default)
+	
+	async def set_google_sheets_setting(self, key: str, value: str) -> None:
+		"""Устаревший метод, используйте set_setting"""
+		await self.set_setting(key, value)
 		_logger.debug(f"Google Sheets setting set: {key}={value}")
 
 	async def add_card_requisite(self, card_id: int, requisite_text: str) -> int:

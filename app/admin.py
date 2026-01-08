@@ -51,8 +51,6 @@ from app.di import get_db, get_admin_ids, get_admin_usernames
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
 
-USERS_PER_PAGE = 6
-
 
 async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optional[Dict[str, Any]] = None, back_to: str = "admin:back"):
 	"""
@@ -5204,6 +5202,13 @@ async def add_card_name(message: Message, state: FSMContext):
 
 async def render_users_page(cb: CallbackQuery, page: int = 0) -> None:
 	db = get_db()
+	# Получаем количество пользователей на странице из БД (по умолчанию 10)
+	users_per_page_str = await db.get_google_sheets_setting("users_per_page", "10")
+	try:
+		users_per_page = int(users_per_page_str) if users_per_page_str else 10
+	except (ValueError, TypeError):
+		users_per_page = 10
+	
 	rows = await db.list_users_with_binding()
 	items: List[Tuple[int, str]] = []
 	for r in rows:
@@ -5220,22 +5225,22 @@ async def render_users_page(cb: CallbackQuery, page: int = 0) -> None:
 			label += f" → {card_names}"
 		items.append((r["user_id"], label))
 	total = len(items)
-	logger.debug(f"Show users: total={total} page={page}")
+	logger.debug(f"Show users: total={total} page={page} users_per_page={users_per_page}")
 	if total == 0:
 		text = "Пользователи не найдены."
 		reply_markup = users_list_kb([], back_to="admin:back")
 	else:
-		total_pages = (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE
+		total_pages = (total + users_per_page - 1) // users_per_page
 		page = max(0, min(page, total_pages - 1))
-		start = page * USERS_PER_PAGE
-		end = start + USERS_PER_PAGE
+		start = page * users_per_page
+		end = start + users_per_page
 		page_items = items[start:end]
 		text = f"Пользователи (стр. {page+1}/{total_pages}, всего: {total}):"
 		reply_markup = users_list_kb(
 			page_items,
 			back_to="admin:back",
 			page=page,
-			per_page=USERS_PER_PAGE,
+			per_page=users_per_page,
 			total=total,
 		)
 	await cb.message.edit_text(text, reply_markup=reply_markup)
