@@ -95,6 +95,8 @@ class Database:
 		await self._ensure_item_usage_log()
 		await self._ensure_card_replenishments()
 		await self._ensure_orders_table()
+		await self._ensure_sell_orders_table()
+		await self._ensure_order_messages_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -2517,4 +2519,230 @@ class Database:
 		)
 		await self._db.commit()
 		return cur.rowcount > 0
+	
+	async def _ensure_sell_orders_table(self) -> None:
+		"""Создает таблицу для хранения заявок на продажу"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='sell_orders'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE sell_orders (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					order_number INTEGER NOT NULL,
+					user_tg_id INTEGER NOT NULL,
+					user_name TEXT,
+					user_username TEXT,
+					crypto_type TEXT NOT NULL,
+					crypto_display TEXT NOT NULL,
+					amount REAL NOT NULL,
+					amount_currency REAL NOT NULL,
+					currency_symbol TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					completed_at INTEGER,
+					admin_message_id INTEGER,
+					user_message_id INTEGER,
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_sell_orders_user_tg_id ON sell_orders(user_tg_id)"
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_sell_orders_created_at ON sell_orders(created_at)"
+			)
+			_logger.debug("Created table sell_orders")
+		else:
+			# Проверяем наличие поля user_message_id
+			cur = await self._db.execute("PRAGMA table_info(sell_orders)")
+			columns = [row[1] for row in await cur.fetchall()]
+			if 'user_message_id' not in columns:
+				await self._db.execute("ALTER TABLE sell_orders ADD COLUMN user_message_id INTEGER")
+				_logger.debug("Added column user_message_id to sell_orders table")
+	
+	async def _ensure_order_messages_table(self) -> None:
+		"""Создает таблицу для хранения сообщений по сделкам"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='order_messages'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE order_messages (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					sell_order_id INTEGER NOT NULL,
+					sender_type TEXT NOT NULL,
+					message_text TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (sell_order_id) REFERENCES sell_orders(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_order_messages_sell_order_id ON order_messages(sell_order_id)"
+			)
+			_logger.debug("Created table order_messages")
+	
+	async def create_sell_order(
+		self,
+		user_tg_id: int,
+		user_name: str,
+		user_username: str,
+		crypto_type: str,
+		crypto_display: str,
+		amount: float,
+		amount_currency: float,
+		currency_symbol: str,
+		admin_message_id: int = None,
+	) -> int:
+		"""
+		Создает новую заявку на продажу и возвращает её ID.
+		Номер заявки - это количество заявок на продажу за сегодня + 1.
+		"""
+		assert self._db
+		
+		# Получаем количество заявок на продажу за сегодня
+		today_start = int(time.time()) - (int(time.time()) % 86400)
+		cur = await self._db.execute(
+			"SELECT COUNT(*) FROM sell_orders WHERE created_at >= ?",
+			(today_start,)
+		)
+		today_orders_count = (await cur.fetchone())[0]
+		order_number = today_orders_count + 1
+		
+		# Создаем заявку
+		cur = await self._db.execute(
+			"""
+			INSERT INTO sell_orders (
+				order_number, user_tg_id, user_name, user_username,
+				crypto_type, crypto_display, amount, amount_currency,
+				currency_symbol, admin_message_id
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			""",
+			(
+				order_number, user_tg_id, user_name, user_username,
+				crypto_type, crypto_display, amount, amount_currency,
+				currency_symbol, admin_message_id
+			)
+		)
+		await self._db.commit()
+		order_id = cur.lastrowid
+		_logger.debug(f"Created sell_order: id={order_id}, order_number={order_number}, user_tg_id={user_tg_id}")
+		return order_id
+	
+	async def get_sell_order_by_id(self, order_id: int) -> Optional[Dict[str, Any]]:
+		"""Получает заявку на продажу по ID"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT 
+				id, order_number, user_tg_id, user_name, user_username,
+				crypto_type, crypto_display, amount, amount_currency,
+				currency_symbol, created_at, completed_at, admin_message_id, user_message_id
+			FROM sell_orders WHERE id = ?
+			""",
+			(order_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		result = {
+			"id": row[0],
+			"order_number": row[1],
+			"user_tg_id": row[2],
+			"user_name": row[3],
+			"user_username": row[4],
+			"crypto_type": row[5],
+			"crypto_display": row[6],
+			"amount": row[7],
+			"amount_currency": row[8],
+			"currency_symbol": row[9],
+			"created_at": row[10],
+			"completed_at": row[11],
+			"admin_message_id": row[12] if len(row) > 12 else None,
+			"user_message_id": row[13] if len(row) > 13 else None,
+		}
+		return result
+	
+	async def add_order_message(
+		self,
+		sell_order_id: int,
+		sender_type: str,
+		message_text: str,
+	) -> int:
+		"""Добавляет сообщение в переписку по сделке"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			INSERT INTO order_messages (sell_order_id, sender_type, message_text)
+			VALUES (?, ?, ?)
+			""",
+			(sell_order_id, sender_type, message_text)
+		)
+		await self._db.commit()
+		message_id = cur.lastrowid
+		_logger.debug(f"Added order message: id={message_id}, sell_order_id={sell_order_id}, sender_type={sender_type}")
+		return message_id
+	
+	async def get_order_messages(self, sell_order_id: int) -> List[Dict[str, Any]]:
+		"""Получает все сообщения по сделке"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id, sender_type, message_text, created_at
+			FROM order_messages
+			WHERE sell_order_id = ?
+			ORDER BY created_at ASC
+			""",
+			(sell_order_id,)
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"id": row[0],
+				"sender_type": row[1],
+				"message_text": row[2],
+				"created_at": row[3],
+			}
+			for row in rows
+		]
+	
+	async def complete_sell_order(self, order_id: int) -> bool:
+		"""Отмечает заявку на продажу как выполненную"""
+		assert self._db
+		cur = await self._db.execute(
+			"UPDATE sell_orders SET completed_at = ? WHERE id = ?",
+			(int(time.time()), order_id)
+		)
+		await self._db.commit()
+		return cur.rowcount > 0
+	
+	async def update_sell_order_user_message_id(self, order_id: int, user_message_id: int) -> bool:
+		"""Обновляет user_message_id для сделки на продажу"""
+		assert self._db
+		cur = await self._db.execute(
+			"UPDATE sell_orders SET user_message_id = ? WHERE id = ?",
+			(user_message_id, order_id)
+		)
+		await self._db.commit()
+		return cur.rowcount > 0
+	
+	async def get_active_sell_order_by_user(self, user_tg_id: int) -> Optional[int]:
+		"""Получает ID последней активной (незавершенной) сделки пользователя"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id FROM sell_orders
+			WHERE user_tg_id = ? AND completed_at IS NULL
+			ORDER BY created_at DESC
+			LIMIT 1
+			""",
+			(user_tg_id,)
+		)
+		row = await cur.fetchone()
+		return row[0] if row else None
 	

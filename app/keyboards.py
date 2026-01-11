@@ -28,6 +28,9 @@ def client_menu_kb() -> ReplyKeyboardMarkup:
 			[
 				KeyboardButton(text="🚀 Купить"),
 				KeyboardButton(text="⚡ Продать"),
+			],
+			[
+				KeyboardButton(text="❓ Задать вопрос"),
 			]
 		],
 		resize_keyboard=True,
@@ -73,6 +76,57 @@ def buy_crypto_kb() -> ReplyKeyboardMarkup:
 		resize_keyboard=True,
 		one_time_keyboard=False,
 	)
+
+
+def sell_crypto_kb() -> ReplyKeyboardMarkup:
+	"""Подменю 'Продать': выбор криптовалюты."""
+	return ReplyKeyboardMarkup(
+		keyboard=[
+			[
+				KeyboardButton(text="Bitcoin - BTC"),
+			],
+			[
+				KeyboardButton(text="Litecoin - LTC"),
+			],
+			[
+				KeyboardButton(text="USDT - TRC20"),
+			],
+			[
+				KeyboardButton(text="Monero - XMR"),
+			],
+			[
+				KeyboardButton(text="⬅️ Назад"),
+			],
+		],
+		resize_keyboard=True,
+		one_time_keyboard=False,
+	)
+
+
+def sell_confirmation_kb() -> InlineKeyboardMarkup:
+	"""Клавиатура для подтверждения продажи"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="✅ Согласен", callback_data="sell:confirm:yes")
+	kb.button(text="❌ Не согласен", callback_data="sell:confirm:no")
+	kb.adjust(2)
+	return kb.as_markup()
+
+
+def sell_order_admin_kb(sell_order_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для админа при работе со сделкой на продажу"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать сообщение", callback_data=f"sell:order:message:{sell_order_id}")
+	kb.button(text="✅ Завершить", callback_data=f"sell:order:complete:{sell_order_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для пользователя с кнопкой 'Ответить' по сделке на продажу"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Ответить", callback_data=f"sell:order:user:reply:{order_id}")
+	kb.adjust(1)
+	return kb.as_markup()
 
 
 def admin_settings_kb() -> InlineKeyboardMarkup:
@@ -1152,6 +1206,19 @@ def order_action_kb(order_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
+def question_reply_kb(user_tg_id: int, question_text: str) -> InlineKeyboardMarkup:
+	"""Клавиатура для ответа на вопрос пользователя."""
+	kb = InlineKeyboardBuilder()
+	# Кодируем вопрос в base64 для передачи в callback_data
+	# Ограничиваем длину вопроса до 200 символов, чтобы callback_data не превышал лимит
+	import base64
+	question_short = question_text[:200] if len(question_text) > 200 else question_text
+	question_encoded = base64.b64encode(question_short.encode('utf-8')).decode('ascii')
+	kb.button(text="💬 Ответить", callback_data=f"question:reply:{user_tg_id}:{question_encoded}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
 def delete_message_kb() -> InlineKeyboardMarkup:
 	"""Клавиатура с кнопкой 'Удалить' для удаления сообщения"""
 	kb = InlineKeyboardBuilder()
@@ -1161,8 +1228,9 @@ def delete_message_kb() -> InlineKeyboardMarkup:
 
 
 def user_access_request_kb(user_id: int) -> InlineKeyboardMarkup:
-	"""Клавиатура для запроса доступа пользователя с кнопкой 'Разрешить'"""
+	"""Клавиатура для запроса доступа пользователя с кнопкой 'Разрешить' и 'Меню пользователя'"""
 	kb = InlineKeyboardBuilder()
 	kb.button(text="✅ Разрешить", callback_data=f"settings:users:set:{user_id}:allow")
-	kb.adjust(1)
+	kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
+	kb.adjust(1, 1)
 	return kb.as_markup()

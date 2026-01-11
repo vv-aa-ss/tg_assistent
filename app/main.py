@@ -17,7 +17,7 @@ from aiogram import F
 from app.config import get_settings
 from app.db import Database
 from app.admin import admin_router, is_admin
-from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb
+from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb, sell_crypto_kb, sell_confirmation_kb, sell_order_user_reply_kb
 from app.di import get_admin_ids
 from app.di import set_dependencies
 
@@ -30,6 +30,23 @@ class BuyStates(StatesGroup):
 	waiting_delivery_method = State()  # Ожидание выбора способа доставки
 	waiting_payment_confirmation = State()  # Ожидание подтверждения оплаты
 	waiting_payment_proof = State()  # Ожидание скриншота/чека оплаты
+
+
+class QuestionStates(StatesGroup):
+	"""Состояния для вопроса пользователя"""
+	waiting_question = State()  # Ожидание ввода вопроса
+
+
+class SellStates(StatesGroup):
+	"""Состояния для процесса продажи криптовалюты"""
+	selecting_crypto = State()  # Выбор криптовалюты
+	waiting_amount = State()  # Ожидание ввода суммы
+	waiting_confirmation = State()  # Ожидание подтверждения сделки
+
+
+class SellOrderUserReplyStates(StatesGroup):
+	"""Состояния для ответа пользователя на сообщение админа по сделке"""
+	waiting_reply = State()  # Ожидание ввода ответа пользователя
 
 
 async def delete_previous_bot_message(bot: Bot, chat_id: int, message_id: int | None):
@@ -223,9 +240,10 @@ async def main() -> None:
 
 	# Команды для пользователей (чтобы появлялась кнопка "Меню" в чате)
 	user_commands = [
-		BotCommand(command="start", description="Меню"),
+		BotCommand(command="start", description="Перезапуск бота"),
 		BotCommand(command="buy", description="Купить"),
 		BotCommand(command="sell", description="Продать"),
+		BotCommand(command="question", description="Задать вопрос"),
 	]
 	
 	# Скрываем команды для всех пользователей по умолчанию
@@ -356,7 +374,7 @@ async def main() -> None:
 
 		# Остальные: игнор (без ответа)
 
-	@dp.message(F.text.in_({"🚀 Купить", "⚡ Продать"}))
+	@dp.message(F.text.in_({"🚀 Купить", "⚡ Продать", "❓ Задать вопрос"}))
 	async def on_client_menu_message(message: Message, state: FSMContext):
 		if not message.from_user:
 			return
@@ -369,7 +387,19 @@ async def main() -> None:
 		if message.text == "🚀 Купить":
 			await send_and_save_message(message, "Выберите страну:", reply_markup=buy_country_kb(), state=state)
 		elif message.text == "⚡ Продать":
-			await send_and_save_message(message, "Вы выбрали: Продать", state=state)
+			# Очищаем состояние при начале новой продажи
+			await state.clear()
+			await state.set_state(SellStates.selecting_crypto)
+			from app.keyboards import sell_crypto_kb
+			await send_and_save_message(message, "Выберите криптовалюту для продажи:", reply_markup=sell_crypto_kb(), state=state)
+		elif message.text == "❓ Задать вопрос":
+			# Переводим в состояние ожидания вопроса
+			await state.set_state(QuestionStates.waiting_question)
+			await send_and_save_message(
+				message,
+				"📝 Пожалуйста, введите ваш вопрос. Администратор получит ваше сообщение и свяжется с вами.",
+				state=state
+			)
 
 	@dp.message(F.text == "⬅️ Назад")
 	async def on_client_back(message: Message, state: FSMContext):
@@ -396,6 +426,12 @@ async def main() -> None:
 			if last_bot_message_id:
 				await state.update_data(last_bot_message_id=last_bot_message_id)
 			await send_and_save_message(message, "Выберите криптовалюту:", reply_markup=buy_crypto_kb(), state=state)
+			return
+		
+		if current_state == QuestionStates.waiting_question:
+			# Если пользователь в процессе ввода вопроса, возвращаем в главное меню
+			await state.clear()
+			await send_and_save_message(message, "Выберите действие:", reply_markup=client_menu_kb(), state=state)
 			return
 		
 		# Иначе возвращаем в главное меню
@@ -440,6 +476,26 @@ async def main() -> None:
 		from app.keyboards import buy_crypto_kb
 		await send_and_save_message(message, "Выберите криптовалюту:", reply_markup=buy_crypto_kb(), state=state)
 
+	# Обработчики для продажи (должны быть ПЕРЕД обработчиками покупки)
+	@dp.message(SellStates.selecting_crypto, F.text.in_({"Bitcoin - BTC", "Litecoin - LTC", "USDT - TRC20", "Monero - XMR"}))
+	async def on_sell_crypto_selected(message: Message, state: FSMContext):
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		await delete_user_message(message)
+		crypto_name = message.text
+		if " - " in crypto_name:
+			crypto_display = crypto_name.split(" - ")[0]
+		else:
+			crypto_display = crypto_name
+		
+		await state.update_data(selected_crypto=crypto_name, crypto_display=crypto_display)
+		await state.set_state(SellStates.waiting_amount)
+		await send_and_save_message(message, f"✅ Введите сумму в {crypto_display}, которую хотите продать:", state=state)
+
 	@dp.message(F.text.in_({"Bitcoin - BTC", "Litecoin - LTC", "USDT - TRC20", "Monero - XMR"}))
 	async def on_buy_crypto_selected(message: Message, state: FSMContext):
 		if not message.from_user:
@@ -448,6 +504,12 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		
+		# Проверяем, что мы не в состоянии продажи
+		current_state = await state.get_state()
+		if current_state and "SellStates" in str(current_state):
+			return  # Пропускаем, если в состоянии продажи
+		
 		# Удаляем сообщение пользователя
 		await delete_user_message(message)
 		# Сохраняем выбранную криптовалюту
@@ -471,6 +533,11 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		
+		# Проверяем, что мы действительно в состоянии покупки, а не продажи
+		current_state = await state.get_state()
+		if current_state and "SellStates" in str(current_state):
+			return  # Пропускаем, если в состоянии продажи
 		
 		# Проверяем, не является ли это командой или кнопкой "Назад"
 		if message.text == "⬅️ Назад":
@@ -1089,6 +1156,96 @@ async def main() -> None:
 		# Очищаем состояние
 		await state.clear()
 	
+	@dp.message(QuestionStates.waiting_question)
+	async def on_question_received(message: Message, state: FSMContext):
+		"""Обработчик получения вопроса от пользователя"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Получаем текст вопроса
+		question_text = message.text or message.caption or ""
+		if not question_text.strip():
+			await send_and_save_message(
+				message,
+				"❌ Пожалуйста, введите текст вопроса.",
+				state=state
+			)
+			return
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем информацию о пользователе
+		user_name = message.from_user.full_name or "Не указано"
+		user_username = message.from_user.username or "Не указано"
+		user_tg_id = message.from_user.id
+		
+		# Формируем сообщение для админов
+		admin_message_text = (
+			f"❓ <b>Вопрос от пользователя</b>\n\n"
+			f"👤 Имя: {user_name}\n"
+			f"📱 Username: @{user_username}\n"
+			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+			f"💬 <b>Вопрос:</b>\n{question_text}"
+		)
+		
+		# Создаем клавиатуру с кнопкой "Ответить"
+		from app.keyboards import question_reply_kb
+		reply_keyboard = question_reply_kb(user_tg_id, question_text)
+		
+		# Отправляем вопрос всем админам
+		admin_ids = get_admin_ids()
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"📤 Отправка вопроса от пользователя {user_tg_id} админам. Список админов: {admin_ids}")
+		
+		if not admin_ids:
+			logger_main.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Список админов пустой! Вопрос не будет отправлен.")
+			await send_and_save_message(
+				message,
+				"❌ Произошла ошибка при отправке вопроса. Попробуйте позже.",
+				reply_markup=client_menu_kb(),
+				state=state
+			)
+			await state.clear()
+			return
+		
+		sent_to_admins = False
+		for admin_id in admin_ids:
+			try:
+				await message.bot.send_message(
+					chat_id=admin_id,
+					text=admin_message_text,
+					parse_mode=ParseMode.HTML,
+					reply_markup=reply_keyboard
+				)
+				sent_to_admins = True
+				logger_main.info(f"✅ Вопрос отправлен админу {admin_id}")
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка отправки вопроса админу {admin_id}: {e}", exc_info=True)
+		
+		if sent_to_admins:
+			# Сообщаем пользователю об успешной отправке
+			await send_and_save_message(
+				message,
+				"✅ Ваш вопрос отправлен администратору. Мы свяжемся с вами в ближайшее время.",
+				reply_markup=client_menu_kb(),
+				state=state
+			)
+		else:
+			await send_and_save_message(
+				message,
+				"❌ Произошла ошибка при отправке вопроса. Попробуйте позже.",
+				reply_markup=client_menu_kb(),
+				state=state
+			)
+		
+		# Очищаем состояние
+		await state.clear()
+	
 	@dp.callback_query(F.data.startswith("order:completed:"))
 	async def on_order_completed(cb: CallbackQuery, state: FSMContext):
 		"""Обработчик нажатия кнопки 'Выполнил'"""
@@ -1231,10 +1388,665 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
-		await send_and_save_message(message, "Вы выбрали: Продать", state=state)
+		# Очищаем состояние при начале новой продажи
+		await state.clear()
+		await state.set_state(SellStates.selecting_crypto)
+		from app.keyboards import sell_crypto_kb
+		await send_and_save_message(message, "Выберите криптовалюту для продажи:", reply_markup=sell_crypto_kb(), state=state)
+
+	@dp.message(Command("question"))
+	async def cmd_question(message: Message, state: FSMContext):
+		"""Обработчик команды /question для вопроса пользователя"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Переводим в состояние ожидания вопроса
+		await state.set_state(QuestionStates.waiting_question)
+		await send_and_save_message(
+			message,
+			"📝 Пожалуйста, введите ваш вопрос. Администратор получит ваше сообщение и свяжется с вами.",
+			state=state
+		)
+
+	@dp.message(SellStates.selecting_crypto, F.text == "⬅️ Назад")
+	async def on_sell_back_to_menu(message: Message, state: FSMContext):
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		await delete_user_message(message)
+		await state.clear()
+		await send_and_save_message(message, "Главное меню", reply_markup=client_menu_kb(), state=state)
+
+	@dp.message(SellStates.waiting_amount)
+	async def on_sell_amount_entered(message: Message, state: FSMContext):
+		"""Обработчик ввода суммы для продажи криптовалюты"""
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		if message.text == "⬅️ Назад":
+			await delete_user_message(message)
+			data = await state.get_data()
+			last_bot_message_id = data.get("last_bot_message_id")
+			await state.clear()
+			await state.set_state(SellStates.selecting_crypto)
+			if last_bot_message_id:
+				await state.update_data(last_bot_message_id=last_bot_message_id)
+			await send_and_save_message(message, "Выберите криптовалюту для продажи:", reply_markup=sell_crypto_kb(), state=state)
+			return
+		
+		await delete_user_message(message)
+		
+		data = await state.get_data()
+		crypto_name = data.get("selected_crypto", "")
+		crypto_display = data.get("crypto_display", "")
+		
+		amount_str = message.text.strip().replace(",", ".")
+		
+		try:
+			amount = float(amount_str)
+			if amount <= 0:
+				await send_and_save_message(message, "❌ Сумма должна быть больше нуля. Введите корректную сумму:", state=state)
+				return
+		except ValueError:
+			await send_and_save_message(message, "❌ Неверный формат суммы. Введите число (например: 0.008 или 100):", state=state)
+			return
+		
+		# Определяем тип криптовалюты
+		crypto_type = None
+		if "BTC" in crypto_name or "Bitcoin" in crypto_name:
+			crypto_type = "BTC"
+		elif "LTC" in crypto_name or "Litecoin" in crypto_name:
+			crypto_type = "LTC"
+		elif "USDT" in crypto_name:
+			crypto_type = "USDT"
+		elif "XMR" in crypto_name or "Monero" in crypto_name:
+			crypto_type = "XMR"
+		
+		# Получаем курс криптовалюты в USD
+		from app.google_sheets import get_btc_price_usd, get_ltc_price_usd, get_xmr_price_usd
+		
+		crypto_price_usd = None
+		if crypto_type == "BTC":
+			crypto_price_usd = await get_btc_price_usd()
+		elif crypto_type == "LTC":
+			crypto_price_usd = await get_ltc_price_usd()
+		elif crypto_type == "USDT":
+			crypto_price_usd = 1.0
+		elif crypto_type == "XMR":
+			crypto_price_usd = await get_xmr_price_usd()
+		
+		if crypto_price_usd is None:
+			await send_and_save_message(message, "❌ Не удалось получить курс криптовалюты. Попробуйте позже.", state=state)
+			return
+		
+		# Используем RUB по умолчанию
+		usd_to_currency_rate = 95.0
+		currency_symbol = "₽"
+		
+		# Рассчитываем сумму в валюте (без наценки для продажи)
+		amount_currency = crypto_price_usd * amount * usd_to_currency_rate
+		
+		# Сохраняем данные
+		await state.update_data(
+			amount=amount,
+			amount_currency=amount_currency,
+			crypto_type=crypto_type,
+			crypto_price_usd=crypto_price_usd,
+			currency_symbol=currency_symbol,
+			usd_to_currency_rate=usd_to_currency_rate
+		)
+		
+		# Формируем сообщение с информацией
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		confirmation_text = (
+			f"💰 Криптовалюта: {crypto_display}\n"
+			f"💵 Сумма: {amount_str} {crypto_display}"
+		)
+		
+		from app.keyboards import sell_confirmation_kb
+		await state.set_state(SellStates.waiting_confirmation)
+		
+		bot = message.bot
+		chat_id = message.chat.id
+		
+		previous_message_id = None
+		if state:
+			data = await state.get_data()
+			previous_message_id = data.get("last_bot_message_id")
+		
+		if previous_message_id:
+			try:
+				await bot.delete_message(chat_id=chat_id, message_id=previous_message_id)
+			except:
+				pass
+		
+		sent_message = await bot.send_message(
+			chat_id=chat_id,
+			text=confirmation_text,
+			reply_markup=sell_confirmation_kb(),
+			parse_mode="HTML"
+		)
+		
+		if state:
+			await state.update_data(last_bot_message_id=sent_message.message_id)
+
+	@dp.callback_query(F.data == "sell:confirm:yes", SellStates.waiting_confirmation)
+	async def on_sell_confirm_yes(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик подтверждения продажи"""
+		if not cb.from_user:
+			await cb.answer()
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			await cb.answer()
+			return
+		
+		await cb.answer()
+		
+		# Получаем данные о продаже
+		data = await state.get_data()
+		amount = data.get("amount", 0)
+		amount_currency = data.get("amount_currency", 0)
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
+		currency_symbol = data.get("currency_symbol", "₽")
+		
+		# Форматируем суммы
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Получаем информацию о пользователе
+		user_tg_id = cb.from_user.id
+		user_name = cb.from_user.full_name or "Не указано"
+		user_username = cb.from_user.username or "Не указано"
+		
+		# Создаем заявку на продажу в БД
+		from app.keyboards import sell_order_admin_kb
+		bot = cb.bot
+		
+		# Формируем сообщение для админа
+		admin_message_text = (
+			f"💰 <b>Заявка на продажу</b>\n\n"
+			f"📊 Номер заявки: #{{order_number}}\n"
+			f"👤 Имя: {user_name}\n"
+			f"📱 Username: @{user_username}\n"
+			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+			f"💵 Криптовалюта: {crypto_display}\n"
+			f"💸 Сумма: {amount_str} {crypto_display}\n"
+			f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+		)
+		
+		# Отправляем заявку всем админам
+		admin_ids = get_admin_ids()
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"📤 Отправка заявки на продажу от пользователя {user_tg_id} админам. Список админов: {admin_ids}")
+		
+		if not admin_ids:
+			logger_main.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Список админов пустой! Заявка не будет отправлена.")
+			await cb.message.edit_text("❌ Произошла ошибка при отправке заявки. Попробуйте позже.")
+			await state.clear()
+			return
+		
+		sent_to_admins = False
+		admin_message_id = None
+		for admin_id in admin_ids:
+			try:
+				# Сначала отправляем сообщение без номера заявки
+				sent_msg = await bot.send_message(
+					chat_id=admin_id,
+					text=admin_message_text.format(order_number="..."),
+					parse_mode="HTML",
+					reply_markup=sell_order_admin_kb(0)  # Временно 0, обновим после создания заявки
+				)
+				admin_message_id = sent_msg.message_id
+				sent_to_admins = True
+				break  # Отправляем только первому админу
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка отправки заявки админу {admin_id}: {e}")
+		
+		if not sent_to_admins:
+			await cb.message.edit_text("❌ Произошла ошибка при отправке заявки. Попробуйте позже.")
+			await state.clear()
+			return
+		
+		# Создаем заявку в БД
+		order_id = await db_local.create_sell_order(
+			user_tg_id=user_tg_id,
+			user_name=user_name,
+			user_username=user_username,
+			crypto_type=crypto_type,
+			crypto_display=crypto_display,
+			amount=amount,
+			amount_currency=amount_currency,
+			currency_symbol=currency_symbol,
+			admin_message_id=admin_message_id
+		)
+		
+		# Получаем номер заявки
+		order = await db_local.get_sell_order_by_id(order_id)
+		order_number = order["order_number"] if order else order_id
+		
+		# Обновляем сообщение админу с правильным номером заявки и клавиатурой
+		try:
+			await bot.edit_message_text(
+				chat_id=admin_ids[0],
+				message_id=admin_message_id,
+				text=admin_message_text.format(order_number=order_number),
+				parse_mode="HTML",
+				reply_markup=sell_order_admin_kb(order_id)
+			)
+		except Exception as e:
+			logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}")
+		
+		# Уведомляем пользователя
+		await cb.message.edit_text(
+			f"✅ Ваша заявка на продажу принята!\n\n"
+			f"💵 Криптовалюта: {crypto_display}\n"
+			f"💸 Сумма: {amount_str} {crypto_display}\n\n"
+			f"Администратор свяжется с вами в ближайшее время.",
+			parse_mode="HTML"
+		)
+		
+		await state.clear()
+
+	@dp.callback_query(F.data == "sell:confirm:no", SellStates.waiting_confirmation)
+	async def on_sell_confirm_no(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик отказа от продажи"""
+		if not cb.from_user:
+			await cb.answer()
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			await cb.answer()
+			return
+		
+		await cb.answer()
+		
+		# Возвращаемся в главное меню
+		await cb.message.edit_text("❌ Заявка отменена.")
+		await state.clear()
+		await cb.message.bot.send_message(
+			chat_id=cb.message.chat.id,
+			text="Главное меню",
+			reply_markup=client_menu_kb()
+		)
 
 	# ВАЖНО: Сначала включаем admin_router, чтобы команды из него обрабатывались первыми
 	dp.include_router(admin_router)
+
+	# Обработчик ответов пользователя на сообщения админа по сделке на продажу
+	@dp.message(
+		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
+		StateFilter(None),
+		~(F.text.startswith("/") if F.text else False)
+	)
+	async def on_user_reply_to_sell_order(message: Message):
+		"""Обработчик ответов пользователя на сообщения админа по сделке"""
+		if not message.from_user:
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		
+		# Проверяем, есть ли у пользователя активная сделка на продажу
+		user_tg_id = message.from_user.id
+		
+		# Получаем последнюю активную сделку пользователя
+		order_id = await db_local.get_active_sell_order_by_user(user_tg_id)
+		
+		if not order_id:
+			# Нет активной сделки, пропускаем обработку
+			return
+		
+		# Получаем текст сообщения
+		message_text = message.text or message.caption or ""
+		if not message_text.strip():
+			return
+		
+		# Сохраняем сообщение в истории переписки
+		await db_local.add_order_message(order_id, "user", message_text)
+		
+		# Получаем информацию о сделке
+		order = await db_local.get_sell_order_by_id(order_id)
+		if not order:
+			return
+		
+		# Получаем всю историю переписки
+		messages = await db_local.get_order_messages(order_id)
+		
+		# Формируем сообщение для админа с историей
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+		
+		admin_message = "\n\n".join(history_lines)
+		
+		# Отправляем сообщение админу
+		admin_ids = get_admin_ids()
+		logger_main = logging.getLogger("app.main")
+		
+		if admin_ids and order.get("admin_message_id"):
+			try:
+				# Формируем полное сообщение для админа
+				order_number = order["order_number"]
+				user_name = order.get("user_name", "Не указано")
+				user_username = order.get("user_username", "Не указано")
+				crypto_display = order["crypto_display"]
+				amount = order["amount"]
+				amount_currency = order["amount_currency"]
+				currency_symbol = order["currency_symbol"]
+				
+				# Форматируем сумму
+				if amount < 1:
+					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+				else:
+					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+				
+				# Формируем исходное сообщение о сделке
+				order_info = (
+					f"💰 <b>Заявка на продажу</b>\n\n"
+					f"📊 Номер заявки: #{order_number}\n"
+					f"👤 Имя: {user_name}\n"
+					f"📱 Username: @{user_username}\n"
+					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+					f"💵 Криптовалюта: {crypto_display}\n"
+					f"💸 Сумма: {amount_str} {crypto_display}\n"
+					f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+				)
+				
+				# Обновляем сообщение админа с историей переписки
+				from app.keyboards import sell_order_admin_kb
+				await message.bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					text=order_info + "\n\n" + admin_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_admin_kb(order_id)
+				)
+				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по сделке {order_id} отправлен админу")
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Если у пользователя было сообщение с историей, обновляем его
+		user_message_id = order.get("user_message_id")
+		if user_message_id:
+			try:
+				# Формируем полное сообщение для пользователя
+				order_number = order["order_number"]
+				crypto_display = order["crypto_display"]
+				amount = order["amount"]
+				
+				# Форматируем сумму
+				if amount < 1:
+					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+				else:
+					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+				
+				order_info = (
+					f"💰 <b>Заявка на продажу #{order_number}</b>\n\n"
+					f"💵 Криптовалюта: {crypto_display}\n"
+					f"💸 Сумма: {amount_str} {crypto_display}\n"
+				)
+				
+				# Получаем обновленную историю переписки
+				updated_messages = await db_local.get_order_messages(order_id)
+				history_lines = []
+				for msg in updated_messages:
+					if msg["sender_type"] == "admin":
+						history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+					else:
+						history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+				
+				history_text = "\n\n".join(history_lines)
+				user_message = order_info + "\n" + history_text
+				
+				# Обновляем сообщение пользователя
+				from app.keyboards import sell_order_user_reply_kb
+				await message.bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_user_reply_kb(order_id)
+				)
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
+		
+		# Отправляем подтверждение пользователю
+		await message.bot.send_message(
+			chat_id=user_tg_id,
+			text="✅ Ваше сообщение отправлено администратору."
+		)
+
+	# Обработчик кнопки "Ответить" для пользователя по сделке
+	@dp.callback_query(F.data.startswith("sell:order:user:reply:"))
+	async def on_sell_order_user_reply_start(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик начала ответа пользователя на сообщение админа по сделке"""
+		if not cb.from_user:
+			await cb.answer()
+			return
+		
+		# Формат: sell:order:user:reply:{order_id}
+		parts = cb.data.split(":")
+		if len(parts) < 5:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		
+		try:
+			order_id = int(parts[4])
+		except ValueError:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		
+		# Проверяем, что это пользователь
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			await cb.answer()
+			return
+		
+		# Получаем информацию о сделке
+		order = await db_local.get_sell_order_by_id(order_id)
+		if not order:
+			await cb.answer("Сделка не найдена", show_alert=True)
+			return
+		
+		# Проверяем, что сделка принадлежит этому пользователю
+		if order["user_tg_id"] != cb.from_user.id:
+			await cb.answer("Это не ваша сделка", show_alert=True)
+			return
+		
+		# Проверяем, не завершена ли сделка
+		if order.get("completed_at"):
+			await cb.answer("Сделка уже завершена", show_alert=True)
+			return
+		
+		# Сохраняем order_id в FSM
+		await state.update_data(sell_order_id=order_id)
+		
+		# Переводим в состояние ожидания ответа
+		await state.set_state(SellOrderUserReplyStates.waiting_reply)
+		
+		try:
+			await cb.message.edit_text(
+				(cb.message.text or "") + "\n\n📝 Введите ваш ответ:",
+				parse_mode="HTML",
+				reply_markup=cb.message.reply_markup
+			)
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.error(f"Ошибка редактирования сообщения: {e}")
+			await cb.message.answer("📝 Введите ваш ответ:")
+		
+		await cb.answer()
+
+	@dp.message(SellOrderUserReplyStates.waiting_reply)
+	async def on_sell_order_user_reply_send(message: Message, state: FSMContext):
+		"""Обработчик отправки ответа пользователя на сообщение админа"""
+		if not message.from_user:
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Получаем данные из FSM
+		data = await state.get_data()
+		order_id = data.get("sell_order_id")
+		
+		if not order_id:
+			await message.answer("❌ Ошибка: не найдена сделка")
+			await state.clear()
+			return
+		
+		# Получаем текст сообщения
+		message_text = message.text or message.caption or ""
+		if not message_text.strip():
+			await message.answer("❌ Пожалуйста, введите текст ответа.")
+			return
+		
+		# Получаем информацию о сделке
+		order = await db_local.get_sell_order_by_id(order_id)
+		if not order:
+			await message.answer("❌ Сделка не найдена")
+			await state.clear()
+			return
+		
+		# Проверяем, что сделка принадлежит этому пользователю
+		if order["user_tg_id"] != message.from_user.id:
+			await message.answer("❌ Это не ваша сделка")
+			await state.clear()
+			return
+		
+		# Сохраняем сообщение в БД
+		await db_local.add_order_message(order_id, "user", message_text)
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Получаем всю историю переписки
+		messages = await db_local.get_order_messages(order_id)
+		
+		# Формируем полное сообщение для пользователя
+		order_number = order["order_number"]
+		crypto_display = order["crypto_display"]
+		amount = order["amount"]
+		
+		# Форматируем сумму
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		order_info = (
+			f"💰 <b>Заявка на продажу #{order_number}</b>\n\n"
+			f"💵 Криптовалюта: {crypto_display}\n"
+			f"💸 Сумма: {amount_str} {crypto_display}\n"
+		)
+		
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+		
+		history_text = "\n\n".join(history_lines)
+		user_message = order_info + "\n" + history_text
+		
+		# Обновляем сообщение пользователя
+		user_message_id = order.get("user_message_id")
+		if user_message_id:
+			try:
+				from app.keyboards import sell_order_user_reply_kb
+				await message.bot.edit_message_text(
+					chat_id=message.from_user.id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_user_reply_kb(order_id)
+				)
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
+		
+		# Обновляем сообщение админа
+		admin_ids = get_admin_ids()
+		if admin_ids and order.get("admin_message_id"):
+			try:
+				user_name = order.get("user_name", "Не указано")
+				user_username = order.get("user_username", "Не указано")
+				user_tg_id = order["user_tg_id"]
+				amount_currency = order["amount_currency"]
+				currency_symbol = order["currency_symbol"]
+				
+				admin_order_info = (
+					f"💰 <b>Заявка на продажу</b>\n\n"
+					f"📊 Номер заявки: #{order_number}\n"
+					f"👤 Имя: {user_name}\n"
+					f"📱 Username: @{user_username}\n"
+					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+					f"💵 Криптовалюта: {crypto_display}\n"
+					f"💸 Сумма: {amount_str} {crypto_display}\n"
+					f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+				)
+				
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_order_info + "\n\n" + admin_history_text
+				
+				from app.keyboards import sell_order_admin_kb
+				await message.bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_admin_kb(order_id)
+				)
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
+		
+		# Отправляем подтверждение пользователю
+		await message.bot.send_message(
+			chat_id=message.from_user.id,
+			text="✅ Ваше сообщение отправлено администратору."
+		)
+		
+		# Очищаем состояние
+		await state.clear()
 
 	# Регистрировать пользователя только когда нет активного состояния и сообщение не переслано
 	# Исключаем команды - они обрабатываются отдельными обработчиками

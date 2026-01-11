@@ -392,6 +392,16 @@ class AddDataStates(StatesGroup):
 	entering_note = State()  # Ввод примечания для /rate
 
 
+class QuestionReplyStates(StatesGroup):
+	"""Состояния для ответа админа на вопрос пользователя"""
+	waiting_reply = State()  # Ожидание ввода ответа
+
+
+class SellOrderMessageStates(StatesGroup):
+	"""Состояния для переписки по сделке на продажу"""
+	waiting_message = State()  # Ожидание ввода сообщения админом
+
+
 class CryptoColumnEditStates(StatesGroup):
 	waiting_column = State()
 	waiting_crypto_name = State()
@@ -1689,6 +1699,7 @@ async def settings_users_set(cb: CallbackQuery, bot: Bot):
 						BotCommand(command="start", description="Меню"),
 						BotCommand(command="buy", description="Купить"),
 						BotCommand(command="sell", description="Продать"),
+						BotCommand(command="question", description="Задать вопрос"),
 					],
 					scope=BotCommandScopeChat(chat_id=tg_id),
 				)
@@ -1733,10 +1744,11 @@ async def settings_users_set(cb: CallbackQuery, bot: Bot):
 			f"Пользователю отправлено приветственное сообщение."
 		)
 		from app.keyboards import user_access_request_kb
-		# Обновляем сообщение, убирая кнопку (или оставляя её, но с другим текстом)
+		# Обновляем сообщение, добавляя кнопку "Меню пользователя"
 		kb = InlineKeyboardBuilder()
 		kb.button(text="✅ Разрешено", callback_data=f"settings:users:set:{user_id}:allow")
-		kb.adjust(1)
+		kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
+		kb.adjust(1, 1)
 		await safe_edit_text(cb.message, text, reply_markup=kb.as_markup(), parse_mode="HTML")
 	else:
 		# Обычное обновление для настроек пользователей
@@ -6482,6 +6494,15 @@ async def user_delete(cb: CallbackQuery):
 		await cb.answer("Пользователь не найден", show_alert=True)
 		return
 	
+	# Получаем tg_id и username перед удалением для отзыва доступа
+	tg_id = user.get("tg_id")
+	username = user.get("username")
+	
+	# Отзываем доступ к боту перед удалением пользователя
+	if tg_id is not None or username:
+		await db.revoke_user_access(tg_id=tg_id, username=username)
+		logger.debug(f"Revoked access for user_id={user_id}, tg_id={tg_id}, username={username}")
+	
 	# Удаляем пользователя (связи удалятся автоматически благодаря CASCADE)
 	await db.delete_user(user_id)
 	logger.debug(f"Deleted user_id={user_id}")
@@ -6610,6 +6631,190 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 	await cb.answer(alert_text)
 
 
+# Обработчик ответа на вопрос пользователя - должен быть ПЕРЕД handle_forwarded_from_admin
+@admin_router.message(QuestionReplyStates.waiting_reply)
+async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик отправки ответа на вопрос пользователя"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	user_tg_id = data.get("question_user_tg_id")
+	question_text = data.get("question_text", "")
+	question_history = data.get("question_history", [])
+	
+	if not user_tg_id:
+		await message.answer("❌ Ошибка: не найден ID пользователя")
+		await state.clear()
+		return
+	
+	# Получаем текст ответа
+	reply_text = message.text or message.caption or ""
+	if not reply_text.strip():
+		await message.answer("❌ Пожалуйста, введите текст ответа.")
+		return
+	
+	# Добавляем ответ в историю
+	question_history.append({"role": "admin", "text": reply_text})
+	
+	# Формируем сообщение для пользователя с историей переписки
+	history_lines = []
+	for item in question_history:
+		if item["role"] == "user":
+			history_lines.append(f"❓ <b>Ваш вопрос:</b>\n{item['text']}")
+		else:
+			history_lines.append(f"💬 <b>Ответ администратора:</b>\n{item['text']}")
+	
+	user_message = "\n\n".join(history_lines)
+	
+	# Отправляем ответ пользователю
+	try:
+		await bot.send_message(
+			chat_id=user_tg_id,
+			text=user_message,
+			parse_mode="HTML"
+		)
+		logger.info(f"✅ Ответ отправлен пользователю {user_tg_id}")
+		
+		# Уведомляем админа об успешной отправке
+		await message.answer(
+			f"✅ Ответ успешно отправлен пользователю (ID: <code>{user_tg_id}</code>)",
+			parse_mode="HTML"
+		)
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки ответа пользователю {user_tg_id}: {e}", exc_info=True)
+		await message.answer(f"❌ Ошибка отправки ответа: {str(e)}")
+	
+	# Очищаем состояние
+	await state.clear()
+
+
+# Обработчики для сделок на продажу - должны быть ПЕРЕД handle_forwarded_from_admin
+@admin_router.message(SellOrderMessageStates.waiting_message)
+async def sell_order_message_send(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик отправки сообщения админом по сделке"""
+	logger.info(f"🔵 SELL_ORDER_MESSAGE_SEND: Получено сообщение message_id={message.message_id}, text='{message.text or message.caption or ''}'")
+	
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		logger.warning(f"🔵 SELL_ORDER_MESSAGE_SEND: Пользователь {message.from_user.id} не является админом")
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("sell_order_id")
+	user_tg_id = data.get("user_tg_id")
+	
+	if not order_id or not user_tg_id:
+		await message.answer("❌ Ошибка: не найдены данные сделки")
+		await state.clear()
+		return
+	
+	# Получаем текст сообщения
+	message_text = message.text or message.caption or ""
+	if not message_text.strip():
+		await message.answer("❌ Пожалуйста, введите текст сообщения.")
+		return
+	
+	# Получаем информацию о сделке
+	db = get_db()
+	order = await db.get_sell_order_by_id(order_id)
+	if not order:
+		await message.answer("❌ Сделка не найдена")
+		await state.clear()
+		return
+	
+	# Сохраняем сообщение в БД
+	await db.add_order_message(order_id, "admin", message_text)
+	
+	# Получаем всю историю переписки
+	messages = await db.get_order_messages(order_id)
+	
+	# Формируем информацию о сделке
+	order_number = order["order_number"]
+	crypto_display = order["crypto_display"]
+	amount = order["amount"]
+	
+	# Форматируем сумму
+	if amount < 1:
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+	else:
+		amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+	
+	# Формируем полное сообщение для пользователя: информация о сделке + история
+	order_info = (
+		f"💰 <b>Заявка на продажу #{order_number}</b>\n\n"
+		f"💵 Криптовалюта: {crypto_display}\n"
+		f"💸 Сумма: {amount_str} {crypto_display}\n"
+	)
+	
+	# Добавляем историю переписки
+	history_lines = []
+	for msg in messages:
+		if msg["sender_type"] == "admin":
+			history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+		else:
+			history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+	
+	history_text = "\n\n".join(history_lines)
+	user_message = order_info + "\n" + history_text
+	
+	# Отправляем или обновляем сообщение пользователю
+	from app.keyboards import sell_order_user_reply_kb
+	try:
+		user_message_id = order.get("user_message_id")
+		if user_message_id:
+			# Обновляем существующее сообщение
+			try:
+				await bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_user_reply_kb(order_id)
+				)
+				logger.info(f"✅ Сообщение обновлено пользователю {user_tg_id} по сделке {order_id}")
+			except Exception as e:
+				# Если не удалось обновить, отправляем новое
+				logger.warning(f"⚠️ Не удалось обновить сообщение {user_message_id}, отправляем новое: {e}")
+				sent_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_user_reply_kb(order_id)
+				)
+				await db.update_sell_order_user_message_id(order_id, sent_msg.message_id)
+				logger.info(f"✅ Новое сообщение отправлено пользователю {user_tg_id} по сделке {order_id}")
+		else:
+			# Отправляем новое сообщение
+			sent_msg = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=sell_order_user_reply_kb(order_id)
+			)
+			await db.update_sell_order_user_message_id(order_id, sent_msg.message_id)
+			logger.info(f"✅ Сообщение отправлено пользователю {user_tg_id} по сделке {order_id}")
+		
+		# Уведомляем админа
+		await message.answer(
+			f"✅ Сообщение отправлено пользователю (ID: <code>{user_tg_id}</code>)",
+			parse_mode="HTML"
+		)
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки сообщения пользователю {user_tg_id}: {e}", exc_info=True)
+		await message.answer(f"❌ Ошибка отправки сообщения: {str(e)}")
+	
+	# Очищаем состояние
+	await state.clear()
+
+
 # Обработчик ввода количества криптовалюты - должен быть ПЕРЕД handle_forwarded_from_admin
 
 # Handle any message and process forwarding logic for admins
@@ -6657,7 +6862,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			if any(state_group in state_str for state_group in [
 				"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
 				"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
-				"DeleteRateStates", "DeleteMoveStates"
+				"DeleteRateStates", "DeleteMoveStates", "QuestionReplyStates",
+				"SellOrderMessageStates", "SellOrderUserReplyStates"
 			]):
 				# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
 				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
@@ -6853,30 +7059,177 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			# Затем показываем меню выбора карты
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
-			await state.update_data(original_tg_id=orig_tg_id)
-			await message.answer(
-				"У пользователя привязано несколько карт. Выберите нужную:",
-				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
-			)
-			return
-		logger.info(f"⚠️ Пользователь {orig_tg_id} не привязан к карте, предлагаем выбрать группу карт")
-		# Сначала отправляем ссылку на mempool, если есть BTC адреса
-		if text:
-			await check_and_send_btc_address_links(bot, message.chat.id, text)
-		# Затем показываем выбор карты
-		groups = await db.list_card_groups()
-		if groups:
-			await state.set_state(ForwardBindStates.waiting_select_group)
-			await state.update_data(original_tg_id=orig_tg_id)
-			await message.answer("Пользователь не привязан. Выберите группу карт:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
-		else:
-			# Если групп нет, показываем все карты
-			rows = await db.list_cards()
-			cards = [(r[0], r[1]) for r in rows]
-			await state.set_state(ForwardBindStates.waiting_select_card)
-			await state.update_data(original_tg_id=orig_tg_id)
-			await message.answer("Пользователь не привязан. Групп пока нет. Выберите карту:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+
+
+@admin_router.callback_query(F.data.startswith("question:reply:"))
+async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала ответа на вопрос пользователя"""
+	# Формат: question:reply:{user_tg_id}:{question_encoded}
+	parts = cb.data.split(":", 3)  # Разделяем максимум на 3 части, чтобы не разбивать base64
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
 		return
+	
+	try:
+		user_tg_id = int(parts[2])
+		question_encoded = parts[3]
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Декодируем вопрос из base64
+	import base64
+	try:
+		question_text = base64.b64decode(question_encoded.encode('ascii')).decode('utf-8')
+	except Exception as e:
+		logger.error(f"Ошибка декодирования вопроса: {e}")
+		await cb.answer("Ошибка декодирования вопроса", show_alert=True)
+		return
+	
+	# Получаем информацию о пользователе из БД
+	db = get_db()
+	user_id = await db.get_user_id_by_tg(user_tg_id)
+	if not user_id:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	user = await db.get_user_by_id(user_id)
+	if not user:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM (вопрос уже декодирован из base64)
+	await state.update_data(
+		question_user_tg_id=user_tg_id,
+		question_text=question_text,
+		question_history=[{"role": "user", "text": question_text}]
+	)
+	
+	# Переводим в состояние ожидания ответа
+	await state.set_state(QuestionReplyStates.waiting_reply)
+	
+	# Отвечаем админу
+	user_name = user.get("full_name") or "Не указано"
+	user_username = user.get("username") or "Не указано"
+	
+	await cb.message.edit_text(
+		f"💬 <b>Ответ пользователю</b>\n\n"
+		f"👤 Имя: {user_name}\n"
+		f"📱 Username: @{user_username}\n"
+		f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+		f"💬 <b>Вопрос:</b>\n{question_text}\n\n"
+		f"📝 Введите ваш ответ:",
+		parse_mode="HTML"
+	)
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("sell:order:message:"))
+async def sell_order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала переписки по сделке на продажу"""
+	# Формат: sell:order:message:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		order_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о сделке
+	db = get_db()
+	order = await db.get_sell_order_by_id(order_id)
+	if not order:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли сделка
+	if order.get("completed_at"):
+		await cb.answer("Сделка уже завершена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		sell_order_id=order_id,
+		user_tg_id=order["user_tg_id"]
+	)
+	
+	# Переводим в состояние ожидания сообщения
+	await state.set_state(SellOrderMessageStates.waiting_message)
+	
+	# Обновляем сообщение или отправляем новое
+	try:
+		# Пытаемся отредактировать сообщение
+		await cb.message.edit_text(
+			(cb.message.text or cb.message.caption or "") + "\n\n📝 Введите ваше сообщение пользователю:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup  # Сохраняем клавиатуру
+		)
+	except Exception as e:
+		# Если не удалось отредактировать, отправляем новое сообщение
+		logger.error(f"Ошибка редактирования сообщения: {e}")
+		try:
+			await cb.message.answer(
+				"📝 Введите ваше сообщение пользователю:",
+				parse_mode="HTML"
+			)
+		except Exception as e2:
+			logger.error(f"Ошибка отправки нового сообщения: {e2}")
+	
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("sell:order:complete:"))
+async def sell_order_complete(cb: CallbackQuery, bot: Bot):
+	"""Обработчик завершения сделки на продажу"""
+	# Формат: sell:order:complete:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		order_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о сделке
+	db = get_db()
+	order = await db.get_sell_order_by_id(order_id)
+	if not order:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли сделка
+	if order.get("completed_at"):
+		await cb.answer("Сделка уже завершена", show_alert=True)
+		return
+	
+	# Завершаем сделку
+	await db.complete_sell_order(order_id)
+	
+	# Уведомляем пользователя
+	user_tg_id = order["user_tg_id"]
+	order_number = order["order_number"]
+	
+	try:
+		await bot.send_message(
+			chat_id=user_tg_id,
+			text=f"✅ Ваша заявка на продажу #{order_number} завершена.\n\nСпасибо за использование нашего сервиса!",
+			parse_mode="HTML"
+		)
+		logger.info(f"✅ Сделка {order_id} завершена, уведомление отправлено пользователю {user_tg_id}")
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки уведомления пользователю {user_tg_id}: {e}", exc_info=True)
+	
+	# Обновляем сообщение админа
+	await cb.message.edit_text(
+		cb.message.text + "\n\n✅ <b>Сделка завершена</b>",
+		parse_mode="HTML"
+	)
+	await cb.answer("Сделка завершена ✅")
+
 	# Если не удалось найти пользователя, но есть username или full_name - возможно пользователь еще не в БД или все скрыто
 	if orig_tg_id is None:
 		# Проверяем, есть ли хотя бы username
