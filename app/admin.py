@@ -52,6 +52,33 @@ admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
 
 
+async def send_temporary_notification(bot: Bot, chat_id: int, text: str, duration: float = 2.0):
+	"""
+	Отправляет временное уведомление, которое автоматически удаляется через указанное время.
+	Создает эффект всплывающего уведомления.
+	
+	Args:
+		bot: Экземпляр бота
+		chat_id: ID чата
+		text: Текст уведомления
+		duration: Время отображения в секундах (по умолчанию 2 секунды)
+	"""
+	try:
+		notification = await bot.send_message(chat_id=chat_id, text=text)
+		
+		# Удаляем уведомление через указанное время
+		async def delayed_delete():
+			await asyncio.sleep(duration)
+			try:
+				await bot.delete_message(chat_id=chat_id, message_id=notification.message_id)
+			except Exception:
+				pass  # Игнорируем ошибки удаления
+		
+		asyncio.create_task(delayed_delete())
+	except Exception:
+		pass  # Игнорируем ошибки отправки
+
+
 async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optional[Dict[str, Any]] = None, back_to: str = "admin:back"):
 	"""
 	Получает клавиатуру add_data_type_kb с последними используемыми криптовалютами и картами.
@@ -399,6 +426,10 @@ class QuestionReplyStates(StatesGroup):
 
 class SellOrderMessageStates(StatesGroup):
 	"""Состояния для переписки по сделке на продажу"""
+	waiting_message = State()  # Ожидание ввода сообщения админом
+
+class OrderMessageStates(StatesGroup):
+	"""Состояния для переписки по обычной заявке"""
 	waiting_message = State()  # Ожидание ввода сообщения админом
 
 
@@ -6643,12 +6674,11 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 	
 	# Получаем данные из FSM
 	data = await state.get_data()
-	user_tg_id = data.get("question_user_tg_id")
-	question_text = data.get("question_text", "")
-	question_history = data.get("question_history", [])
+	question_id = data.get("question_id")
+	user_tg_id = data.get("user_tg_id")
 	
-	if not user_tg_id:
-		await message.answer("❌ Ошибка: не найден ID пользователя")
+	if not question_id or not user_tg_id:
+		await message.answer("❌ Ошибка: не найдены данные вопроса")
 		await state.clear()
 		return
 	
@@ -6658,33 +6688,130 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 		await message.answer("❌ Пожалуйста, введите текст ответа.")
 		return
 	
-	# Добавляем ответ в историю
-	question_history.append({"role": "admin", "text": reply_text})
+	# Получаем информацию о вопросе
+	db = get_db()
+	question = await db.get_question_by_id(question_id)
+	if not question:
+		await message.answer("❌ Вопрос не найден")
+		await state.clear()
+		return
 	
-	# Формируем сообщение для пользователя с историей переписки
+	# Сохраняем сообщение в БД
+	await db.add_question_message(question_id, "admin", reply_text)
+	
+	# Получаем всю историю переписки
+	messages = await db.get_question_messages(question_id)
+	
+	# Формируем полное сообщение для пользователя: информация о вопросе + история
+	question_info = (
+		f"❓ <b>Ваш вопрос</b>\n\n"
+	)
+	
+	# Добавляем историю переписки
 	history_lines = []
-	for item in question_history:
-		if item["role"] == "user":
-			history_lines.append(f"❓ <b>Ваш вопрос:</b>\n{item['text']}")
+	for msg in messages:
+		if msg["sender_type"] == "admin":
+			history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
 		else:
-			history_lines.append(f"💬 <b>Ответ администратора:</b>\n{item['text']}")
+			history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
 	
-	user_message = "\n\n".join(history_lines)
+	history_text = "\n\n".join(history_lines)
+	user_message = question_info + history_text
 	
-	# Отправляем ответ пользователю
+	# Отправляем или обновляем сообщение пользователю
+	from app.keyboards import question_user_reply_kb
 	try:
-		await bot.send_message(
-			chat_id=user_tg_id,
-			text=user_message,
-			parse_mode="HTML"
-		)
-		logger.info(f"✅ Ответ отправлен пользователю {user_tg_id}")
+		user_message_id = question.get("user_message_id")
+		if user_message_id:
+			# Обновляем существующее сообщение
+			try:
+				await bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=question_user_reply_kb(question_id)
+				)
+				logger.info(f"✅ Сообщение обновлено пользователю {user_tg_id} по вопросу {question_id}")
+			except Exception as e:
+				# Если не удалось обновить, отправляем новое
+				logger.warning(f"⚠️ Не удалось обновить сообщение {user_message_id}, отправляем новое: {e}")
+				sent_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=question_user_reply_kb(question_id)
+				)
+				await db.update_question_user_message_id(question_id, sent_msg.message_id)
+				logger.info(f"✅ Новое сообщение отправлено пользователю {user_tg_id} по вопросу {question_id}")
+		else:
+			# Отправляем новое сообщение
+			sent_msg = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=question_user_reply_kb(question_id)
+			)
+			await db.update_question_user_message_id(question_id, sent_msg.message_id)
+			logger.info(f"✅ Сообщение отправлено пользователю {user_tg_id} по вопросу {question_id}")
 		
-		# Уведомляем админа об успешной отправке
-		await message.answer(
-			f"✅ Ответ успешно отправлен пользователю (ID: <code>{user_tg_id}</code>)",
-			parse_mode="HTML"
-		)
+		# Обновляем сообщение админа с полной историей переписки
+		if admin_ids and question.get("admin_message_id"):
+			try:
+				user_name = question.get("user_name", "Не указано")
+				user_username = question.get("user_username", "Не указано")
+				question_text = question["question_text"]
+				
+				# Формируем информацию о вопросе для админа
+				admin_question_info = (
+					f"❓ <b>Вопрос от пользователя</b>\n\n"
+					f"👤 Имя: {user_name}\n"
+					f"📱 Username: @{user_username}\n"
+					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+					f"💬 <b>Вопрос:</b>\n{question_text}"
+				)
+				
+				# Формируем историю переписки для админа
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_question_info + "\n\n" + admin_history_text
+				
+				# Обновляем сообщение админа
+				from app.keyboards import question_reply_kb
+				await bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=question["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=question_reply_kb(question_id)
+				)
+				logger.info(f"✅ Сообщение админа обновлено с историей переписки для вопроса {question_id}")
+				
+				# Отправляем временное уведомление админу
+				import asyncio
+				notif_msg = await bot.send_message(
+					chat_id=admin_ids[0],
+					text="✅ Сообщение отправлено пользователю"
+				)
+				await asyncio.sleep(2)
+				try:
+					await bot.delete_message(chat_id=admin_ids[0], message_id=notif_msg.message_id)
+				except:
+					pass
+			except Exception as e:
+				logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
+		
+		# Удаляем сообщение админа после отправки, чтобы не захламлять чат
+		try:
+			await message.delete()
+		except Exception as e:
+			logger.debug(f"Не удалось удалить сообщение админа: {e}")
 	except Exception as e:
 		logger.error(f"❌ Ошибка отправки ответа пользователю {user_tg_id}: {e}", exc_info=True)
 		await message.answer(f"❌ Ошибка отправки ответа: {str(e)}")
@@ -6692,6 +6819,190 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 	# Очищаем состояние
 	await state.clear()
 
+
+# Обработчик отправки сообщения админом по обычной заявке - должен быть ПЕРЕД handle_forwarded_from_admin
+@admin_router.message(OrderMessageStates.waiting_message)
+async def order_message_send(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик отправки сообщения админом по обычной заявке"""
+	logger.info(f"🔵 ORDER_MESSAGE_SEND: Получено сообщение message_id={message.message_id}, text='{message.text or message.caption or ''}'")
+	
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		logger.warning(f"🔵 ORDER_MESSAGE_SEND: Пользователь {message.from_user.id} не является админом")
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("order_id")
+	user_tg_id = data.get("user_tg_id")
+	
+	if not order_id or not user_tg_id:
+		await message.answer("❌ Ошибка: не найдены данные заявки")
+		await state.clear()
+		return
+	
+	# Получаем текст сообщения
+	message_text = message.text or message.caption or ""
+	if not message_text.strip():
+		await message.answer("❌ Пожалуйста, введите текст сообщения.")
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await message.answer("❌ Заявка не найдена")
+		await state.clear()
+		return
+	
+	# Сохраняем сообщение в БД
+	await db.add_buy_order_message(order_id, "admin", message_text)
+	
+	# Получаем всю историю переписки
+	messages = await db.get_buy_order_messages(order_id)
+	
+	# Формируем информацию о заявке
+	order_number = order["order_number"]
+	crypto_display = order["crypto_display"]
+	amount = order["amount"]
+	amount_currency = order.get("amount_currency", 0)
+	currency_symbol = order.get("currency_symbol", "₽")
+	
+	# Форматируем сумму
+	if amount < 1:
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+	else:
+		amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+	
+	# Формируем полное сообщение для пользователя: информация о заявке + история
+	order_info = (
+		f"💰 <b>Заявка #{order_number}</b>\n\n"
+		f"💵 Криптовалюта: {crypto_display}\n"
+		f"💸 Сумма: {amount_str} {crypto_display}\n"
+		f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
+	)
+	
+	# Добавляем историю переписки
+	history_lines = []
+	for msg in messages:
+		if msg["sender_type"] == "admin":
+			history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+		else:
+			history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+	
+	history_text = "\n\n".join(history_lines)
+	user_message = order_info + "\n" + history_text
+	
+	# Отправляем или обновляем сообщение пользователю
+	from app.keyboards import order_user_reply_kb
+	try:
+		user_message_id = order.get("user_message_id")
+		if user_message_id:
+			# Обновляем существующее сообщение
+			try:
+				await bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=order_user_reply_kb(order_id)
+				)
+				logger.info(f"✅ Сообщение обновлено пользователю {user_tg_id} по заявке {order_id}")
+			except Exception as e:
+				# Если не удалось обновить, отправляем новое
+				logger.warning(f"⚠️ Не удалось обновить сообщение {user_message_id}, отправляем новое: {e}")
+				sent_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=order_user_reply_kb(order_id)
+				)
+				await db.update_order_user_message_id(order_id, sent_msg.message_id)
+				logger.info(f"✅ Новое сообщение отправлено пользователю {user_tg_id} по заявке {order_id}")
+		else:
+			# Отправляем новое сообщение
+			sent_msg = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=order_user_reply_kb(order_id)
+			)
+			await db.update_order_user_message_id(order_id, sent_msg.message_id)
+			logger.info(f"✅ Сообщение отправлено пользователю {user_tg_id} по заявке {order_id}")
+		
+		# Обновляем сообщение админа с полной историей переписки
+		if admin_ids and order.get("admin_message_id"):
+			try:
+				user_name = order.get("user_name", "Не указано")
+				user_username = order.get("user_username", "Не указано")
+				
+				# Формируем информацию о заявке для админа
+				admin_order_info = (
+					f"Номер заявки за сегодня: {order_number}\n"
+					f"Имя пользователя: {user_name or 'Не указано'}\n"
+					f"Username: @{user_username}\n\n"
+					f"Количество монет: {amount_str} {crypto_display}\n"
+					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+					f"Адрес кошелька: <code>{order.get('wallet_address', '')}</code>"
+				)
+				
+				# Формируем историю переписки для админа
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_order_info + "\n\n" + admin_history_text
+				
+				# Обновляем сообщение админа
+				from app.keyboards import order_action_kb
+				# Определяем, расширена ли клавиатура (проверяем наличие кнопки "Написать" в текущем сообщении)
+				current_markup = message.reply_markup
+				is_expanded = False
+				if current_markup and hasattr(current_markup, 'inline_keyboard'):
+					for row in current_markup.inline_keyboard:
+						for button in row:
+							if hasattr(button, 'callback_data') and button.callback_data and "order:message:" in button.callback_data:
+								is_expanded = True
+								break
+				
+				await bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=order_action_kb(order_id, expanded=is_expanded)
+				)
+				logger.info(f"✅ Сообщение админа обновлено с историей переписки для заявки {order_id}")
+				
+				# Отправляем временное уведомление админу
+				import asyncio
+				notif_msg = await bot.send_message(
+					chat_id=admin_ids[0],
+					text="✅ Сообщение отправлено пользователю"
+				)
+				await asyncio.sleep(2)
+				try:
+					await bot.delete_message(chat_id=admin_ids[0], message_id=notif_msg.message_id)
+				except:
+					pass
+			except Exception as e:
+				logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки сообщения пользователю: {e}", exc_info=True)
+		await message.answer(f"❌ Ошибка отправки сообщения: {str(e)}")
+	
+	# Удаляем сообщение админа после отправки
+	from app.admin import delete_user_message
+	await delete_user_message(message)
+	
+	# Очищаем состояние
+	await state.clear()
 
 # Обработчики для сделок на продажу - должны быть ПЕРЕД handle_forwarded_from_admin
 @admin_router.message(SellOrderMessageStates.waiting_message)
@@ -6802,11 +7113,67 @@ async def sell_order_message_send(message: Message, state: FSMContext, bot: Bot)
 			await db.update_sell_order_user_message_id(order_id, sent_msg.message_id)
 			logger.info(f"✅ Сообщение отправлено пользователю {user_tg_id} по сделке {order_id}")
 		
-		# Уведомляем админа
-		await message.answer(
-			f"✅ Сообщение отправлено пользователю (ID: <code>{user_tg_id}</code>)",
-			parse_mode="HTML"
-		)
+		# Обновляем сообщение админа с полной историей переписки
+		if admin_ids and order.get("admin_message_id"):
+			try:
+				user_name = order.get("user_name", "Не указано")
+				user_username = order.get("user_username", "Не указано")
+				amount_currency = order.get("amount_currency", 0)
+				currency_symbol = order.get("currency_symbol", "₽")
+				
+				# Формируем информацию о сделке для админа
+				admin_order_info = (
+					f"💰 <b>Заявка на продажу</b>\n\n"
+					f"📊 Номер заявки: #{order_number}\n"
+					f"👤 Имя: {user_name}\n"
+					f"📱 Username: @{user_username}\n"
+					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+					f"💵 Криптовалюта: {crypto_display}\n"
+					f"💸 Сумма: {amount_str} {crypto_display}\n"
+					f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+				)
+				
+				# Формируем историю переписки для админа
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_order_info + "\n\n" + admin_history_text
+				
+				# Обновляем сообщение админа
+				from app.keyboards import sell_order_admin_kb
+				await bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=sell_order_admin_kb(order_id)
+				)
+				logger.info(f"✅ Сообщение админа обновлено с историей переписки для сделки {order_id}")
+				
+				# Отправляем временное уведомление админу
+				import asyncio
+				notif_msg = await bot.send_message(
+					chat_id=admin_ids[0],
+					text="✅ Сообщение отправлено пользователю"
+				)
+				await asyncio.sleep(2)
+				try:
+					await bot.delete_message(chat_id=admin_ids[0], message_id=notif_msg.message_id)
+				except:
+					pass
+			except Exception as e:
+				logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
+		
+		# Удаляем сообщение админа после отправки, чтобы не захламлять чат
+		try:
+			await message.delete()
+		except Exception as e:
+			logger.debug(f"Не удалось удалить сообщение админа: {e}")
 	except Exception as e:
 		logger.error(f"❌ Ошибка отправки сообщения пользователю {user_tg_id}: {e}", exc_info=True)
 		await message.answer(f"❌ Ошибка отправки сообщения: {str(e)}")
@@ -6863,7 +7230,8 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				"AddDataStates", "CardUserMessageStates", "CardRequisiteStates", 
 				"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
 				"DeleteRateStates", "DeleteMoveStates", "QuestionReplyStates",
-				"SellOrderMessageStates", "SellOrderUserReplyStates"
+				"SellOrderMessageStates", "SellOrderUserReplyStates", "QuestionUserReplyStates",
+				"OrderMessageStates", "OrderUserReplyStates"
 			]):
 				# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
 				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
@@ -7064,62 +7432,86 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 @admin_router.callback_query(F.data.startswith("question:reply:"))
 async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	"""Обработчик начала ответа на вопрос пользователя"""
-	# Формат: question:reply:{user_tg_id}:{question_encoded}
-	parts = cb.data.split(":", 3)  # Разделяем максимум на 3 части, чтобы не разбивать base64
-	if len(parts) < 4:
+	# Формат: question:reply:{question_id}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
 	
 	try:
-		user_tg_id = int(parts[2])
-		question_encoded = parts[3]
-	except (ValueError, IndexError):
+		question_id = int(parts[2])
+	except ValueError:
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
 	
-	# Декодируем вопрос из base64
-	import base64
-	try:
-		question_text = base64.b64decode(question_encoded.encode('ascii')).decode('utf-8')
-	except Exception as e:
-		logger.error(f"Ошибка декодирования вопроса: {e}")
-		await cb.answer("Ошибка декодирования вопроса", show_alert=True)
-		return
-	
-	# Получаем информацию о пользователе из БД
+	# Получаем информацию о вопросе из БД
 	db = get_db()
-	user_id = await db.get_user_id_by_tg(user_tg_id)
-	if not user_id:
-		await cb.answer("Пользователь не найден", show_alert=True)
-		return
-	user = await db.get_user_by_id(user_id)
-	if not user:
-		await cb.answer("Пользователь не найден", show_alert=True)
+	question = await db.get_question_by_id(question_id)
+	if not question:
+		await cb.answer("Вопрос не найден", show_alert=True)
 		return
 	
-	# Сохраняем данные в FSM (вопрос уже декодирован из base64)
+	# Проверяем, не завершен ли вопрос
+	if question.get("completed_at"):
+		await cb.answer("Вопрос уже завершен", show_alert=True)
+		return
+	
+	# Получаем историю переписки
+	messages = await db.get_question_messages(question_id)
+	
+	# Формируем информацию о вопросе
+	user_tg_id = question["user_tg_id"]
+	user_name = question.get("user_name", "Не указано")
+	user_username = question.get("user_username", "Не указано")
+	question_text = question["question_text"]
+	
+	# Формируем сообщение для админа с историей
+	question_info = (
+		f"❓ <b>Вопрос от пользователя</b>\n\n"
+		f"👤 Имя: {user_name}\n"
+		f"📱 Username: @{user_username}\n"
+		f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+		f"💬 <b>Вопрос:</b>\n{question_text}"
+	)
+	
+	# Добавляем историю переписки
+	history_lines = []
+	for msg in messages:
+		if msg["sender_type"] == "admin":
+			history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+		else:
+			history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+	
+	history_text = "\n\n".join(history_lines)
+	admin_message = question_info + "\n\n" + history_text
+	
+	# Сохраняем данные в FSM
 	await state.update_data(
-		question_user_tg_id=user_tg_id,
-		question_text=question_text,
-		question_history=[{"role": "user", "text": question_text}]
+		question_id=question_id,
+		user_tg_id=user_tg_id
 	)
 	
 	# Переводим в состояние ожидания ответа
 	await state.set_state(QuestionReplyStates.waiting_reply)
 	
-	# Отвечаем админу
-	user_name = user.get("full_name") or "Не указано"
-	user_username = user.get("username") or "Не указано"
+	# Обновляем сообщение админа
+	from app.keyboards import question_reply_kb
+	try:
+		await cb.message.edit_text(
+			admin_message + "\n\n📝 Введите ваш ответ:",
+			parse_mode="HTML",
+			reply_markup=question_reply_kb(question_id)
+		)
+	except Exception as e:
+		logger.error(f"Ошибка редактирования сообщения: {e}")
+		try:
+			await cb.message.answer(
+				admin_message + "\n\n📝 Введите ваш ответ:",
+				parse_mode="HTML"
+			)
+		except Exception as e2:
+			logger.error(f"Ошибка отправки нового сообщения: {e2}")
 	
-	await cb.message.edit_text(
-		f"💬 <b>Ответ пользователю</b>\n\n"
-		f"👤 Имя: {user_name}\n"
-		f"📱 Username: @{user_username}\n"
-		f"🆔 ID: <code>{user_tg_id}</code>\n\n"
-		f"💬 <b>Вопрос:</b>\n{question_text}\n\n"
-		f"📝 Введите ваш ответ:",
-		parse_mode="HTML"
-	)
 	await cb.answer()
 
 @admin_router.callback_query(F.data.startswith("sell:order:message:"))
@@ -7230,106 +7622,99 @@ async def sell_order_complete(cb: CallbackQuery, bot: Bot):
 	)
 	await cb.answer("Сделка завершена ✅")
 
-	# Если не удалось найти пользователя, но есть username или full_name - возможно пользователь еще не в БД или все скрыто
-	if orig_tg_id is None:
-		# Проверяем, есть ли хотя бы username
-		if orig_username:
-			# Пользователь не найден в БД, но есть username - возможно первый раз
-			logger.warning(f"Не удалось определить ID пользователя, но есть username={orig_username}. Возможные причины: пользователь скрыл данные в настройках приватности Telegram или еще не взаимодействовал с ботом.")
-			# Сначала отправляем ссылку на mempool, если есть BTC адреса
-			if text:
-				await check_and_send_btc_address_links(bot, message.chat.id, text)
-			# Затем показываем выбор карты
-			groups = await db.list_card_groups()
-			if groups:
-				await state.set_state(ForwardBindStates.waiting_select_group)
-				await state.update_data(reply_only=True)
-				warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nВыберите группу карт:"
-				await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
-			else:
-				rows = await db.list_cards()
-				cards = [(r[0], r[1]) for r in rows]
-				await state.set_state(ForwardBindStates.waiting_select_card)
-				await state.update_data(reply_only=True)
-				warning_msg = f"⚠️ Не удалось получить ID пользователя @{orig_username}.\n\nВозможные причины:\n• Пользователь скрыл данные в настройках приватности Telegram\n• Пользователь еще не взаимодействовал с ботом\n\nГрупп пока нет. Выберите карту:"
-				await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
-			return
-		# Проверяем, есть ли full_name (MessageOriginHiddenUser)
-		elif orig_full_name:
-			logger.warning(f"Не удалось определить ID пользователя, но есть full_name='{orig_full_name}'. Это MessageOriginHiddenUser - пользователь полностью скрыл информацию. Пытаемся найти похожих пользователей...")
-			
-			# Пытаемся найти похожих пользователей по имени (частичное совпадение)
-			similar_users = await db.find_similar_users_by_name(orig_full_name, limit=5)
-			logger.info(f"🔍 Найдено {len(similar_users)} похожих пользователей для '{orig_full_name}'")
-			
-			if len(similar_users) == 1:
-				# Найден один похожий - используем его автоматически
-				user = similar_users[0]
-				orig_tg_id = user["tg_id"]
-				orig_username = user.get("username")
-				logger.info(f"✅ Автоматически выбран единственный похожий пользователь: tg_id={orig_tg_id}, full_name={user['full_name']}")
-				# Продолжаем обработку с найденным пользователем
-				await db.get_or_create_user(orig_tg_id, orig_username, orig_full_name)
-				# Не делаем return, продолжаем выполнение кода ниже
-			elif len(similar_users) > 1:
-				# Найдено несколько похожих - предлагаем выбрать
-				await state.set_state(ForwardBindStates.waiting_select_card)
-				await state.update_data(hidden_user_name=orig_full_name, similar_users=[u["tg_id"] for u in similar_users])
-				
-				similar_text = f"🔍 Найдено {len(similar_users)} похожих пользователей для '{orig_full_name}':\n\n"
-				similar_text += "Выберите нужного пользователя:"
-				await message.answer(similar_text, reply_markup=similar_users_select_kb(similar_users, orig_full_name))
-				return
-			else:
-				# Не найдено похожих - сохраняем имя для последующей привязки
-				# Сначала отправляем ссылку на mempool, если есть BTC адреса
-				if text:
-					await check_and_send_btc_address_links(bot, message.chat.id, text)
-				# Затем показываем выбор карты
-				groups = await db.list_card_groups()
-				if groups:
-					await state.set_state(ForwardBindStates.waiting_select_group)
-					# Сохраняем имя скрытого пользователя в state, чтобы при выборе карты создать запись
-					await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
-					warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nВыберите группу карт:"
-					await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
-				else:
-					rows = await db.list_cards()
-					cards = [(r[0], r[1]) for r in rows]
-					await state.set_state(ForwardBindStates.waiting_select_card)
-					await state.update_data(hidden_user_name=orig_full_name, reply_only=False)
-					warning_msg = f"⚠️ Пользователь '{orig_full_name}' полностью скрыл информацию (MessageOriginHiddenUser).\n\nID и username недоступны. Похожие пользователи в БД не найдены.\n\n💡 Система запомнит выбор карты для этого имени.\nКогда пользователь '{orig_full_name}' напишет боту, карта будет автоматически привязана.\n\nГрупп пока нет. Выберите карту:"
-					await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+@admin_router.callback_query(F.data.startswith("order:message:"))
+async def order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала переписки по обычной заявке"""
+	# Формат: order:message:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
 		return
-	# fallback by text when no origin available
-	if text:
-		card = await db.find_card_by_text(text)
-		logger.debug(f"Pattern search result: {bool(card)}")
-		if card:
-			user_msg = await db.get_card_user_message(card[0])
-			if user_msg:
-				await message.answer(user_msg, parse_mode="HTML")
-			else:
-				await message.answer("Сообщение карты отсутствует")
-			return
-	# as last resort: show groups to reply-only
-	# Сначала отправляем ссылку на mempool, если есть BTC адреса
-	if text:
-		await check_and_send_btc_address_links(bot, message.chat.id, text)
-	# Затем показываем выбор карты
-	groups = await db.list_card_groups()
-	if groups:
-		await state.set_state(ForwardBindStates.waiting_select_group)
-		await state.update_data(reply_only=True)
-		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nВыберите группу карт:"
-		await message.answer(warning_msg, reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
-	else:
-		rows = await db.list_cards()
-		cards = [(r[0], r[1]) for r in rows]
-		await state.set_state(ForwardBindStates.waiting_select_card)
-		await state.update_data(reply_only=True)
-		warning_msg = "⚠️ Не удалось определить пользователя из пересылки.\n\nВозможные причины:\n• Пользователь скрыл все данные в настройках приватности Telegram\n• Сообщение не переслано\n\nГрупп пока нет. Выберите карту:"
-		await message.answer(warning_msg, reply_markup=cards_select_kb(cards, back_to="admin:back"))
+	
+	try:
+		order_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await cb.answer("Заявка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли заявка
+	if order.get("completed_at"):
+		await cb.answer("Заявка уже завершена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		order_id=order_id,
+		user_tg_id=order["user_tg_id"]
+	)
+	
+	# Переводим в состояние ожидания сообщения
+	await state.set_state(OrderMessageStates.waiting_message)
+	
+	# Обновляем сообщение админа
+	await cb.message.edit_text(
+		cb.message.text + "\n\n📝 Введите ваше сообщение пользователю:",
+		parse_mode="HTML",
+		reply_markup=cb.message.reply_markup
+	)
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("question:complete:"))
+async def question_complete(cb: CallbackQuery, bot: Bot):
+	"""Обработчик закрытия вопроса"""
+	# Формат: question:complete:{question_id}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		question_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о вопросе
+	db = get_db()
+	question = await db.get_question_by_id(question_id)
+	if not question:
+		await cb.answer("Вопрос не найден", show_alert=True)
+		return
+	
+	# Проверяем, не закрыт ли вопрос
+	if question.get("completed_at"):
+		await cb.answer("Вопрос уже закрыт", show_alert=True)
+		return
+	
+	# Закрываем вопрос
+	await db.complete_question(question_id)
+	
+	# Уведомляем пользователя
+	user_tg_id = question["user_tg_id"]
+	
+	try:
+		await bot.send_message(
+			chat_id=user_tg_id,
+			text="✅ Ваш вопрос закрыт администратором.\n\nСпасибо за обращение!",
+			parse_mode="HTML"
+		)
+		logger.info(f"✅ Вопрос {question_id} закрыт, уведомление отправлено пользователю {user_tg_id}")
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки уведомления пользователю {user_tg_id}: {e}", exc_info=True)
+	
+	# Обновляем сообщение админа
+	await cb.message.edit_text(
+		cb.message.text + "\n\n✅ <b>Вопрос закрыт</b>",
+		parse_mode="HTML"
+	)
+	await cb.answer("Вопрос закрыт ✅")
 
 
 @admin_router.callback_query(ForwardBindStates.waiting_select_card, F.data.startswith("hidden:select:"))

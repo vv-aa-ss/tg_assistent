@@ -121,6 +121,13 @@ def sell_order_admin_kb(sell_order_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
+def order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для ответа пользователя на сообщение админа по обычной заявке"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Ответить", callback_data=f"order:user:reply:{order_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
 def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
 	"""Клавиатура для пользователя с кнопкой 'Ответить' по сделке на продажу"""
 	kb = InlineKeyboardBuilder()
@@ -1197,24 +1204,32 @@ def buy_payment_confirmed_kb() -> ReplyKeyboardMarkup:
 	)
 
 
-def order_action_kb(order_id: int) -> InlineKeyboardMarkup:
+def order_action_kb(order_id: int, expanded: bool = False) -> InlineKeyboardMarkup:
 	"""Клавиатура для действий с заявкой админом."""
 	kb = InlineKeyboardBuilder()
 	kb.button(text="✅ Выполнил", callback_data=f"order:completed:{order_id}")
-	kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}")
-	kb.adjust(2)
+	if expanded:
+		kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}")
+		kb.button(text="💬 Написать", callback_data=f"order:message:{order_id}")
+		kb.adjust(2, 1)
+	else:
+		kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}:expanded")
+		kb.adjust(2)
 	return kb.as_markup()
 
 
-def question_reply_kb(user_tg_id: int, question_text: str) -> InlineKeyboardMarkup:
+def question_reply_kb(question_id: int) -> InlineKeyboardMarkup:
 	"""Клавиатура для ответа на вопрос пользователя."""
 	kb = InlineKeyboardBuilder()
-	# Кодируем вопрос в base64 для передачи в callback_data
-	# Ограничиваем длину вопроса до 200 символов, чтобы callback_data не превышал лимит
-	import base64
-	question_short = question_text[:200] if len(question_text) > 200 else question_text
-	question_encoded = base64.b64encode(question_short.encode('utf-8')).decode('ascii')
-	kb.button(text="💬 Ответить", callback_data=f"question:reply:{user_tg_id}:{question_encoded}")
+	kb.button(text="💬 Ответить", callback_data=f"question:reply:{question_id}")
+	kb.button(text="✅ Закрыть вопрос", callback_data=f"question:complete:{question_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+def question_user_reply_kb(question_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для ответа пользователя на вопрос админа"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Ответить", callback_data=f"question:user:reply:{question_id}")
 	kb.adjust(1)
 	return kb.as_markup()
 
