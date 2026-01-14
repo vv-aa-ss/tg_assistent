@@ -2518,6 +2518,8 @@ class Database:
 			"order_message_id": row[16] if len(row) > 16 else None,
 			"proof_request_message_id": row[17] if len(row) > 17 else None,
 			"proof_confirmation_message_id": row[18] if len(row) > 18 else None,
+			"admin_message_id": row[19] if len(row) > 19 else None,
+			"user_message_id": row[20] if len(row) > 20 else None,
 		}
 	
 	async def complete_order(self, order_id: int) -> bool:

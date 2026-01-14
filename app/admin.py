@@ -6723,6 +6723,19 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 	try:
 		user_message_id = question.get("user_message_id")
 		if user_message_id:
+			# Отправляем уведомление перед обновлением
+			try:
+				notif_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text="💬 <b>Новое сообщение от администратора</b>",
+					parse_mode="HTML"
+				)
+				# Сохраняем ID уведомления
+				from app.notifications import notification_ids
+				notification_ids[(user_tg_id, question_id, 'question')] = notif_msg.message_id
+			except Exception as e:
+				# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+				logger.warning(f"⚠️ Не удалось отправить уведомление пользователю {user_tg_id}: {e}")
 			# Обновляем существующее сообщение
 			try:
 				await bot.edit_message_text(
@@ -6878,7 +6891,6 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 	
 	# Формируем полное сообщение для пользователя: информация о заявке + история
 	order_info = (
-		f"💰 <b>Заявка #{order_number}</b>\n\n"
 		f"💵 Криптовалюта: {crypto_display}\n"
 		f"💸 Сумма: {amount_str} {crypto_display}\n"
 		f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
@@ -6900,6 +6912,19 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 	try:
 		user_message_id = order.get("user_message_id")
 		if user_message_id:
+			# Отправляем уведомление перед обновлением
+			try:
+				notif_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text="💬 <b>Новое сообщение от администратора</b>",
+					parse_mode="HTML"
+				)
+				# Сохраняем ID уведомления
+				from app.notifications import notification_ids
+				notification_ids[(user_tg_id, order_id, 'order')] = notif_msg.message_id
+			except Exception as e:
+				# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+				logger.warning(f"⚠️ Не удалось отправить уведомление пользователю {user_tg_id}: {e}")
 			# Обновляем существующее сообщение
 			try:
 				await bot.edit_message_text(
@@ -6933,6 +6958,7 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 			logger.info(f"✅ Сообщение отправлено пользователю {user_tg_id} по заявке {order_id}")
 		
 		# Обновляем сообщение админа с полной историей переписки
+		logger.info(f"🔵 ORDER_MESSAGE_SEND: Проверка обновления сообщения админа: admin_ids={admin_ids}, admin_message_id={order.get('admin_message_id')}")
 		if admin_ids and order.get("admin_message_id"):
 			try:
 				user_name = order.get("user_name", "Не указано")
@@ -6961,23 +6987,29 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 				
 				# Обновляем сообщение админа
 				from app.keyboards import order_action_kb
-				# Определяем, расширена ли клавиатура (проверяем наличие кнопки "Написать" в текущем сообщении)
-				current_markup = message.reply_markup
-				is_expanded = False
-				if current_markup and hasattr(current_markup, 'inline_keyboard'):
-					for row in current_markup.inline_keyboard:
-						for button in row:
-							if hasattr(button, 'callback_data') and button.callback_data and "order:message:" in button.callback_data:
-								is_expanded = True
-								break
+				# Используем расширенную клавиатуру, если есть переписка
+				is_expanded = len(messages) > 0
 				
-				await bot.edit_message_text(
-					chat_id=admin_ids[0],
-					message_id=order["admin_message_id"],
-					text=admin_message,
-					parse_mode="HTML",
-					reply_markup=order_action_kb(order_id, expanded=is_expanded)
-				)
+				logger.info(f"🔵 ORDER_MESSAGE_SEND: Обновление сообщения админа: chat_id={admin_ids[0]}, message_id={order['admin_message_id']}, messages_count={len(messages)}")
+				# Пытаемся обновить как caption (для фото/документа), если не получится - как текст
+				try:
+					await bot.edit_message_caption(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						caption=admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
+				except Exception as e:
+					# Если не получилось (это текстовое сообщение), используем edit_text
+					logger.debug(f"Не удалось обновить caption, пробуем edit_text: {e}")
+					await bot.edit_message_text(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						text=admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
 				logger.info(f"✅ Сообщение админа обновлено с историей переписки для заявки {order_id}")
 				
 				# Отправляем временное уведомление админу
@@ -6993,12 +7025,14 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 					pass
 			except Exception as e:
 				logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
+		else:
+			logger.warning(f"⚠️ ORDER_MESSAGE_SEND: Не удалось обновить сообщение админа: admin_ids={admin_ids}, admin_message_id={order.get('admin_message_id')}")
 	except Exception as e:
 		logger.error(f"❌ Ошибка отправки сообщения пользователю: {e}", exc_info=True)
 		await message.answer(f"❌ Ошибка отправки сообщения: {str(e)}")
 	
 	# Удаляем сообщение админа после отправки
-	from app.admin import delete_user_message
+	from app.main import delete_user_message
 	await delete_user_message(message)
 	
 	# Очищаем состояние
@@ -7081,6 +7115,19 @@ async def sell_order_message_send(message: Message, state: FSMContext, bot: Bot)
 	try:
 		user_message_id = order.get("user_message_id")
 		if user_message_id:
+			# Отправляем уведомление перед обновлением
+			try:
+				notif_msg = await bot.send_message(
+					chat_id=user_tg_id,
+					text="💬 <b>Новое сообщение от администратора</b>",
+					parse_mode="HTML"
+				)
+				# Сохраняем ID уведомления
+				from app.notifications import notification_ids
+				notification_ids[(user_tg_id, order_id, 'sell_order')] = notif_msg.message_id
+			except Exception as e:
+				# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+				logger.warning(f"⚠️ Не удалось отправить уведомление пользователю {user_tg_id}: {e}")
 			# Обновляем существующее сообщение
 			try:
 				await bot.edit_message_text(
@@ -7485,6 +7532,19 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	history_text = "\n\n".join(history_lines)
 	admin_message = question_info + "\n\n" + history_text
 	
+	# Удаляем уведомление для админа (если есть)
+	from app.notifications import notification_ids
+	admin_ids = get_admin_ids()
+	if admin_ids:
+		notification_key = (admin_ids[0], question_id, 'question')
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				await bot.delete_message(chat_id=admin_ids[0], message_id=notif_message_id)
+				del notification_ids[notification_key]
+			except Exception as e:
+				logger.debug(f"Не удалось удалить уведомление: {e}")
+	
 	# Сохраняем данные в FSM
 	await state.update_data(
 		question_id=question_id,
@@ -7540,6 +7600,19 @@ async def sell_order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bo
 	if order.get("completed_at"):
 		await cb.answer("Сделка уже завершена", show_alert=True)
 		return
+	
+	# Удаляем уведомление для админа (если есть)
+	from app.notifications import notification_ids
+	admin_ids = get_admin_ids()
+	if admin_ids:
+		notification_key = (admin_ids[0], order_id, 'sell_order')
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				await bot.delete_message(chat_id=admin_ids[0], message_id=notif_message_id)
+				del notification_ids[notification_key]
+			except Exception as e:
+				logger.debug(f"Не удалось удалить уведомление: {e}")
 	
 	# Сохраняем данные в FSM
 	await state.update_data(
@@ -7601,14 +7674,39 @@ async def sell_order_complete(cb: CallbackQuery, bot: Bot):
 	# Завершаем сделку
 	await db.complete_sell_order(order_id)
 	
-	# Уведомляем пользователя
+	# Удаляем зависшие уведомления у пользователя и админа
+	from app.notifications import notification_ids
+	admin_ids = get_admin_ids()
 	user_tg_id = order["user_tg_id"]
-	order_number = order["order_number"]
 	
+	# Удаляем уведомление пользователю
+	user_notif_key = (user_tg_id, order_id, 'sell_order')
+	if user_notif_key in notification_ids:
+		try:
+			notif_message_id = notification_ids[user_notif_key]
+			await bot.delete_message(chat_id=user_tg_id, message_id=notif_message_id)
+		except Exception as e:
+			logger.debug(f"Не удалось удалить уведомление пользователю: {e}")
+		finally:
+			del notification_ids[user_notif_key]
+	
+	# Удаляем уведомление админу
+	if admin_ids:
+		admin_notif_key = (admin_ids[0], order_id, 'sell_order')
+		if admin_notif_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[admin_notif_key]
+				await bot.delete_message(chat_id=admin_ids[0], message_id=notif_message_id)
+			except Exception as e:
+				logger.debug(f"Не удалось удалить уведомление админу: {e}")
+			finally:
+				del notification_ids[admin_notif_key]
+	
+	# Уведомляем пользователя
 	try:
 		await bot.send_message(
 			chat_id=user_tg_id,
-			text=f"✅ Ваша заявка на продажу #{order_number} завершена.\n\nСпасибо за использование нашего сервиса!",
+			text="✅ Ваша заявка на продажу завершена.\n\nСпасибо за использование нашего сервиса!",
 			parse_mode="HTML"
 		)
 		logger.info(f"✅ Сделка {order_id} завершена, уведомление отправлено пользователю {user_tg_id}")
@@ -7649,6 +7747,22 @@ async def order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		await cb.answer("Заявка уже завершена", show_alert=True)
 		return
 	
+	# Удаляем уведомление для админа (если есть)
+	from app.notifications import notification_ids
+	admin_ids = get_admin_ids()
+	if admin_ids:
+		notification_key = (admin_ids[0], order_id, 'order')
+		logger.info(f"🔵 Удаление уведомления админа: key={notification_key}, exists={notification_key in notification_ids}, all_keys={list(notification_ids.keys())}")
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				logger.info(f"🔵 Удаление уведомления админа: message_id={notif_message_id}, chat_id={admin_ids[0]}")
+				await bot.delete_message(chat_id=admin_ids[0], message_id=notif_message_id)
+				del notification_ids[notification_key]
+				logger.info(f"✅ Уведомление админа успешно удалено")
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось удалить уведомление админа: {e}")
+	
 	# Сохраняем данные в FSM
 	await state.update_data(
 		order_id=order_id,
@@ -7659,11 +7773,30 @@ async def order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	await state.set_state(OrderMessageStates.waiting_message)
 	
 	# Обновляем сообщение админа
-	await cb.message.edit_text(
-		cb.message.text + "\n\n📝 Введите ваше сообщение пользователю:",
-		parse_mode="HTML",
-		reply_markup=cb.message.reply_markup
-	)
+	# Проверяем тип сообщения (кнопки теперь на фото/документе)
+	if cb.message.photo:
+		# Это фото - используем edit_message_caption
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + "\n\n📝 Введите ваше сообщение пользователю:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	elif cb.message.document:
+		# Это документ - используем edit_message_caption
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + "\n\n📝 Введите ваше сообщение пользователю:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	else:
+		# Это текстовое сообщение - используем edit_text
+		await cb.message.edit_text(
+			cb.message.text + "\n\n📝 Введите ваше сообщение пользователю:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
 	await cb.answer()
 
 @admin_router.callback_query(F.data.startswith("question:complete:"))

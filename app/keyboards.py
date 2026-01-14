@@ -1218,6 +1218,16 @@ def order_action_kb(order_id: int, expanded: bool = False) -> InlineKeyboardMark
 	return kb.as_markup()
 
 
+def xmr_wallet_select_kb(order_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для выбора кошелька XMR при завершении заявки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="XMR-1", callback_data=f"order:xmr:wallet:{order_id}:1")
+	kb.button(text="XMR-2", callback_data=f"order:xmr:wallet:{order_id}:2")
+	kb.button(text="XMR-3", callback_data=f"order:xmr:wallet:{order_id}:3")
+	kb.adjust(3)  # Все три кнопки в один ряд
+	return kb.as_markup()
+
+
 def question_reply_kb(question_id: int) -> InlineKeyboardMarkup:
 	"""Клавиатура для ответа на вопрос пользователя."""
 	kb = InlineKeyboardBuilder()

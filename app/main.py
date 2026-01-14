@@ -20,6 +20,7 @@ from app.admin import admin_router, is_admin
 from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb, sell_crypto_kb, sell_confirmation_kb, sell_order_user_reply_kb, question_user_reply_kb, question_reply_kb, order_user_reply_kb
 from app.di import get_admin_ids
 from app.di import set_dependencies
+from app.notifications import notification_ids
 
 
 class BuyStates(StatesGroup):
@@ -846,22 +847,95 @@ async def main() -> None:
 		else:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
-		# Формируем сообщение с информацией о заказе
-		order_info = (
-			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
-			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}\n\n"
-			f"Выберите способ доставки:"
-		)
-		
-		# Показываем клавиатуру выбора способа доставки
-		is_byn = selected_country == "BYN"
-		await state.set_state(BuyStates.waiting_delivery_method)
-		await send_and_save_message(
-			message,
-			order_info,
-			reply_markup=buy_delivery_method_kb(currency_symbol, is_byn),
-			state=state
-		)
+		# Для XMR пропускаем выбор способа доставки, для BTC показываем выбор
+		if crypto_type == "XMR":
+			# Для XMR устанавливаем обычную доставку и сразу переходим к созданию заявки
+			delivery_type = "normal"
+			await state.update_data(delivery_method=delivery_type)
+			
+			# Рассчитываем сумму (без VIP для XMR)
+			final_amount = amount_currency
+			
+			# Получаем реквизиты пользователя
+			user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
+			requisites_text = ""
+			
+			if user_cards:
+				# Берем первую карту пользователя
+				card = user_cards[0]
+				card_id = card["card_id"]
+				
+				# Получаем реквизиты из таблицы card_requisites
+				requisites = await db_local.list_card_requisites(card_id)
+				
+				# Формируем текст реквизитов
+				requisites_list = []
+				for req in requisites:
+					requisites_list.append(req["requisite_text"])
+				
+				# Добавляем user_message, если есть
+				if card.get("user_message") and card["user_message"].strip():
+					requisites_list.append(card["user_message"])
+				
+				if requisites_list:
+					requisites_text = "\n".join(requisites_list)
+			
+			# Формируем сообщение
+			crypto_short = "xmr"
+			order_message = (
+				f"☑️Заявка успешно создана.\n"
+				f"Вы получаете: {amount_str} {crypto_short}\n"
+				f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
+				f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
+				f"Реквизиты для оплаты:\n\n"
+			)
+			
+			if requisites_text:
+				order_message += requisites_text + "\n\n"
+			else:
+				order_message += "Реквизиты не найдены. Обратитесь к администратору.\n\n"
+			
+			# Сохраняем время создания заявки (15 минут)
+			order_created_at = int(time.time())
+			order_expires_at = order_created_at + 15 * 60  # 15 минут
+			
+			order_message += f"⏰Заявка действительна: 15 минут\n"
+			order_message += f"✅После оплаты необходимо нажать на кнопку 'ОПЛАТА СОВЕРШЕНА'"
+			
+			# Сохраняем данные о заявке
+			await state.update_data(
+				final_amount=final_amount,
+				order_created_at=order_created_at,
+				order_expires_at=order_expires_at
+			)
+			
+			# Отправляем финальное сообщение
+			await state.set_state(BuyStates.waiting_payment_confirmation)
+			final_message = await send_and_save_message(
+				message,
+				order_message,
+				reply_markup=buy_payment_confirmed_kb(),
+				state=state
+			)
+			# Сохраняем ID сообщения с заявкой в состоянии для последующего сохранения в БД
+			await state.update_data(order_message_id=final_message.message_id)
+		else:
+			# Для BTC и других криптовалют показываем выбор способа доставки
+			order_info = (
+				f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+				f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}\n\n"
+				f"Выберите способ доставки:"
+			)
+			
+			# Показываем клавиатуру выбора способа доставки
+			is_byn = selected_country == "BYN"
+			await state.set_state(BuyStates.waiting_delivery_method)
+			await send_and_save_message(
+				message,
+				order_info,
+				reply_markup=buy_delivery_method_kb(currency_symbol, is_byn),
+				state=state
+			)
 	
 	@dp.message(BuyStates.waiting_delivery_method)
 	async def on_delivery_method_selected(message: Message, state: FSMContext):
@@ -1156,32 +1230,38 @@ async def main() -> None:
 			for admin_id in admin_ids:
 				try:
 					logger_main.info(f"📤 Отправка заявки #{order_number} админу {admin_id}")
-					# Отправляем текст заявки
-					admin_msg = await message.bot.send_message(
-						chat_id=admin_id,
-						text=admin_message_text,
-						parse_mode=ParseMode.HTML,
-						reply_markup=order_action_kb(order_id)
-					)
-					logger_main.info(f"✅ Текст заявки отправлен админу {admin_id}, message_id={admin_msg.message_id}")
-					# Сохраняем admin_message_id в БД
-					await db_local.update_order_admin_message_id(order_id, admin_msg.message_id)
-					
-					# Отправляем скриншот/чек
+					# Отправляем скриншот/чек с информацией о заявке в caption и кнопками
+					proof_msg = None
 					if proof_photo_file_id:
-						await message.bot.send_photo(
+						proof_msg = await message.bot.send_photo(
 							chat_id=admin_id,
 							photo=proof_photo_file_id,
-							reply_to_message_id=admin_msg.message_id
+							caption=admin_message_text,
+							parse_mode=ParseMode.HTML,
+							reply_markup=order_action_kb(order_id)
 						)
-						logger_main.info(f"✅ Фото отправлено админу {admin_id}")
+						logger_main.info(f"✅ Фото отправлено админу {admin_id} с информацией и кнопками, message_id={proof_msg.message_id}")
 					elif proof_document_file_id:
-						await message.bot.send_document(
+						proof_msg = await message.bot.send_document(
 							chat_id=admin_id,
 							document=proof_document_file_id,
-							reply_to_message_id=admin_msg.message_id
+							caption=admin_message_text,
+							parse_mode=ParseMode.HTML,
+							reply_markup=order_action_kb(order_id)
 						)
-						logger_main.info(f"✅ Документ отправлен админу {admin_id}")
+						logger_main.info(f"✅ Документ отправлен админу {admin_id} с информацией и кнопками, message_id={proof_msg.message_id}")
+					else:
+						# Если нет фото и документа, отправляем текстовое сообщение с кнопками
+						proof_msg = await message.bot.send_message(
+							chat_id=admin_id,
+							text=admin_message_text,
+							parse_mode=ParseMode.HTML,
+							reply_markup=order_action_kb(order_id)
+						)
+						logger_main.info(f"✅ Текст заявки отправлен админу {admin_id} с кнопками, message_id={proof_msg.message_id}")
+					
+					# Сохраняем admin_message_id в БД (ID фото/документа/текста для обновления при переписке)
+					await db_local.update_order_admin_message_id(order_id, proof_msg.message_id)
 					
 					success_count += 1
 					logger_main.info(f"✅ Заявка #{order_number} успешно отправлена админу {admin_id}")
@@ -1394,37 +1474,12 @@ async def main() -> None:
 			await cb.answer("❌ Заявка не найдена.", show_alert=True)
 			return
 		
-		# Формируем текст сообщения заново
-		order_number = order["order_number"]
-		user_name = order.get("user_name", "Не указано")
-		user_username = order.get("user_username", "Не указано")
-		amount = order["amount"]
-		amount_currency = order.get("amount_currency", 0)
-		currency_symbol = order.get("currency_symbol", "₽")
-		wallet_address = order.get("wallet_address", "")
-		crypto_display = order.get("crypto_display", "")
-		
-		# Форматируем сумму
-		if amount < 1:
-			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
-		else:
-			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
-		
-		admin_message_text = (
-			f"Номер заявки за сегодня: {order_number}\n"
-			f"Имя пользователя: {user_name or 'Не указано'}\n"
-			f"Username: @{user_username}\n\n"
-			f"Количество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-			f"Адрес кошелька: <code>{wallet_address}</code>"
-		)
-		
-		# Обновляем сообщение с новой клавиатурой
+		# Обновляем только клавиатуру, не меняя текст/caption
+		# Кнопки теперь находятся на фото/документе, поэтому используем edit_message_reply_markup
 		try:
-			logger_main.info(f"🔵 ORDER_DETAILS: Обновление сообщения с expanded={new_expanded}")
-			await cb.message.edit_text(
-				admin_message_text,
-				parse_mode=ParseMode.HTML,
+			logger_main.info(f"🔵 ORDER_DETAILS: Обновление клавиатуры с expanded={new_expanded}")
+			# Обновляем только клавиатуру, не трогая текст/caption
+			await cb.message.edit_reply_markup(
 				reply_markup=order_action_kb(order_id, expanded=new_expanded)
 			)
 			logger_main.info(f"🔵 ORDER_DETAILS: Сообщение успешно обновлено")
@@ -1434,6 +1489,10 @@ async def main() -> None:
 			if "message is not modified" in str(e):
 				logger_main.debug(f"🔵 ORDER_DETAILS: Сообщение не изменилось (это нормально)")
 				await cb.answer()
+			# Сетевые ошибки - логируем, но не показываем пользователю
+			elif "NetworkError" in str(type(e).__name__) or "ClientConnectorError" in str(e) or "ConnectionResetError" in str(e):
+				logger_main.warning(f"⚠️ Сетевая ошибка при обновлении сообщения (временная): {e}")
+				await cb.answer()  # Просто отвечаем на callback без ошибки
 			else:
 				logger_main.error(f"❌ Ошибка обновления сообщения: {e}", exc_info=True)
 				await cb.answer("❌ Ошибка обновления сообщения.", show_alert=True)
@@ -1462,6 +1521,40 @@ async def main() -> None:
 			await cb.answer("❌ Заявка не найдена.", show_alert=True)
 			return
 		
+		# Если это XMR, показываем выбор кошелька
+		if order.get("crypto_type") == "XMR":
+			from app.keyboards import xmr_wallet_select_kb
+			try:
+				# Обновляем сообщение с кнопками выбора кошелька
+				if cb.message.photo:
+					current_caption = cb.message.caption or ""
+					await cb.message.edit_caption(
+						caption=f"{current_caption}\n\n🪙 Выберите кошелек XMR:",
+						reply_markup=xmr_wallet_select_kb(order_id)
+					)
+				elif cb.message.document:
+					current_caption = cb.message.caption or ""
+					await cb.message.edit_caption(
+						caption=f"{current_caption}\n\n🪙 Выберите кошелек XMR:",
+						reply_markup=xmr_wallet_select_kb(order_id)
+					)
+				else:
+					await cb.message.edit_text(
+						f"{cb.message.text}\n\n🪙 Выберите кошелек XMR:",
+						reply_markup=xmr_wallet_select_kb(order_id)
+					)
+				await cb.answer()
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка обновления сообщения для выбора кошелька XMR: {e}")
+				await cb.answer("❌ Ошибка обновления сообщения.", show_alert=True)
+			return
+		
+		# Для остальных криптовалют выполняем завершение сразу
+		await _complete_order_with_wallet(cb, order_id, order, db_local, None)
+	
+	async def _complete_order_with_wallet(cb: CallbackQuery, order_id: int, order: dict, db_local, xmr_number: int | None = None):
+		"""Вспомогательная функция для завершения заявки с указанным номером кошелька XMR (если применимо)"""
 		# Отмечаем заявку как выполненную
 		await db_local.complete_order(order_id)
 		
@@ -1508,6 +1601,11 @@ async def main() -> None:
 		if proof_confirmation_message_id:
 			messages_to_delete.append(proof_confirmation_message_id)
 		
+		# Сообщение с перепиской (нужно удалить)
+		user_message_id = order.get("user_message_id")
+		if user_message_id:
+			messages_to_delete.append(user_message_id)
+		
 		# Удаляем все сообщения
 		for msg_id in messages_to_delete:
 			try:
@@ -1517,6 +1615,34 @@ async def main() -> None:
 				)
 			except Exception as e:
 				logging.getLogger("app.main").debug(f"Не удалось удалить сообщение {msg_id} у пользователя {user_tg_id}: {e}")
+		
+		# Удаляем зависшие уведомления у пользователя и админа
+		from app.notifications import notification_ids
+		from app.di import get_admin_ids
+		admin_ids = get_admin_ids()
+		
+		# Удаляем уведомление пользователю
+		user_notif_key = (user_tg_id, order_id, 'order')
+		if user_notif_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[user_notif_key]
+				await cb.bot.delete_message(chat_id=user_tg_id, message_id=notif_message_id)
+			except Exception as e:
+				logging.getLogger("app.main").debug(f"Не удалось удалить уведомление пользователю: {e}")
+			finally:
+				del notification_ids[user_notif_key]
+		
+		# Удаляем уведомление админу
+		if admin_ids:
+			admin_notif_key = (admin_ids[0], order_id, 'order')
+			if admin_notif_key in notification_ids:
+				try:
+					notif_message_id = notification_ids[admin_notif_key]
+					await cb.bot.delete_message(chat_id=admin_ids[0], message_id=notif_message_id)
+				except Exception as e:
+					logging.getLogger("app.main").debug(f"Не удалось удалить уведомление админу: {e}")
+				finally:
+					del notification_ids[admin_notif_key]
 		
 		# Отправляем сообщение пользователю с кнопкой "Удалить"
 		from app.keyboards import delete_message_kb
@@ -1529,12 +1655,147 @@ async def main() -> None:
 		except Exception as e:
 			logging.getLogger("app.main").error(f"Ошибка отправки сообщения пользователю {order['user_tg_id']}: {e}")
 		
+		# Отправляем стикер пользователю
+		try:
+			await cb.bot.send_sticker(
+				chat_id=order["user_tg_id"],
+				sticker="CAACAgIAAxkBAAEVPMRpZ3yqu0lezCX6Gr6tMGiJnBBj7QACYAYAAvoLtgg_BZcxRs21uzgE"
+			)
+		except Exception as e:
+			logging.getLogger("app.main").error(f"Ошибка отправки стикера пользователю {order['user_tg_id']}: {e}")
+		
+		# Записываем данные в Google Sheets
+		from app.config import get_settings
+		from app.google_sheets import write_order_to_google_sheet, read_profit
+		settings = get_settings()
+		written_cells_info = []
+		profit_value = None
+		row_number = None
+		
+		if settings.google_sheet_id and settings.google_credentials_path:
+			try:
+				result = await write_order_to_google_sheet(
+					sheet_id=settings.google_sheet_id,
+					credentials_path=settings.google_credentials_path,
+					order=order,
+					db=db_local,
+					sheet_name=settings.google_sheet_name,
+					xmr_number=xmr_number
+				)
+				if result.get("success"):
+					logger_main = logging.getLogger("app.main")
+					logger_main.info(f"✅ Данные заявки {order_id} записаны в Google Sheets")
+					
+					# Получаем информацию о записанных ячейках
+					written_cells = result.get("written_cells", [])
+					row_number = result.get("row")
+					
+					# Формируем список записанных ячеек
+					if written_cells:
+						written_cells_info = written_cells
+					
+					# Читаем профит из ячейки BC
+					if row_number:
+						profit_column = await db_local.get_google_sheets_setting("profit_column", "BC")
+						profit_value = await read_profit(
+							sheet_id=settings.google_sheet_id,
+							credentials_path=settings.google_credentials_path,
+							row=row_number,
+							profit_column=profit_column,
+							sheet_name=settings.google_sheet_name
+						)
+				else:
+					logger_main = logging.getLogger("app.main")
+					logger_main.warning(f"⚠️ Не удалось записать данные заявки {order_id} в Google Sheets: {result.get('error', 'Unknown error')}")
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка записи данных заявки {order_id} в Google Sheets: {e}", exc_info=True)
+		else:
+			logger_main = logging.getLogger("app.main")
+			logger_main.warning("⚠️ Google Sheets не настроен, пропускаем запись данных заявки")
+		
+		# Формируем дополнительную информацию для сообщения
+		additional_info = "\n\n✅ Выполнено"
+		
+		if written_cells_info or profit_value is not None:
+			additional_info += "\n\n📊 Записано в Google Sheets:"
+			
+			# Добавляем информацию о записанных ячейках
+			if written_cells_info:
+				for cell_info in written_cells_info:
+					additional_info += f"\n  • {cell_info}"
+			
+			# Добавляем профит
+			if profit_value is not None:
+				try:
+					# Пытаемся форматировать как число
+					profit_num = float(str(profit_value).replace(",", ".").replace(" ", ""))
+					profit_formatted = f"{int(round(profit_num)):,}".replace(",", " ")
+					additional_info += f"\n\n📈 Профит: {profit_formatted} USD"
+				except (ValueError, AttributeError):
+					# Если не число, используем как есть
+					additional_info += f"\n\n📈 Профит: {profit_value} USD"
+		
 		# Обновляем сообщение админа
 		await cb.answer("✅ Заявка отмечена как выполненная!")
-		await cb.message.edit_text(
-			f"{cb.message.text}\n\n✅ Выполнено",
-			reply_markup=None
-		)
+		# Проверяем тип сообщения (кнопки теперь на фото/документе)
+		try:
+			if cb.message.photo:
+				# Это фото - используем edit_message_caption
+				current_caption = cb.message.caption or ""
+				await cb.message.edit_caption(
+					caption=f"{current_caption}{additional_info}",
+					reply_markup=None
+				)
+			elif cb.message.document:
+				# Это документ - используем edit_message_caption
+				current_caption = cb.message.caption or ""
+				await cb.message.edit_caption(
+					caption=f"{current_caption}{additional_info}",
+					reply_markup=None
+				)
+			else:
+				# Это текстовое сообщение - используем edit_text
+				await cb.message.edit_text(
+					f"{cb.message.text}{additional_info}",
+					reply_markup=None
+				)
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.error(f"❌ Ошибка обновления сообщения админа: {e}")
+	
+	@dp.callback_query(F.data.startswith("order:xmr:wallet:"))
+	async def on_xmr_wallet_selected(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик выбора кошелька XMR при завершении заявки"""
+		if not cb.from_user:
+			return
+		from app.di import get_db, get_admin_ids
+		from app.admin import is_admin
+		db_local = get_db()
+		admin_ids = get_admin_ids()
+		
+		# Проверяем, что это админ
+		if not is_admin(cb.from_user.id, cb.from_user.username, admin_ids, []):
+			await cb.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
+			return
+		
+		# Формат: order:xmr:wallet:{order_id}:{xmr_number}
+		parts = cb.data.split(":")
+		if len(parts) < 5:
+			await cb.answer("❌ Ошибка данных.", show_alert=True)
+			return
+		
+		order_id = int(parts[3])
+		xmr_number = int(parts[4])
+		
+		# Получаем данные заявки
+		order = await db_local.get_order_by_id(order_id)
+		if not order:
+			await cb.answer("❌ Заявка не найдена.", show_alert=True)
+			return
+		
+		# Выполняем завершение заявки с выбранным номером кошелька
+		await _complete_order_with_wallet(cb, order_id, order, db_local, xmr_number)
 	
 	@dp.callback_query(F.data == "delete_message")
 	async def on_delete_message(cb: CallbackQuery):
@@ -1890,6 +2151,255 @@ async def main() -> None:
 	# ВАЖНО: Сначала включаем admin_router, чтобы команды из него обрабатывались первыми
 	dp.include_router(admin_router)
 
+	# Обработчик кнопки "Ответить" для пользователя по обычной заявке
+	# ВАЖНО: Должен быть ПЕРЕД обработчиком без состояния, чтобы иметь приоритет
+	@dp.callback_query(F.data.startswith("order:user:reply:"))
+	async def on_order_user_reply_start(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик начала ответа пользователя на сообщение админа по обычной заявке"""
+		if not cb.from_user:
+			await cb.answer()
+			return
+		
+		# Формат: order:user:reply:{order_id}
+		parts = cb.data.split(":")
+		if len(parts) < 4:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		
+		try:
+			order_id = int(parts[3])
+		except ValueError:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		
+		# Проверяем, что заявка принадлежит пользователю
+		order = await db_local.get_order_by_id(order_id)
+		if not order or order["user_tg_id"] != cb.from_user.id:
+			await cb.answer("Заявка не найдена", show_alert=True)
+			return
+		
+		# Проверяем, не завершена ли заявка
+		if order.get("completed_at"):
+			await cb.answer("Заявка уже завершена", show_alert=True)
+			return
+		
+		# Сохраняем order_id в состоянии
+		await state.update_data(order_id=order_id)
+		
+		# Переводим в состояние ожидания ответа
+		await state.set_state(OrderUserReplyStates.waiting_reply)
+		
+		# Удаляем уведомление о новом сообщении (если есть)
+		notification_key = (cb.from_user.id, order_id, 'order')
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🔵 Удаление уведомления: key={notification_key}, exists={notification_key in notification_ids}, all_keys={list(notification_ids.keys())}")
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				logger_main.info(f"🔵 Удаление уведомления: message_id={notif_message_id}, chat_id={cb.from_user.id}")
+				await cb.bot.delete_message(chat_id=cb.from_user.id, message_id=notif_message_id)
+				del notification_ids[notification_key]
+				logger_main.info(f"✅ Уведомление успешно удалено")
+			except Exception as e:
+				# Если не удалось удалить уведомление, продолжаем работу
+				logger_main.warning(f"⚠️ Не удалось удалить уведомление: {e}")
+		
+		# Уведомляем пользователя
+		await cb.message.edit_text(
+			cb.message.text + "\n\n📝 Введите ваш ответ:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+		await cb.answer()
+	
+	@dp.message(OrderUserReplyStates.waiting_reply)
+	async def on_order_user_reply_send(message: Message, state: FSMContext):
+		"""Обработчик отправки ответа пользователя на сообщение админа по обычной заявке"""
+		if not message.from_user:
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		
+		# Получаем данные из состояния
+		data = await state.get_data()
+		order_id = data.get("order_id")
+		
+		if not order_id:
+			await message.answer("❌ Ошибка: не найден ID заявки")
+			await state.clear()
+			return
+		
+		# Получаем текст ответа
+		reply_text = message.text or message.caption or ""
+		if not reply_text.strip():
+			await message.answer("❌ Пожалуйста, введите текст ответа.")
+			return
+		
+		# Получаем информацию о заявке
+		order = await db_local.get_order_by_id(order_id)
+		if not order:
+			await message.answer("❌ Заявка не найдена")
+			await state.clear()
+			return
+		
+		# Проверяем, что заявка принадлежит пользователю
+		if order["user_tg_id"] != message.from_user.id:
+			await message.answer("❌ Это не ваша заявка")
+			await state.clear()
+			return
+		
+		# Проверяем, не завершена ли заявка
+		if order.get("completed_at"):
+			await message.answer("❌ Заявка уже завершена. Вы не можете отправлять сообщения по завершенной заявке.")
+			await state.clear()
+			return
+		
+		# Сохраняем сообщение в истории переписки
+		await db_local.add_buy_order_message(order_id, "user", reply_text)
+		
+		# Получаем всю историю переписки
+		messages = await db_local.get_buy_order_messages(order_id)
+		
+		# Формируем информацию о заявке
+		order_number = order["order_number"]
+		crypto_display = order["crypto_display"]
+		amount = order["amount"]
+		amount_currency = order.get("amount_currency", 0)
+		currency_symbol = order.get("currency_symbol", "₽")
+		
+		# Форматируем сумму
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Формируем полное сообщение для пользователя: информация о заявке + история (без номера заявки)
+		order_info = (
+			f"💵 Криптовалюта: {crypto_display}\n"
+			f"💸 Сумма: {amount_str} {crypto_display}\n"
+			f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
+		)
+		
+		# Добавляем историю переписки
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+		
+		history_text = "\n\n".join(history_lines)
+		user_message = order_info + "\n" + history_text
+		
+		# Обновляем сообщение пользователя
+		from app.keyboards import order_user_reply_kb
+		try:
+			user_message_id = order.get("user_message_id")
+			if user_message_id:
+				await message.bot.edit_message_text(
+					chat_id=message.from_user.id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=order_user_reply_kb(order_id)
+				)
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
+		
+		# Обновляем сообщение админа
+		admin_ids = get_admin_ids()
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🔵 USER_REPLY: Проверка обновления сообщения админа: admin_ids={admin_ids}, admin_message_id={order.get('admin_message_id')}")
+		if admin_ids and order.get("admin_message_id"):
+			try:
+				user_name = order.get("user_name", "Не указано")
+				user_username = order.get("user_username", "Не указано")
+				user_tg_id = order["user_tg_id"]
+				wallet_address = order.get("wallet_address", "")
+				
+				admin_order_info = (
+					f"Имя пользователя: {user_name or 'Не указано'}\n"
+					f"Username: @{user_username}\n\n"
+					f"Количество монет: {amount_str} {crypto_display}\n"
+					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+					f"Адрес кошелька: <code>{wallet_address}</code>"
+				)
+				
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_order_info + "\n\n" + admin_history_text
+				
+				from app.keyboards import order_action_kb
+				# Используем расширенную клавиатуру, если есть переписка
+				is_expanded = len(messages) > 0
+				logger_main.info(f"🔵 USER_REPLY: Обновление сообщения админа: chat_id={admin_ids[0]}, message_id={order['admin_message_id']}, messages_count={len(messages)}")
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					# Сохраняем ID уведомления
+					notification_ids[(admin_ids[0], order_id, 'order')] = notif_msg.message_id
+				except Exception as e:
+					# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
+				# Пытаемся обновить как caption (для фото/документа), если не получится - как текст
+				try:
+					await message.bot.edit_message_caption(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						caption=admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
+				except Exception as e:
+					# Если не получилось (это текстовое сообщение), используем edit_text
+					logger_main.debug(f"Не удалось обновить caption, пробуем edit_text: {e}")
+					await message.bot.edit_message_text(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						text=admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
+				logger_main.info(f"✅ Сообщение админа обновлено после ответа пользователя по заявке {order_id}")
+				
+				# Отправляем временное уведомление пользователю
+				notif_msg = await message.bot.send_message(
+					chat_id=message.from_user.id,
+					text="✅ Сообщение отправлено администратору"
+				)
+				await asyncio.sleep(2)
+				try:
+					await message.bot.delete_message(chat_id=message.from_user.id, message_id=notif_msg.message_id)
+				except:
+					pass
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
+		else:
+			logger_main = logging.getLogger("app.main")
+			logger_main.warning(f"⚠️ USER_REPLY: Не удалось обновить сообщение админа: admin_ids={admin_ids}, admin_message_id={order.get('admin_message_id')}")
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Очищаем состояние
+		await state.clear()
+
 	# Обработчик ответов пользователя на сообщения админа по обычной заявке (должен быть ПЕРЕД обработчиком для продажи)
 	@dp.message(
 		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
@@ -1967,9 +2477,8 @@ async def main() -> None:
 				else:
 					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 				
-				# Формируем исходное сообщение о заявке
+				# Формируем исходное сообщение о заявке (без номера заявки)
 				order_info = (
-					f"Номер заявки за сегодня: {order_number}\n"
 					f"Имя пользователя: {user_name or 'Не указано'}\n"
 					f"Username: @{user_username}\n\n"
 					f"Количество монет: {amount_str} {crypto_display}\n"
@@ -1982,13 +2491,38 @@ async def main() -> None:
 				# Используем расширенную клавиатуру, если есть переписка
 				is_expanded = len(messages) > 0
 				
-				await message.bot.edit_message_text(
-					chat_id=admin_ids[0],
-					message_id=order["admin_message_id"],
-					text=order_info + "\n\n" + admin_message,
-					parse_mode="HTML",
-					reply_markup=order_action_kb(order_id, expanded=is_expanded)
-				)
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					# Сохраняем ID уведомления
+					notification_ids[(admin_ids[0], order_id, 'order')] = notif_msg.message_id
+				except Exception as e:
+					# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
+				
+				# Пытаемся обновить как caption (для фото/документа), если не получится - как текст
+				try:
+					await message.bot.edit_message_caption(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						caption=order_info + "\n\n" + admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
+				except Exception as e:
+					# Если не получилось (это текстовое сообщение), используем edit_text
+					logger_main.debug(f"Не удалось обновить caption, пробуем edit_text: {e}")
+					await message.bot.edit_message_text(
+						chat_id=admin_ids[0],
+						message_id=order["admin_message_id"],
+						text=order_info + "\n\n" + admin_message,
+						parse_mode="HTML",
+						reply_markup=order_action_kb(order_id, expanded=is_expanded)
+					)
 				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по заявке {order_id} отправлен админу")
 				
 				# Отправляем временное уведомление пользователю
@@ -2025,7 +2559,6 @@ async def main() -> None:
 					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 				
 				order_info = (
-					f"💰 <b>Заявка #{order_number}</b>\n\n"
 					f"💵 Криптовалюта: {crypto_display}\n"
 					f"💸 Сумма: {amount_str} {crypto_display}\n"
 					f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
@@ -2140,6 +2673,18 @@ async def main() -> None:
 				
 				# Обновляем сообщение админа с историей переписки
 				from app.keyboards import sell_order_admin_kb
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					# Сохраняем ID уведомления
+					notification_ids[(admin_ids[0], order_id, 'sell_order')] = notif_msg.message_id
+				except Exception as e:
+					# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
 				await message.bot.edit_message_text(
 					chat_id=admin_ids[0],
 					message_id=order["admin_message_id"],
@@ -2206,172 +2751,6 @@ async def main() -> None:
 					text=user_message,
 					parse_mode="HTML",
 					reply_markup=sell_order_user_reply_kb(order_id)
-				)
-			except Exception as e:
-				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
-	
-	# Обработчик ответов пользователя на сообщения админа по обычной заявке
-	@dp.message(
-		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
-		StateFilter(None),
-		~(F.text.startswith("/") if F.text else False)
-	)
-	async def on_user_reply_to_order(message: Message):
-		"""Обработчик ответов пользователя на сообщения админа по обычной заявке"""
-		if not message.from_user:
-			return
-		
-		from app.di import get_db
-		db_local = get_db()
-		
-		# Проверяем, есть ли у пользователя активная заявка
-		user_tg_id = message.from_user.id
-		
-		# Получаем последнюю активную заявку пользователя
-		order_id = await db_local.get_active_order_by_user(user_tg_id)
-		
-		if not order_id:
-			# Нет активной заявки, пропускаем обработку
-			return
-		
-		# Получаем информацию о заявке
-		order = await db_local.get_order_by_id(order_id)
-		if not order:
-			return
-		
-		# Проверяем, не завершена ли заявка
-		if order.get("completed_at"):
-			# Заявка завершена, не обрабатываем ответ
-			return
-		
-		# Получаем текст сообщения
-		message_text = message.text or message.caption or ""
-		if not message_text.strip():
-			return
-		
-		# Сохраняем сообщение в истории переписки
-		await db_local.add_buy_order_message(order_id, "user", message_text)
-		
-		# Получаем всю историю переписки
-		messages = await db_local.get_buy_order_messages(order_id)
-		
-		# Формируем сообщение для админа с историей
-		history_lines = []
-		for msg in messages:
-			if msg["sender_type"] == "admin":
-				history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
-			else:
-				history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
-		
-		admin_message = "\n\n".join(history_lines)
-		
-		# Отправляем сообщение админу
-		admin_ids = get_admin_ids()
-		logger_main = logging.getLogger("app.main")
-		
-		if admin_ids and order.get("admin_message_id"):
-			try:
-				# Формируем полное сообщение для админа
-				order_number = order["order_number"]
-				user_name = order.get("user_name", "Не указано")
-				user_username = order.get("user_username", "Не указано")
-				amount = order["amount"]
-				amount_currency = order.get("amount_currency", 0)
-				currency_symbol = order.get("currency_symbol", "₽")
-				wallet_address = order.get("wallet_address", "")
-				crypto_display = order["crypto_display"]
-				
-				# Форматируем сумму
-				if amount < 1:
-					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
-				else:
-					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
-				
-				# Формируем исходное сообщение о заявке
-				order_info = (
-					f"Номер заявки за сегодня: {order_number}\n"
-					f"Имя пользователя: {user_name or 'Не указано'}\n"
-					f"Username: @{user_username}\n\n"
-					f"Количество монет: {amount_str} {crypto_display}\n"
-					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-					f"Адрес кошелька: <code>{wallet_address}</code>"
-				)
-				
-				# Обновляем сообщение админа с историей переписки
-				from app.keyboards import order_action_kb
-				# Определяем, расширена ли клавиатура (проверяем наличие кнопки "Написать")
-				# Для простоты всегда используем расширенную клавиатуру, если есть переписка
-				is_expanded = len(messages) > 0
-				
-				await message.bot.edit_message_text(
-					chat_id=admin_ids[0],
-					message_id=order["admin_message_id"],
-					text=order_info + "\n\n" + admin_message,
-					parse_mode="HTML",
-					reply_markup=order_action_kb(order_id, expanded=is_expanded)
-				)
-				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по заявке {order_id} отправлен админу")
-				
-				# Отправляем временное уведомление пользователю
-				notif_msg = await message.bot.send_message(
-					chat_id=user_tg_id,
-					text="✅ Сообщение отправлено администратору"
-				)
-				await asyncio.sleep(2)
-				try:
-					await message.bot.delete_message(chat_id=user_tg_id, message_id=notif_msg.message_id)
-				except:
-					pass
-			except Exception as e:
-				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
-		
-		# Удаляем сообщение пользователя
-		await delete_user_message(message)
-		
-		# Если у пользователя было сообщение с историей, обновляем его
-		user_message_id = order.get("user_message_id")
-		if user_message_id:
-			try:
-				# Формируем полное сообщение для пользователя
-				order_number = order["order_number"]
-				crypto_display = order["crypto_display"]
-				amount = order["amount"]
-				amount_currency = order.get("amount_currency", 0)
-				currency_symbol = order.get("currency_symbol", "₽")
-				
-				# Форматируем сумму
-				if amount < 1:
-					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
-				else:
-					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
-				
-				order_info = (
-					f"💰 <b>Заявка #{order_number}</b>\n\n"
-					f"💵 Криптовалюта: {crypto_display}\n"
-					f"💸 Сумма: {amount_str} {crypto_display}\n"
-					f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
-				)
-				
-				# Получаем обновленную историю переписки
-				updated_messages = await db_local.get_buy_order_messages(order_id)
-				history_lines = []
-				for msg in updated_messages:
-					if msg["sender_type"] == "admin":
-						history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
-					else:
-						history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
-				
-				history_text = "\n\n".join(history_lines)
-				user_message = order_info + "\n" + history_text
-				
-				# Обновляем сообщение пользователя
-				from app.keyboards import order_user_reply_kb
-				await message.bot.edit_message_text(
-					chat_id=user_tg_id,
-					message_id=user_message_id,
-					text=user_message,
-					parse_mode="HTML",
-					reply_markup=order_user_reply_kb(order_id)
 				)
 			except Exception as e:
 				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
@@ -2551,6 +2930,17 @@ async def main() -> None:
 		# Переводим в состояние ожидания ответа
 		await state.set_state(QuestionUserReplyStates.waiting_reply)
 		
+		# Удаляем уведомление о новом сообщении (если есть)
+		notification_key = (cb.from_user.id, question_id, 'question')
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				await cb.bot.delete_message(chat_id=cb.from_user.id, message_id=notif_message_id)
+				del notification_ids[notification_key]
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.debug(f"Не удалось удалить уведомление: {e}")
+		
 		# Уведомляем пользователя
 		await cb.message.edit_text(
 			cb.message.text + "\n\n📝 Введите ваш ответ:",
@@ -2668,6 +3058,18 @@ async def main() -> None:
 				admin_message = admin_question_info + "\n\n" + admin_history_text
 				
 				from app.keyboards import question_reply_kb
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					# Сохраняем ID уведомления
+					notification_ids[(admin_ids[0], question_id, 'question')] = notif_msg.message_id
+				except Exception as e:
+					# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
 				await message.bot.edit_message_text(
 					chat_id=admin_ids[0],
 					message_id=question["admin_message_id"],
@@ -2675,18 +3077,6 @@ async def main() -> None:
 					parse_mode="HTML",
 					reply_markup=question_reply_kb(question_id)
 				)
-				
-				# Отправляем временное уведомление пользователю
-				import asyncio
-				notif_msg = await message.bot.send_message(
-					chat_id=message.from_user.id,
-					text="✅ Сообщение отправлено администратору"
-				)
-				await asyncio.sleep(2)
-				try:
-					await message.bot.delete_message(chat_id=message.from_user.id, message_id=notif_msg.message_id)
-				except:
-					pass
 			except Exception as e:
 				logger_main = logging.getLogger("app.main")
 				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
@@ -2697,210 +3087,6 @@ async def main() -> None:
 		# Очищаем состояние
 		await state.clear()
 
-	# Обработчик кнопки "Ответить" для пользователя по обычной заявке
-	@dp.callback_query(F.data.startswith("order:user:reply:"))
-	async def on_order_user_reply_start(cb: CallbackQuery, state: FSMContext):
-		"""Обработчик начала ответа пользователя на сообщение админа по обычной заявке"""
-		if not cb.from_user:
-			await cb.answer()
-			return
-		
-		# Формат: order:user:reply:{order_id}
-		parts = cb.data.split(":")
-		if len(parts) < 4:
-			await cb.answer("Ошибка данных", show_alert=True)
-			return
-		
-		try:
-			order_id = int(parts[3])
-		except ValueError:
-			await cb.answer("Ошибка данных", show_alert=True)
-			return
-		
-		from app.di import get_db
-		db_local = get_db()
-		
-		# Проверяем, что заявка принадлежит пользователю
-		order = await db_local.get_order_by_id(order_id)
-		if not order or order["user_tg_id"] != cb.from_user.id:
-			await cb.answer("Заявка не найдена", show_alert=True)
-			return
-		
-		# Проверяем, не завершена ли заявка
-		if order.get("completed_at"):
-			await cb.answer("Заявка уже завершена", show_alert=True)
-			return
-		
-		# Сохраняем order_id в состоянии
-		await state.update_data(order_id=order_id)
-		
-		# Переводим в состояние ожидания ответа
-		await state.set_state(OrderUserReplyStates.waiting_reply)
-		
-		# Уведомляем пользователя
-		await cb.message.edit_text(
-			cb.message.text + "\n\n📝 Введите ваш ответ:",
-			parse_mode="HTML",
-			reply_markup=cb.message.reply_markup
-		)
-		await cb.answer()
-	
-	@dp.message(OrderUserReplyStates.waiting_reply)
-	async def on_order_user_reply_send(message: Message, state: FSMContext):
-		"""Обработчик отправки ответа пользователя на сообщение админа по обычной заявке"""
-		if not message.from_user:
-			return
-		
-		from app.di import get_db
-		db_local = get_db()
-		
-		# Получаем данные из состояния
-		data = await state.get_data()
-		order_id = data.get("order_id")
-		
-		if not order_id:
-			await message.answer("❌ Ошибка: не найден ID заявки")
-			await state.clear()
-			return
-		
-		# Получаем текст ответа
-		reply_text = message.text or message.caption or ""
-		if not reply_text.strip():
-			await message.answer("❌ Пожалуйста, введите текст ответа.")
-			return
-		
-		# Получаем информацию о заявке
-		order = await db_local.get_order_by_id(order_id)
-		if not order:
-			await message.answer("❌ Заявка не найдена")
-			await state.clear()
-			return
-		
-		# Проверяем, что заявка принадлежит пользователю
-		if order["user_tg_id"] != message.from_user.id:
-			await message.answer("❌ Это не ваша заявка")
-			await state.clear()
-			return
-		
-		# Проверяем, не завершена ли заявка
-		if order.get("completed_at"):
-			await message.answer("❌ Заявка уже завершена. Вы не можете отправлять сообщения по завершенной заявке.")
-			await state.clear()
-			return
-		
-		# Сохраняем сообщение в истории переписки
-		await db_local.add_buy_order_message(order_id, "user", reply_text)
-		
-		# Получаем всю историю переписки
-		messages = await db_local.get_buy_order_messages(order_id)
-		
-		# Формируем информацию о заявке
-		order_number = order["order_number"]
-		crypto_display = order["crypto_display"]
-		amount = order["amount"]
-		amount_currency = order.get("amount_currency", 0)
-		currency_symbol = order.get("currency_symbol", "₽")
-		
-		# Форматируем сумму
-		if amount < 1:
-			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
-		else:
-			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
-		
-		# Формируем полное сообщение для пользователя: информация о заявке + история
-		order_info = (
-			f"💰 <b>Заявка #{order_number}</b>\n\n"
-			f"💵 Криптовалюта: {crypto_display}\n"
-			f"💸 Сумма: {amount_str} {crypto_display}\n"
-			f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
-		)
-		
-		# Добавляем историю переписки
-		history_lines = []
-		for msg in messages:
-			if msg["sender_type"] == "admin":
-				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
-			else:
-				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
-		
-		history_text = "\n\n".join(history_lines)
-		user_message = order_info + "\n" + history_text
-		
-		# Обновляем сообщение пользователя
-		from app.keyboards import order_user_reply_kb
-		try:
-			user_message_id = order.get("user_message_id")
-			if user_message_id:
-				await message.bot.edit_message_text(
-					chat_id=message.from_user.id,
-					message_id=user_message_id,
-					text=user_message,
-					parse_mode="HTML",
-					reply_markup=order_user_reply_kb(order_id)
-				)
-		except Exception as e:
-			logger_main = logging.getLogger("app.main")
-			logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
-		
-		# Обновляем сообщение админа
-		admin_ids = get_admin_ids()
-		if admin_ids and order.get("admin_message_id"):
-			try:
-				user_name = order.get("user_name", "Не указано")
-				user_username = order.get("user_username", "Не указано")
-				user_tg_id = order["user_tg_id"]
-				wallet_address = order.get("wallet_address", "")
-				
-				admin_order_info = (
-					f"Номер заявки за сегодня: {order_number}\n"
-					f"Имя пользователя: {user_name or 'Не указано'}\n"
-					f"Username: @{user_username}\n\n"
-					f"Количество монет: {amount_str} {crypto_display}\n"
-					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-					f"Адрес кошелька: <code>{wallet_address}</code>"
-				)
-				
-				admin_history_lines = []
-				for msg in messages:
-					if msg["sender_type"] == "admin":
-						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
-					else:
-						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
-				
-				admin_history_text = "\n\n".join(admin_history_lines)
-				admin_message = admin_order_info + "\n\n" + admin_history_text
-				
-				from app.keyboards import order_action_kb
-				# Используем расширенную клавиатуру, если есть переписка
-				is_expanded = len(messages) > 0
-				await message.bot.edit_message_text(
-					chat_id=admin_ids[0],
-					message_id=order["admin_message_id"],
-					text=admin_message,
-					parse_mode="HTML",
-					reply_markup=order_action_kb(order_id, expanded=is_expanded)
-				)
-				
-				# Отправляем временное уведомление пользователю
-				notif_msg = await message.bot.send_message(
-					chat_id=message.from_user.id,
-					text="✅ Сообщение отправлено администратору"
-				)
-				await asyncio.sleep(2)
-				try:
-					await message.bot.delete_message(chat_id=message.from_user.id, message_id=notif_msg.message_id)
-				except:
-					pass
-			except Exception as e:
-				logger_main = logging.getLogger("app.main")
-				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
-		
-		# Удаляем сообщение пользователя
-		await delete_user_message(message)
-		
-		# Очищаем состояние
-		await state.clear()
-	
 	# Обработчик кнопки "Ответить" для пользователя по сделке
 	@dp.callback_query(F.data.startswith("sell:order:user:reply:"))
 	async def on_sell_order_user_reply_start(cb: CallbackQuery, state: FSMContext):
@@ -2949,6 +3135,17 @@ async def main() -> None:
 		
 		# Переводим в состояние ожидания ответа
 		await state.set_state(SellOrderUserReplyStates.waiting_reply)
+		
+		# Удаляем уведомление о новом сообщении (если есть)
+		notification_key = (cb.from_user.id, order_id, 'sell_order')
+		if notification_key in notification_ids:
+			try:
+				notif_message_id = notification_ids[notification_key]
+				await cb.bot.delete_message(chat_id=cb.from_user.id, message_id=notif_message_id)
+				del notification_ids[notification_key]
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.debug(f"Не удалось удалить уведомление: {e}")
 		
 		try:
 			await cb.message.edit_text(
@@ -3086,6 +3283,18 @@ async def main() -> None:
 				admin_message = admin_order_info + "\n\n" + admin_history_text
 				
 				from app.keyboards import sell_order_admin_kb
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					# Сохраняем ID уведомления
+					notification_ids[(admin_ids[0], order_id, 'sell_order')] = notif_msg.message_id
+				except Exception as e:
+					# Если не удалось отправить уведомление (сетевая ошибка и т.д.), продолжаем работу
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
 				await message.bot.edit_message_text(
 					chat_id=admin_ids[0],
 					message_id=order["admin_message_id"],

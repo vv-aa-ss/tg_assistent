@@ -1385,6 +1385,139 @@ def _write_all_to_google_sheet_one_row_sync(
 		return {"success": False}
 
 
+async def write_order_to_google_sheet(
+	sheet_id: str,
+	credentials_path: str,
+	order: Dict[str, Any],
+	db: Any,
+	sheet_name: Optional[str] = None,
+	xmr_number: Optional[int] = None
+) -> Dict[str, Any]:
+	"""
+	Записывает данные заявки в Google Sheets при нажатии "Выполнено".
+	
+	Args:
+		sheet_id: ID Google Sheet
+		credentials_path: Путь к файлу с учетными данными
+		order: Словарь с данными заявки
+		db: Экземпляр базы данных
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Словарь с результатами: {"success": bool, "written_cells": list}
+	"""
+	try:
+		# Получаем первую карту пользователя (как при создании заявки)
+		user_tg_id = order.get("user_tg_id")
+		user_cards = await db.get_cards_for_user_tg(user_tg_id)
+		
+		# Подготавливаем данные для записи
+		crypto_list = []
+		xmr_list = []
+		card_cash_pairs = []
+		
+		crypto_type = order.get("crypto_type", "")
+		amount = order.get("amount", 0.0)  # Количество проданных монет
+		amount_currency = order.get("amount_currency", 0.0)  # Количество рублей
+		
+		# Определяем тип криптовалюты и подготавливаем данные
+		# Пользователь сказал записывать "Количество проданных монет"
+		# Но в ячейки записывается USD эквивалент (как в существующем коде)
+		# Поэтому нужно конвертировать количество монет в USD
+		if crypto_type == "BTC":
+			# Конвертируем количество BTC монет в USD
+			btc_price = await get_btc_price_usd()
+			if btc_price:
+				usd_amount = amount * btc_price
+			else:
+				logger.warning("⚠️ Не удалось получить курс BTC, используем количество монет")
+				usd_amount = amount
+			crypto_list.append({
+				"currency": "BTC",
+				"usd_amount": usd_amount  # USD эквивалент
+			})
+		elif crypto_type == "LTC":
+			# Конвертируем количество LTC монет в USD
+			ltc_price = await get_ltc_price_usd()
+			if ltc_price:
+				usd_amount = amount * ltc_price
+			else:
+				logger.warning("⚠️ Не удалось получить курс LTC, используем количество монет")
+				usd_amount = amount
+			crypto_list.append({
+				"currency": "LTC",
+				"usd_amount": usd_amount  # USD эквивалент
+			})
+		elif crypto_type == "XMR":
+			# Для XMR используем переданный номер кошелька или XMR-1 по умолчанию
+			if xmr_number is None:
+				xmr_number = 1  # По умолчанию XMR-1
+			# Для XMR нужно конвертировать количество монет в USD
+			# Получаем курс XMR
+			from app.google_sheets import get_xmr_price_usd
+			xmr_price = await get_xmr_price_usd()
+			if xmr_price:
+				usd_amount = amount * xmr_price
+			else:
+				logger.warning("⚠️ Не удалось получить курс XMR, используем количество монет")
+				usd_amount = amount
+			xmr_list.append({
+				"xmr_number": xmr_number,
+				"usd_amount": usd_amount  # USD эквивалент
+			})
+		elif crypto_type == "USDT":
+			# Для USDT нужно определить, ТЕЗЕР или ТРАСТ
+			# Пока что используем ТЕЗЕР по умолчанию (BB)
+			# TODO: Нужно сохранять тип кошелька при создании заявки
+			# ТЕЗЕР = BB, ТРАСТ = AZ
+			# Пока что используем ТЕЗЕР
+			# Записываем количество USDT монет (USDT равен USD)
+			crypto_list.append({
+				"currency": "USDT",
+				"usd_amount": amount  # Количество USDT монет
+			})
+		
+		# Получаем ячейку для карты (рубли)
+		if user_cards:
+			card = user_cards[0]
+			card_id = card.get("card_id")
+			card_name = card.get("name", "")
+			column = await db.get_card_column(card_id)
+			
+			if column:
+				card_cash_pairs.append({
+					"card": {
+						"card_id": card_id,
+						"card_name": card_name,
+						"column": column
+					},
+					"cash": {
+						"currency": "RUB",
+						"value": int(amount_currency)  # Количество рублей
+					}
+				})
+			else:
+				logger.warning(f"⚠️ Не найдена ячейка для карты card_id={card_id}")
+		
+		# Используем существующую функцию для записи
+		result = await write_all_to_google_sheet_one_row(
+			sheet_id=sheet_id,
+			credentials_path=credentials_path,
+			crypto_list=crypto_list,
+			xmr_list=xmr_list,
+			cash_list=[],
+			card_cash_pairs=card_cash_pairs,
+			mode="add",
+			sheet_name=sheet_name
+		)
+		
+		return result
+		
+	except Exception as e:
+		logger.exception(f"Ошибка записи данных заявки в Google Sheet: {e}")
+		return {"success": False, "written_cells": []}
+
+
 async def delete_last_row_from_google_sheet(
 	sheet_id: str,
 	credentials_path: str,
