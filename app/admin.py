@@ -432,6 +432,13 @@ class OrderMessageStates(StatesGroup):
 	"""Состояния для переписки по обычной заявке"""
 	waiting_message = State()  # Ожидание ввода сообщения админом
 
+class OrderEditStates(StatesGroup):
+	"""Состояния для редактирования заявки"""
+	waiting_amount = State()  # Ожидание ввода новой суммы сделки
+	waiting_crypto_amount = State()  # Ожидание ввода нового количества крипты
+	waiting_debt_amount = State()  # Ожидание ввода суммы долга
+	waiting_debt_currency = State()  # Ожидание выбора валюты долга
+
 
 class CryptoColumnEditStates(StatesGroup):
 	waiting_column = State()
@@ -6797,9 +6804,18 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 									if last_order_profit is not None:
 										try:
 											profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
-											last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+											last_order_info += f"\n💰 Профит от последней сделки: {profit_formatted} USD"
 										except (ValueError, TypeError):
-											last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+											last_order_info += f"\n💰 Профит от последней сделки: {last_order_profit} USD"
+							
+							# Получаем профит за текущий месяц
+							monthly_profit = await db.get_user_monthly_profit(user_tg_id)
+							if monthly_profit and monthly_profit > 0:
+								try:
+									monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+								except (ValueError, TypeError):
+									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
 				except Exception as e:
 					logger.debug(f"Ошибка получения информации о последней сделке: {e}")
 				
@@ -6992,6 +7008,22 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 				user_name = order.get("user_name", "Не указано")
 				user_username = order.get("user_username", "Не указано")
 				
+				# Получаем долг для этой заявки
+				debt = await db.get_debt_by_order_id(order_id)
+				debt_info = ""
+				if debt:
+					debt_info = f"\n💳 Долг по этой сделке: {int(debt['debt_amount'])} {debt['currency_symbol']}"
+				
+				# Получаем общий долг пользователя
+				user_debts = await db.get_user_total_debt(order["user_tg_id"])
+				total_debt_info = ""
+				if user_debts:
+					debt_lines = []
+					for curr, debt_sum in user_debts.items():
+						debt_lines.append(f"{int(debt_sum)} {curr}")
+					if debt_lines:
+						total_debt_info = f"\n💳 Общий долг пользователя: {', '.join(debt_lines)}"
+				
 				# Формируем информацию о заявке для админа
 				admin_order_info = (
 					f"Номер заявки за сегодня: {order_number}\n"
@@ -6999,7 +7031,7 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 					f"Username: @{user_username}\n\n"
 					f"Количество монет: {amount_str} {crypto_display}\n"
 					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-					f"Адрес кошелька: <code>{order.get('wallet_address', '')}</code>"
+					f"Адрес кошелька: <code>{order.get('wallet_address', '')}</code>{debt_info}{total_debt_info}"
 				)
 				
 				# Формируем историю переписки для админа
@@ -7062,9 +7094,425 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 	# Удаляем сообщение админа после отправки
 	from app.main import delete_user_message
 	await delete_user_message(message)
+
+@admin_router.message(OrderEditStates.waiting_amount)
+async def order_edit_amount_save(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик сохранения новой суммы сделки"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Проверяем, не является ли это командой
+	if message.text and message.text.startswith("/"):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("order_id")
+	current_amount = data.get("current_amount_currency", 0)
+	currency_symbol = data.get("currency_symbol", "₽")
+	
+	if not order_id:
+		await message.answer("❌ Ошибка: не найден ID заявки")
+		await state.clear()
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await message.answer("❌ Заявка не найдена")
+		await state.clear()
+		return
+	
+	# Валидируем введенную сумму
+	try:
+		new_amount_str = message.text.strip().replace(",", ".")
+		new_amount = float(new_amount_str)
+		if new_amount <= 0:
+			await message.answer(f"❌ Сумма должна быть больше нуля. Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите новую сумму:")
+			return
+	except ValueError:
+		await message.answer(f"❌ Неверный формат суммы. Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите число (например: 5000):")
+		return
+	
+	# Обновляем сумму в БД
+	await db._db.execute(
+		"UPDATE orders SET amount_currency = ? WHERE id = ?",
+		(new_amount, order_id)
+	)
+	await db._db.commit()
+	
+	logger.info(f"✅ Сумма сделки {order_id} обновлена: {int(current_amount)} {currency_symbol} -> {int(new_amount)} {currency_symbol}")
+	
+	# Обновляем сообщение админа с новыми данными
+	await _update_admin_order_message(bot, order_id, db, admin_ids)
 	
 	# Очищаем состояние
 	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	
+	await message.answer(f"✅ Сумма сделки обновлена: {int(new_amount)} {currency_symbol}")
+
+@admin_router.message(OrderEditStates.waiting_crypto_amount)
+async def order_edit_crypto_amount_save(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик сохранения нового количества крипты"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Проверяем, не является ли это командой
+	if message.text and message.text.startswith("/"):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("order_id")
+	current_crypto_amount = data.get("current_crypto_amount", 0)
+	crypto_display = data.get("crypto_display", "")
+	
+	if not order_id:
+		await message.answer("❌ Ошибка: не найден ID заявки")
+		await state.clear()
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await message.answer("❌ Заявка не найдена")
+		await state.clear()
+		return
+	
+	# Валидируем введенное количество
+	try:
+		new_amount_str = message.text.strip().replace(",", ".")
+		new_crypto_amount = float(new_amount_str)
+		if new_crypto_amount <= 0:
+			current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+			await message.answer(f"❌ Количество должно быть больше нуля. Текущее количество: {current_str} {crypto_display}\nВведите новое количество:")
+			return
+	except ValueError:
+		current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+		await message.answer(f"❌ Неверный формат количества. Текущее количество: {current_str} {crypto_display}\nВведите число (например: 0.008 или 100):")
+		return
+	
+	# Обновляем количество крипты в БД
+	await db._db.execute(
+		"UPDATE orders SET amount = ? WHERE id = ?",
+		(new_crypto_amount, order_id)
+	)
+	await db._db.commit()
+	
+	current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+	new_str = f"{new_crypto_amount:.8f}".rstrip('0').rstrip('.') if new_crypto_amount < 1 else f"{new_crypto_amount:.2f}".rstrip('0').rstrip('.')
+	logger.info(f"✅ Количество крипты сделки {order_id} обновлено: {current_str} {crypto_display} -> {new_str} {crypto_display}")
+	
+	# Обновляем сообщение админа с новыми данными
+	await _update_admin_order_message(bot, order_id, db, admin_ids)
+	
+	# Очищаем состояние
+	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	
+	await message.answer(f"✅ Количество крипты обновлено: {new_str} {crypto_display}")
+
+@admin_router.callback_query(F.data.startswith("order:debt:"))
+async def order_debt_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала добавления долга"""
+	# Формат: order:debt:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		order_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await cb.answer("Заявка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли заявка
+	if order.get("completed_at"):
+		await cb.answer("Заявка уже завершена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		order_id=order_id,
+		user_tg_id=order["user_tg_id"]
+	)
+	
+	# Переводим в состояние ожидания выбора валюты
+	await state.set_state(OrderEditStates.waiting_debt_currency)
+	
+	# Создаем клавиатуру для выбора валюты
+	from aiogram.utils.keyboard import InlineKeyboardBuilder
+	kb = InlineKeyboardBuilder()
+	kb.button(text="Бел. руб (BYN)", callback_data="debt:currency:BYN")
+	kb.button(text="Рос. руб (RUB)", callback_data="debt:currency:RUB")
+	kb.adjust(1)
+	
+	# Обновляем сообщение админа
+	if cb.message.photo:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + "\n\n💳 Выберите валюту долга:",
+			parse_mode="HTML",
+			reply_markup=kb.as_markup()
+		)
+	elif cb.message.document:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + "\n\n💳 Выберите валюту долга:",
+			parse_mode="HTML",
+			reply_markup=kb.as_markup()
+		)
+	else:
+		await cb.message.edit_text(
+			cb.message.text + "\n\n💳 Выберите валюту долга:",
+			parse_mode="HTML",
+			reply_markup=kb.as_markup()
+		)
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("debt:currency:"))
+async def order_debt_currency_selected(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора валюты долга"""
+	# Формат: debt:currency:{currency}
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	currency_symbol = parts[2]
+	if currency_symbol not in ["BYN", "RUB"]:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Сохраняем валюту в FSM
+	await state.update_data(debt_currency=currency_symbol)
+	
+	# Переводим в состояние ожидания суммы долга
+	await state.set_state(OrderEditStates.waiting_debt_amount)
+	
+		# Получаем информацию о заявке для восстановления клавиатуры
+		data = await state.get_data()
+		order_id = data.get("order_id")
+		if not order_id:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		
+		# Восстанавливаем клавиатуру заявки
+		from app.keyboards import order_action_kb
+		db = get_db()
+		messages = await db.get_order_messages(order_id)
+		is_expanded = len(messages) > 0
+		
+		# Обновляем сообщение админа
+		if cb.message.photo:
+			current_caption = cb.message.caption or ""
+			# Удаляем строку о выборе валюты
+			caption_lines = current_caption.split("\n")
+			if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
+				caption_lines = caption_lines[:-1]
+			current_caption = "\n".join(caption_lines)
+			await cb.message.edit_caption(
+				caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+				parse_mode="HTML",
+				reply_markup=order_action_kb(order_id, expanded=is_expanded)
+			)
+		elif cb.message.document:
+			current_caption = cb.message.caption or ""
+			caption_lines = current_caption.split("\n")
+			if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
+				caption_lines = caption_lines[:-1]
+			current_caption = "\n".join(caption_lines)
+			await cb.message.edit_caption(
+				caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+				parse_mode="HTML",
+				reply_markup=order_action_kb(order_id, expanded=is_expanded)
+			)
+		else:
+			text_lines = cb.message.text.split("\n")
+			if text_lines and "Выберите валюту долга" in text_lines[-1]:
+				text_lines = text_lines[:-1]
+			text = "\n".join(text_lines)
+			await cb.message.edit_text(
+				text + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+				parse_mode="HTML",
+				reply_markup=order_action_kb(order_id, expanded=is_expanded)
+			)
+	await cb.answer()
+
+@admin_router.message(OrderEditStates.waiting_debt_amount)
+async def order_debt_amount_save(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик сохранения суммы долга"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Проверяем, не является ли это командой
+	if message.text and message.text.startswith("/"):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("order_id")
+	user_tg_id = data.get("user_tg_id")
+	debt_currency = data.get("debt_currency")
+	
+	if not order_id or not user_tg_id or not debt_currency:
+		await message.answer("❌ Ошибка: не найдены данные заявки")
+		await state.clear()
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await message.answer("❌ Заявка не найдена")
+		await state.clear()
+		return
+	
+	# Валидируем введенную сумму
+	try:
+		debt_amount_str = message.text.strip().replace(",", ".")
+		debt_amount = float(debt_amount_str)
+		if debt_amount <= 0:
+			await message.answer(f"❌ Сумма должна быть больше нуля. Введите сумму долга:")
+			return
+	except ValueError:
+		await message.answer(f"❌ Неверный формат суммы. Введите число (например: 5000):")
+		return
+	
+	# Проверяем, есть ли уже долг для этой заявки
+	existing_debt = await db.get_debt_by_order_id(order_id)
+	if existing_debt:
+		# Обновляем существующий долг
+		await db._db.execute(
+			"UPDATE debts SET debt_amount = ?, currency_symbol = ? WHERE order_id = ?",
+			(debt_amount, debt_currency, order_id)
+		)
+		await db._db.commit()
+		logger.info(f"✅ Долг для заявки {order_id} обновлен: {int(debt_amount)} {debt_currency}")
+		await message.answer(f"✅ Долг обновлен: {int(debt_amount)} {debt_currency}")
+	else:
+		# Создаем новый долг
+		await db.create_debt(order_id, user_tg_id, debt_amount, debt_currency)
+		logger.info(f"✅ Долг для заявки {order_id} создан: {int(debt_amount)} {debt_currency}")
+		await message.answer(f"✅ Долг добавлен: {int(debt_amount)} {debt_currency}")
+	
+	# Обновляем сообщение админа с новыми данными
+	await _update_admin_order_message(bot, order_id, db, admin_ids)
+	
+	# Очищаем состояние
+	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+
+async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: List[int]):
+	"""Вспомогательная функция для обновления сообщения админа с данными заявки"""
+	try:
+		order = await db.get_order_by_id(order_id)
+		if not order or not admin_ids:
+			return
+		
+		# Получаем историю переписки
+		messages = await db.get_order_messages(order_id)
+		
+		# Формируем информацию о заявке
+		order_number = order.get("order_number", 0)
+		user_name = order.get("user_name", "Не указано")
+		user_username = order.get("user_username", "Не указано")
+		crypto_display = order.get("crypto_display", "")
+		amount = order.get("amount", 0)
+		amount_currency = order.get("amount_currency", 0)
+		currency_symbol = order.get("currency_symbol", "₽")
+		wallet_address = order.get("wallet_address", "")
+		
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Получаем долг для этой заявки
+		debt = await db.get_debt_by_order_id(order_id)
+		debt_info = ""
+		if debt:
+			debt_info = f"\n💳 Долг по этой сделке: {int(debt['debt_amount'])} {debt['currency_symbol']}"
+		
+		# Получаем общий долг пользователя
+		user_debts = await db.get_user_total_debt(order["user_tg_id"])
+		total_debt_info = ""
+		if user_debts:
+			debt_lines = []
+			for curr, debt_sum in user_debts.items():
+				debt_lines.append(f"{int(debt_sum)} {curr}")
+			if debt_lines:
+				total_debt_info = f"\n💳 Общий долг пользователя: {', '.join(debt_lines)}"
+		
+		admin_order_info = (
+			f"Номер заявки за сегодня: {order_number}\n"
+			f"Имя пользователя: {user_name or 'Не указано'}\n"
+			f"Username: @{user_username}\n\n"
+			f"Количество монет: {amount_str} {crypto_display}\n"
+			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Адрес кошелька: <code>{wallet_address}</code>{debt_info}{total_debt_info}"
+		)
+		
+		# Формируем историю переписки
+		admin_history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+			else:
+				admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+		
+		admin_history_text = "\n\n".join(admin_history_lines)
+		admin_message = admin_order_info + ("\n\n" + admin_history_text if admin_history_text else "")
+		
+		# Обновляем сообщение админа
+		from app.keyboards import order_action_kb
+		is_expanded = len(messages) > 0
+		
+		if order.get("admin_message_id"):
+			try:
+				await bot.edit_message_caption(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					caption=admin_message,
+					parse_mode="HTML",
+					reply_markup=order_action_kb(order_id, expanded=is_expanded)
+				)
+			except Exception:
+				await bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=order["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=order_action_kb(order_id, expanded=is_expanded)
+				)
+	except Exception as e:
+		logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
 
 # Обработчики для сделок на продажу - должны быть ПЕРЕД handle_forwarded_from_admin
 @admin_router.message(SellOrderMessageStates.waiting_message)
@@ -7633,9 +8081,18 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 						if last_order_profit is not None:
 							try:
 								profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
-								last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+								last_order_info += f"\n💰 Профит от последней сделки: {profit_formatted} USD"
 							except (ValueError, TypeError):
-								last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+								last_order_info += f"\n💰 Профит от последней сделки: {last_order_profit} USD"
+				
+				# Получаем профит за текущий месяц
+				monthly_profit = await db.get_user_monthly_profit(user_tg_id)
+				if monthly_profit and monthly_profit > 0:
+					try:
+						monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+						last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+					except (ValueError, TypeError):
+						last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
 	except Exception as e:
 		logger.debug(f"Ошибка получения информации о последней сделке: {e}")
 	
@@ -7921,6 +8378,135 @@ async def order_message_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		# Это текстовое сообщение - используем edit_text
 		await cb.message.edit_text(
 			cb.message.text + "\n\n📝 Введите ваше сообщение пользователю:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("order:edit:amount:"))
+async def order_edit_amount_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала изменения суммы сделки"""
+	# Формат: order:edit:amount:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		order_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await cb.answer("Заявка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли заявка
+	if order.get("completed_at"):
+		await cb.answer("Заявка уже завершена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		order_id=order_id,
+		current_amount_currency=order.get("amount_currency", 0),
+		currency_symbol=order.get("currency_symbol", "₽")
+	)
+	
+	# Переводим в состояние ожидания новой суммы
+	await state.set_state(OrderEditStates.waiting_amount)
+	
+	# Обновляем сообщение админа
+	current_amount = order.get("amount_currency", 0)
+	currency_symbol = order.get("currency_symbol", "₽")
+	
+	# Проверяем тип сообщения (кнопки теперь на фото/документе)
+	if cb.message.photo:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n💰 Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите новую сумму сделки:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	elif cb.message.document:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n💰 Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите новую сумму сделки:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	else:
+		await cb.message.edit_text(
+			cb.message.text + f"\n\n💰 Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите новую сумму сделки:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	await cb.answer()
+
+@admin_router.callback_query(F.data.startswith("order:edit:crypto:"))
+async def order_edit_crypto_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик начала изменения количества крипты"""
+	# Формат: order:edit:crypto:{order_id}
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	try:
+		order_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем информацию о заявке
+	db = get_db()
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await cb.answer("Заявка не найдена", show_alert=True)
+		return
+	
+	# Проверяем, не завершена ли заявка
+	if order.get("completed_at"):
+		await cb.answer("Заявка уже завершена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		order_id=order_id,
+		current_crypto_amount=order.get("amount", 0),
+		crypto_display=order.get("crypto_display", "")
+	)
+	
+	# Переводим в состояние ожидания нового количества крипты
+	await state.set_state(OrderEditStates.waiting_crypto_amount)
+	
+	# Обновляем сообщение админа
+	current_amount = order.get("amount", 0)
+	crypto_display = order.get("crypto_display", "")
+	amount_str = f"{current_amount:.8f}".rstrip('0').rstrip('.') if current_amount < 1 else f"{current_amount:.2f}".rstrip('0').rstrip('.')
+	
+	# Проверяем тип сообщения (кнопки теперь на фото/документе)
+	if cb.message.photo:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n🪙 Текущее количество: {amount_str} {crypto_display}\nВведите новое количество крипты:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	elif cb.message.document:
+		current_caption = cb.message.caption or ""
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n🪙 Текущее количество: {amount_str} {crypto_display}\nВведите новое количество крипты:",
+			parse_mode="HTML",
+			reply_markup=cb.message.reply_markup
+		)
+	else:
+		await cb.message.edit_text(
+			cb.message.text + f"\n\n🪙 Текущее количество: {amount_str} {crypto_display}\nВведите новое количество крипты:",
 			parse_mode="HTML",
 			reply_markup=cb.message.reply_markup
 		)

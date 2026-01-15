@@ -1360,6 +1360,16 @@ async def main() -> None:
 		else:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
+		# Получаем общий долг пользователя
+		user_debts = await db_local.get_user_total_debt(message.from_user.id)
+		total_debt_info = ""
+		if user_debts:
+			debt_lines = []
+			for curr, debt_sum in user_debts.items():
+				debt_lines.append(f"{int(debt_sum)} {curr}")
+			if debt_lines:
+				total_debt_info = f"\n💳 Общий долг пользователя: {', '.join(debt_lines)}"
+		
 		# Формируем сообщение для админа
 		admin_message_text = (
 			f"Номер заявки за сегодня: {order_number}\n"
@@ -1367,7 +1377,7 @@ async def main() -> None:
 			f"Username: @{user_username}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
 			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-			f"Адрес кошелька: <code>{wallet_address}</code>"
+			f"Адрес кошелька: <code>{wallet_address}</code>{total_debt_info}"
 		)
 		
 		# Отправляем заявку всем админам
@@ -1488,9 +1498,18 @@ async def main() -> None:
 							if last_order_profit is not None:
 								try:
 									profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
-									last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+									last_order_info += f"\n💰 Профит от последней сделки: {profit_formatted} USD"
 								except (ValueError, TypeError):
-									last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+									last_order_info += f"\n💰 Профит от последней сделки: {last_order_profit} USD"
+					
+					# Получаем профит за текущий месяц
+					monthly_profit = await db_local.get_user_monthly_profit(user_tg_id)
+					if monthly_profit and monthly_profit > 0:
+						try:
+							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+						except (ValueError, TypeError):
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
 		except Exception as e:
 			logging.getLogger("app.main").debug(f"Ошибка получения информации о последней сделке: {e}")
 		
@@ -1740,7 +1759,8 @@ async def main() -> None:
 	
 	async def _complete_order_with_wallet(cb: CallbackQuery, order_id: int, order: dict, db_local, xmr_number: int | None = None):
 		"""Вспомогательная функция для завершения заявки с указанным номером кошелька XMR (если применимо)"""
-		# Отмечаем заявку как выполненную
+		# Отмечаем заявку как выполненную (profit будет обновлен позже, если есть)
+		# Пока отмечаем без профита, профит обновим после получения из Google Sheets
 		await db_local.complete_order(order_id)
 		
 		# Форматируем сумму для отображения
@@ -1942,6 +1962,9 @@ async def main() -> None:
 						profit_num = float(str(profit_value).replace(",", ".").replace(" ", ""))
 					except (ValueError, AttributeError):
 						pass
+				# Обновляем профит в таблице orders
+				if profit_num is not None:
+					await db_local.complete_order(order_id, profit_num)
 				await db_local.update_user_last_order(order["user_tg_id"], order_id, profit_num)
 			except Exception as e:
 				logging.getLogger("app.main").warning(f"Ошибка сохранения информации о последней сделке: {e}")

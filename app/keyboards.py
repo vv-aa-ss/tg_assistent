@@ -1211,7 +1211,10 @@ def order_action_kb(order_id: int, expanded: bool = False) -> InlineKeyboardMark
 	if expanded:
 		kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}")
 		kb.button(text="💬 Написать", callback_data=f"order:message:{order_id}")
-		kb.adjust(2, 1)
+		kb.button(text="💰 Изменить сумму сделки", callback_data=f"order:edit:amount:{order_id}")
+		kb.button(text="🪙 Изменить количество крипты", callback_data=f"order:edit:crypto:{order_id}")
+		kb.button(text="💳 Долг", callback_data=f"order:debt:{order_id}")
+		kb.adjust(2, 2, 1)
 	else:
 		kb.button(text="📋 Дополнительно", callback_data=f"order:details:{order_id}:expanded")
 		kb.adjust(2)

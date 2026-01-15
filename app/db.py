@@ -100,6 +100,7 @@ class Database:
 		await self._ensure_buy_order_messages_table()
 		await self._ensure_questions_table()
 		await self._ensure_question_messages_table()
+		await self._ensure_debts_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -2415,6 +2416,9 @@ class Database:
 			if 'order_message_id' not in columns:
 				await self._db.execute("ALTER TABLE orders ADD COLUMN order_message_id INTEGER")
 				_logger.debug("Added column order_message_id to orders table")
+			if 'profit' not in columns:
+				await self._db.execute("ALTER TABLE orders ADD COLUMN profit REAL")
+				_logger.debug("Added column profit to orders table")
 			if 'proof_request_message_id' not in columns:
 				await self._db.execute("ALTER TABLE orders ADD COLUMN proof_request_message_id INTEGER")
 				_logger.debug("Added column proof_request_message_id to orders table")
@@ -2496,7 +2500,7 @@ class Database:
 			       proof_photo_file_id, proof_document_file_id,
 			       created_at, completed_at, order_message_id,
 			       proof_request_message_id, proof_confirmation_message_id,
-			       admin_message_id, user_message_id
+			       admin_message_id, user_message_id, profit
 			FROM orders WHERE id = ?
 			""",
 			(order_id,)
@@ -2526,15 +2530,22 @@ class Database:
 			"proof_confirmation_message_id": row[18] if len(row) > 18 else None,
 			"admin_message_id": row[19] if len(row) > 19 else None,
 			"user_message_id": row[20] if len(row) > 20 else None,
+			"profit": row[21] if len(row) > 21 else None,
 		}
 	
-	async def complete_order(self, order_id: int) -> bool:
+	async def complete_order(self, order_id: int, profit: Optional[float] = None) -> bool:
 		"""Отмечает заявку как выполненную"""
 		assert self._db
-		cur = await self._db.execute(
-			"UPDATE orders SET completed_at = ? WHERE id = ?",
-			(int(time.time()), order_id)
-		)
+		if profit is not None:
+			cur = await self._db.execute(
+				"UPDATE orders SET completed_at = ?, profit = ? WHERE id = ?",
+				(int(time.time()), profit, order_id)
+			)
+		else:
+			cur = await self._db.execute(
+				"UPDATE orders SET completed_at = ? WHERE id = ?",
+				(int(time.time()), order_id)
+			)
 		await self._db.commit()
 		return cur.rowcount > 0
 	
@@ -2560,6 +2571,32 @@ class Database:
 			)
 		await self._db.commit()
 		_logger.debug(f"Обновлена информация о последней сделке для пользователя tg_id={user_tg_id}: order_id={order_id}, profit={profit}")
+	
+	async def get_user_monthly_profit(self, user_tg_id: int) -> Optional[float]:
+		"""Получает профит пользователя за текущий месяц"""
+		assert self._db
+		# Получаем начало текущего месяца
+		import datetime
+		now = datetime.datetime.now()
+		month_start = datetime.datetime(now.year, now.month, 1)
+		month_start_timestamp = int(month_start.timestamp())
+		
+		# Суммируем профиты всех завершенных сделок за текущий месяц
+		cur = await self._db.execute(
+			"""
+			SELECT COALESCE(SUM(profit), 0) 
+			FROM orders 
+			WHERE user_tg_id = ? 
+			AND completed_at IS NOT NULL 
+			AND completed_at >= ? 
+			AND profit IS NOT NULL
+			""",
+			(user_tg_id, month_start_timestamp)
+		)
+		row = await cur.fetchone()
+		if row and row[0] is not None:
+			return float(row[0])
+		return 0.0
 	
 	async def _ensure_sell_orders_table(self) -> None:
 		"""Создает таблицу для хранения заявок на продажу"""
@@ -2877,6 +2914,35 @@ class Database:
 			)
 			_logger.debug("Created table question_messages")
 	
+	async def _ensure_debts_table(self) -> None:
+		"""Создает таблицу для хранения долгов пользователей"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='debts'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE debts (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					order_id INTEGER NOT NULL,
+					user_tg_id INTEGER NOT NULL,
+					debt_amount REAL NOT NULL,
+					currency_symbol TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_debts_order_id ON debts(order_id)"
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_debts_user_tg_id ON debts(user_tg_id)"
+			)
+			_logger.debug("Created table debts")
+	
 	async def create_question(
 		self,
 		user_tg_id: int,
@@ -3074,6 +3140,49 @@ class Database:
 		)
 		await self._db.commit()
 		return cur.rowcount > 0
+	
+	async def create_debt(self, order_id: int, user_tg_id: int, debt_amount: float, currency_symbol: str) -> int:
+		"""Создает запись о долге для заявки"""
+		assert self._db
+		cur = await self._db.execute(
+			"INSERT INTO debts (order_id, user_tg_id, debt_amount, currency_symbol) VALUES (?, ?, ?, ?)",
+			(order_id, user_tg_id, debt_amount, currency_symbol)
+		)
+		await self._db.commit()
+		debt_id = cur.lastrowid
+		_logger.debug(f"Created debt: id={debt_id}, order_id={order_id}, user_tg_id={user_tg_id}, amount={debt_amount} {currency_symbol}")
+		return debt_id
+	
+	async def get_debt_by_order_id(self, order_id: int) -> Optional[Dict[str, Any]]:
+		"""Получает долг по ID заявки"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT id, order_id, user_tg_id, debt_amount, currency_symbol, created_at FROM debts WHERE order_id = ?",
+			(order_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"id": row[0],
+			"order_id": row[1],
+			"user_tg_id": row[2],
+			"debt_amount": row[3],
+			"currency_symbol": row[4],
+			"created_at": row[5],
+		}
+	
+	async def get_user_total_debt(self, user_tg_id: int) -> Dict[str, float]:
+		"""Получает общую сумму долгов пользователя по валютам"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT currency_symbol, SUM(debt_amount) FROM debts WHERE user_tg_id = ? GROUP BY currency_symbol",
+			(user_tg_id,)
+		)
+		result = {}
+		async for row in cur:
+			result[row[0]] = row[1]
+		return result
 	
 	async def update_order_user_message_id(self, order_id: int, user_message_id: int) -> bool:
 		"""Обновляет user_message_id для заявки"""
