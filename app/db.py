@@ -152,6 +152,12 @@ class Database:
 		if "last_interaction_at" not in cols:
 			await self._db.execute("ALTER TABLE users ADD COLUMN last_interaction_at INTEGER")
 			_logger.debug("Applied migration: add users.last_interaction_at")
+		if "last_order_id" not in cols:
+			await self._db.execute("ALTER TABLE users ADD COLUMN last_order_id INTEGER")
+			_logger.debug("Applied migration: add users.last_order_id")
+		if "last_order_profit" not in cols:
+			await self._db.execute("ALTER TABLE users ADD COLUMN last_order_profit REAL")
+			_logger.debug("Applied migration: add users.last_order_profit")
 
 	async def _ensure_card_delivery_log(self) -> None:
 		assert self._db
@@ -2531,6 +2537,29 @@ class Database:
 		)
 		await self._db.commit()
 		return cur.rowcount > 0
+	
+	async def update_user_last_order(self, user_tg_id: int, order_id: int, profit: Optional[float] = None) -> None:
+		"""Обновляет информацию о последней сделке и профите пользователя"""
+		assert self._db
+		# Получаем user_id по tg_id
+		user_id = await self.get_user_id_by_tg(user_tg_id)
+		if not user_id:
+			_logger.warning(f"update_user_last_order: пользователь с tg_id={user_tg_id} не найден")
+			return
+		
+		# Обновляем last_order_id и last_order_profit
+		if profit is not None:
+			await self._db.execute(
+				"UPDATE users SET last_order_id = ?, last_order_profit = ? WHERE id = ?",
+				(order_id, profit, user_id)
+			)
+		else:
+			await self._db.execute(
+				"UPDATE users SET last_order_id = ? WHERE id = ?",
+				(order_id, user_id)
+			)
+		await self._db.commit()
+		_logger.debug(f"Обновлена информация о последней сделке для пользователя tg_id={user_tg_id}: order_id={order_id}, profit={profit}")
 	
 	async def _ensure_sell_orders_table(self) -> None:
 		"""Создает таблицу для хранения заявок на продажу"""

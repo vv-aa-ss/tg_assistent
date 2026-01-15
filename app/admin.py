@@ -6775,12 +6775,40 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 				user_username = question.get("user_username", "Не указано")
 				question_text = question["question_text"]
 				
+				# Получаем информацию о последней сделке и профите пользователя
+				last_order_info = ""
+				try:
+					user_id = await db.get_user_id_by_tg(user_tg_id)
+					if user_id:
+						user_data = await db.get_user_by_id(user_id)
+						if user_data:
+							last_order_id = user_data.get("last_order_id")
+							last_order_profit = user_data.get("last_order_profit")
+							
+							if last_order_id:
+								# Получаем информацию о последней сделке
+								last_order = await db.get_order_by_id(last_order_id)
+								if last_order:
+									crypto_display = last_order.get("crypto_display", "")
+									amount = last_order.get("amount", 0)
+									amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+									last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+									
+									if last_order_profit is not None:
+										try:
+											profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
+											last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+										except (ValueError, TypeError):
+											last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+				except Exception as e:
+					logger.debug(f"Ошибка получения информации о последней сделке: {e}")
+				
 				# Формируем информацию о вопросе для админа
 				admin_question_info = (
 					f"❓ <b>Вопрос от пользователя</b>\n\n"
 					f"👤 Имя: {user_name}\n"
 					f"📱 Username: @{user_username}\n"
-					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+					f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
 					f"💬 <b>Вопрос:</b>\n{question_text}"
 				)
 				
@@ -7396,6 +7424,25 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 					return
 		else:
 			logger.warning(f"❌ Пользователь с full_name='{orig_full_name}' не найден в БД")
+			# Если пользователь не найден, но есть текст с BTC адресом, отправляем ссылку
+			if text:
+				logger.info(f"🔍 Пользователь не найден, но есть текст. Проверяем BTC адреса и отправляем ссылку, text='{text[:50]}...', chat_id={message.chat.id}")
+				await check_and_send_btc_address_links(bot, message.chat.id, text)
+				logger.info(f"✅ Функция check_and_send_btc_address_links завершена для chat_id={message.chat.id}")
+			# Предлагаем создать пользователя и привязать карту
+			logger.info(f"🔍 Пользователь '{orig_full_name}' не найден, предлагаем создать и привязать карту")
+			groups = await db.list_card_groups()
+			if groups:
+				await state.set_state(ForwardBindStates.waiting_select_group)
+				await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=None)
+				await message.answer(f"❌ Пользователь '{orig_full_name}' не найден в БД.\n\nВыберите группу карт для привязки:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+			else:
+				rows = await db.list_cards()
+				cards = [(r[0], r[1]) for r in rows]
+				await state.set_state(ForwardBindStates.waiting_select_card)
+				await state.update_data(hidden_user_name=orig_full_name, reply_only=False, existing_user_id=None)
+				await message.answer(f"❌ Пользователь '{orig_full_name}' не найден в БД.\n\nГрупп пока нет. Выберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+			return
 	
 	# Try resolve @username from text when no forward info
 	if orig_tg_id is None and text:
@@ -7474,6 +7521,58 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			# Затем показываем меню выбора карты
 			buttons = [(card["card_id"], card["card_name"]) for card in cards_for_user]
 			await state.set_state(ForwardBindStates.waiting_select_existing_card)
+			await state.update_data(original_tg_id=orig_tg_id, user_id=user_id)
+			await message.answer(
+				f"✅ У пользователя привязано несколько карт. Выберите нужную:",
+				reply_markup=user_cards_reply_kb(buttons, orig_tg_id, back_to="admin:back"),
+			)
+			return
+		else:
+			# Карт нет - показываем выбор группы карт для привязки
+			logger.info(f"⚠️ У пользователя {orig_tg_id} нет привязанных карт, предлагаем выбрать группу")
+			# Сначала отправляем ссылку на mempool, если есть BTC адреса
+			if text:
+				logger.info(f"🔍 Отправка ссылки на BTC адрес перед показом меню выбора группы, text='{text[:50]}...', chat_id={message.chat.id}, user_id={user_id}")
+				await check_and_send_btc_address_links(bot, message.chat.id, text, user_id=user_id)
+				logger.info(f"✅ Функция check_and_send_btc_address_links завершена для chat_id={message.chat.id}")
+			# Затем показываем выбор карты
+			groups = await db.list_card_groups()
+			if groups:
+				await state.set_state(ForwardBindStates.waiting_select_group)
+				await state.update_data(original_tg_id=orig_tg_id, user_id=user_id, reply_only=False)
+				await message.answer(f"✅ Пользователь найден в БД, но не привязан к карте.\n\nВыберите группу карт:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+			else:
+				rows = await db.list_cards()
+				cards = [(r[0], r[1]) for r in rows]
+				await state.set_state(ForwardBindStates.waiting_select_card)
+				await state.update_data(original_tg_id=orig_tg_id, user_id=user_id, reply_only=False)
+				await message.answer(f"✅ Пользователь найден в БД, но не привязан к карте.\n\nГрупп пока нет. Выберите карту:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+			return
+	else:
+		# orig_tg_id is None - пользователь не найден после всех попыток
+		logger.warning(f"❌ Пользователь не найден после всех попыток поиска. Отправляем ссылку на BTC адрес, если есть в тексте")
+		if text:
+			logger.info(f"🔍 Пользователь не найден, но есть текст. Проверяем BTC адреса и отправляем ссылку, text='{text[:50]}...', chat_id={message.chat.id}")
+			await check_and_send_btc_address_links(bot, message.chat.id, text)
+			logger.info(f"✅ Функция check_and_send_btc_address_links завершена для chat_id={message.chat.id}")
+		else:
+			logger.warning(f"❌ Пользователь не найден и нет текста для проверки BTC адресов")
+		
+		# Предлагаем создать пользователя и привязать карту
+		# Используем full_name, если он был извлечен из пересылки
+		hidden_name = orig_full_name if orig_full_name else "Неизвестный пользователь"
+		logger.info(f"🔍 Пользователь не найден после всех попыток, предлагаем создать и привязать карту (hidden_name='{hidden_name}')")
+		groups = await db.list_card_groups()
+		if groups:
+			await state.set_state(ForwardBindStates.waiting_select_group)
+			await state.update_data(hidden_user_name=hidden_name, reply_only=False, existing_user_id=None)
+			await message.answer(f"❌ Пользователь не найден в БД.\n\nВыберите группу карт для привязки:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+		else:
+			rows = await db.list_cards()
+			cards = [(r[0], r[1]) for r in rows]
+			await state.set_state(ForwardBindStates.waiting_select_card)
+			await state.update_data(hidden_user_name=hidden_name, reply_only=False, existing_user_id=None)
+			await message.answer(f"❌ Пользователь не найден в БД.\n\nГрупп пока нет. Выберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
 
 
 @admin_router.callback_query(F.data.startswith("question:reply:"))
@@ -7512,12 +7611,40 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	user_username = question.get("user_username", "Не указано")
 	question_text = question["question_text"]
 	
+	# Получаем информацию о последней сделке и профите пользователя
+	last_order_info = ""
+	try:
+		user_id = await db.get_user_id_by_tg(user_tg_id)
+		if user_id:
+			user_data = await db.get_user_by_id(user_id)
+			if user_data:
+				last_order_id = user_data.get("last_order_id")
+				last_order_profit = user_data.get("last_order_profit")
+				
+				if last_order_id:
+					# Получаем информацию о последней сделке
+					last_order = await db.get_order_by_id(last_order_id)
+					if last_order:
+						crypto_display = last_order.get("crypto_display", "")
+						amount = last_order.get("amount", 0)
+						amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+						last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+						
+						if last_order_profit is not None:
+							try:
+								profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
+								last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+							except (ValueError, TypeError):
+								last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+	except Exception as e:
+		logger.debug(f"Ошибка получения информации о последней сделке: {e}")
+	
 	# Формируем сообщение для админа с историей
 	question_info = (
 		f"❓ <b>Вопрос от пользователя</b>\n\n"
 		f"👤 Имя: {user_name}\n"
 		f"📱 Username: @{user_username}\n"
-		f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+		f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
 		f"💬 <b>Вопрос:</b>\n{question_text}"
 	)
 	

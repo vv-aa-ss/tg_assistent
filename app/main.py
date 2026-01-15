@@ -3,7 +3,9 @@ import logging
 import os
 import re
 import time
-from logging.handlers import RotatingFileHandler
+import glob
+from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery
 from aiogram.filters import CommandStart, StateFilter, Command
@@ -18,7 +20,7 @@ from app.config import get_settings
 from app.db import Database
 from app.admin import admin_router, is_admin
 from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb, sell_crypto_kb, sell_confirmation_kb, sell_order_user_reply_kb, question_user_reply_kb, question_reply_kb, order_user_reply_kb
-from app.di import get_admin_ids
+from app.di import get_admin_ids, get_admin_usernames
 from app.di import set_dependencies
 from app.notifications import notification_ids
 
@@ -219,25 +221,121 @@ async def send_and_save_message(message: Message, text: str, reply_markup=None, 
 	return sent_message
 
 
+def setup_logging(log_level: str = "INFO", max_log_size_mb: int = 10, backup_count: int = 10, keep_days: int = 30):
+	"""
+	Настраивает систему логирования с ротацией и очисткой старых файлов.
+	
+	Args:
+		log_level: Уровень логирования (DEBUG/INFO/WARNING/ERROR)
+		max_log_size_mb: Максимальный размер файла лога в MB перед ротацией
+		backup_count: Количество резервных копий для ротации по размеру
+		keep_days: Количество дней хранения логов (старые удаляются)
+	"""
+	os.makedirs("logs", exist_ok=True)
+	
+	log_level_name = log_level.upper()
+	log_level_value = getattr(logging, log_level_name, logging.INFO)
+	
+	# Формат логов: дата, время, уровень, модуль, сообщение
+	log_format = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+	date_format = "%Y-%m-%d %H:%M:%S"
+	
+	# Основной лог-файл с ротацией по размеру
+	main_log_handler = RotatingFileHandler(
+		"logs/bot.log",
+		maxBytes=max_log_size_mb * 1024 * 1024,
+		backupCount=backup_count,
+		encoding="utf-8",
+	)
+	main_log_handler.setLevel(log_level_value)
+	main_log_handler.setFormatter(logging.Formatter(log_format, date_format))
+	
+	# Лог-файл с ротацией по дням (ежедневная ротация)
+	daily_log_handler = TimedRotatingFileHandler(
+		"logs/bot_daily.log",
+		when="midnight",
+		interval=1,
+		backupCount=keep_days,
+		encoding="utf-8",
+	)
+	daily_log_handler.setLevel(log_level_value)
+	daily_log_handler.setFormatter(logging.Formatter(log_format, date_format))
+	
+	# Отдельный файл для ошибок (только ERROR и CRITICAL)
+	error_log_handler = RotatingFileHandler(
+		"logs/errors.log",
+		maxBytes=5 * 1024 * 1024,  # 5 MB для ошибок
+		backupCount=5,
+		encoding="utf-8",
+	)
+	error_log_handler.setLevel(logging.ERROR)
+	error_log_handler.setFormatter(logging.Formatter(log_format, date_format))
+	
+	# Настройка корневого логгера
+	root_logger = logging.getLogger()
+	root_logger.setLevel(log_level_value)
+	root_logger.handlers.clear()  # Очищаем существующие обработчики
+	root_logger.addHandler(main_log_handler)
+	root_logger.addHandler(daily_log_handler)
+	root_logger.addHandler(error_log_handler)
+	
+	# Очистка старых логов
+	cleanup_old_logs(keep_days)
+	
+	return root_logger
+
+
+def cleanup_old_logs(keep_days: int = 30):
+	"""
+	Удаляет старые лог-файлы, которые старше указанного количества дней.
+	
+	Args:
+		keep_days: Количество дней для хранения логов
+	"""
+	try:
+		logs_dir = "logs"
+		if not os.path.exists(logs_dir):
+			return
+		
+		cutoff_date = datetime.now() - timedelta(days=keep_days)
+		cutoff_timestamp = cutoff_date.timestamp()
+		
+		# Ищем все .log файлы и их резервные копии
+		patterns = [
+			os.path.join(logs_dir, "*.log"),
+			os.path.join(logs_dir, "*.log.*"),
+		]
+		
+		deleted_count = 0
+		for pattern in patterns:
+			for log_file in glob.glob(pattern):
+				try:
+					# Проверяем время модификации файла
+					file_mtime = os.path.getmtime(log_file)
+					if file_mtime < cutoff_timestamp:
+						os.remove(log_file)
+						deleted_count += 1
+				except (OSError, Exception) as e:
+					# Игнорируем ошибки при удалении (файл может быть занят)
+					pass
+		
+		if deleted_count > 0:
+			logging.getLogger("app.start").info(f"🧹 Очищено старых лог-файлов: {deleted_count}")
+	except Exception as e:
+		# Не падаем, если не удалось очистить логи
+		pass
+
+
 async def main() -> None:
 	os.makedirs("logs", exist_ok=True)
 	settings = get_settings()
 
-	# Настройка логирования (с ротацией, чтобы logs/bot.log не раздувался)
-	log_level_name = (settings.log_level or "INFO").upper()
-	log_level = getattr(logging, log_level_name, logging.INFO)
-
-	log_file_handler = RotatingFileHandler(
-		"logs/bot.log",
-		maxBytes=5 * 1024 * 1024,  # 5 MB
-		backupCount=5,
-		encoding="utf-8",
-	)
-
-	logging.basicConfig(
-		level=log_level,
-		format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-		handlers=[log_file_handler],
+	# Настройка логирования
+	setup_logging(
+		log_level=settings.log_level or "INFO",
+		max_log_size_mb=10,  # 10 MB
+		backup_count=10,  # Храним 10 резервных копий
+		keep_days=30,  # Храним логи 30 дней
 	)
 
 	# Приглушаем сторонние библиотеки (они часто шумят на DEBUG)
@@ -246,6 +344,14 @@ async def main() -> None:
 	logging.getLogger("gspread").setLevel(logging.WARNING)
 
 	logger = logging.getLogger("app.start")
+	logger.info("=" * 80)
+	logger.info("🚀 Запуск бота")
+	logger.info(f"📊 Уровень логирования: {settings.log_level or 'INFO'}")
+	logger.info("📁 Логи сохраняются в:")
+	logger.info("   - logs/bot.log (ротация по размеру, до 10 файлов)")
+	logger.info("   - logs/bot_daily.log (ротация по дням, 30 дней)")
+	logger.info("   - logs/errors.log (только ошибки, до 5 файлов)")
+	logger.info("=" * 80)
 	logger.debug(f"Loaded settings: db={settings.database_path}, admins={settings.admin_ids}")
 	if not settings.telegram_bot_token:
 		raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Создайте .env с токеном.")
@@ -388,25 +494,60 @@ async def main() -> None:
 						f"Пользователь пытается получить доступ к боту."
 					)
 					
-					# Отправляем уведомление всем админам
+					# Отправляем уведомление всем админам (и по ID, и по username)
 					admin_ids = get_admin_ids()
+					admin_usernames = get_admin_usernames()
 					logger_main = logging.getLogger("app.main")
-					logger_main.info(f"📤 Отправка уведомления о запросе доступа админам. Список админов: {admin_ids}")
+					logger_main.info(f"📤 Отправка уведомления о запросе доступа админам. Админы по ID: {admin_ids}, по username: {admin_usernames}")
 					
-					if admin_ids:
-						for admin_id in admin_ids:
+					# Собираем все chat_id админов для отправки
+					admin_chat_ids = set()
+					
+					# Добавляем админов по ID
+					admin_chat_ids.update(admin_ids)
+					
+					# Получаем chat_id для админов по username
+					if admin_usernames:
+						for username in admin_usernames:
+							username_clean = username.lstrip("@")
+							found_chat_id = None
+							
+							# Сначала пробуем найти в БД
+							try:
+								user_by_username = await db_local.get_user_by_username(username_clean)
+								if user_by_username and user_by_username.get("tg_id"):
+									found_chat_id = user_by_username["tg_id"]
+									logger_main.info(f"✅ Найден админ @{username_clean} в БД, tg_id={found_chat_id}")
+							except Exception as e:
+								logger_main.debug(f"⚠️ Ошибка поиска админа @{username_clean} в БД: {e}")
+							
+							# Если не нашли в БД, пробуем через get_chat
+							if not found_chat_id:
+								try:
+									chat = await message.bot.get_chat(f"@{username_clean}")
+									found_chat_id = chat.id
+									logger_main.info(f"✅ Получен chat_id={found_chat_id} для админа @{username_clean} через get_chat")
+								except Exception as e:
+									logger_main.warning(f"⚠️ Не удалось получить chat_id для админа @{username_clean}: {e}. Возможно, админ не писал боту. Попросите админа написать боту хотя бы раз (/start)")
+							
+							if found_chat_id:
+								admin_chat_ids.add(found_chat_id)
+					
+					# Отправляем уведомления всем админам
+					if admin_chat_ids:
+						for admin_chat_id in admin_chat_ids:
 							try:
 								await message.bot.send_message(
-									chat_id=admin_id,
+									chat_id=admin_chat_id,
 									text=admin_message_text,
 									parse_mode=ParseMode.HTML,
 									reply_markup=user_access_request_kb(user_id)
 								)
-								logger_main.info(f"✅ Уведомление о запросе доступа отправлено админу {admin_id}")
+								logger_main.info(f"✅ Уведомление о запросе доступа отправлено админу {admin_chat_id}")
 							except Exception as e:
-								logger_main.error(f"❌ Ошибка отправки уведомления админу {admin_id}: {e}", exc_info=True)
+								logger_main.error(f"❌ Ошибка отправки уведомления админу {admin_chat_id}: {e}", exc_info=True)
 					else:
-						logger_main.warning("⚠️ Список админов пустой, уведомление не отправлено")
+						logger_main.warning("⚠️ Не удалось определить chat_id ни для одного админа, уведомление не отправлено")
 
 		# Остальные: игнор (без ответа)
 
@@ -569,6 +710,11 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		
+		# Проверяем, не является ли это командой - если да, пропускаем обработку
+		# чтобы команда обработалась в своем обработчике
+		if message.text and message.text.startswith("/"):
+			return  # Пропускаем команды, они обработаются в своих обработчиках
 		
 		# Проверяем, что мы действительно в состоянии покупки, а не продажи
 		current_state = await state.get_state()
@@ -816,6 +962,10 @@ async def main() -> None:
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
 		
+		# Проверяем, не является ли это командой - если да, пропускаем обработку
+		if message.text and message.text.startswith("/"):
+			return  # Пропускаем команды, они обработаются в своих обработчиках
+		
 		# Удаляем сообщение пользователя
 		await delete_user_message(message)
 		
@@ -847,13 +997,13 @@ async def main() -> None:
 		else:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
-		# Для XMR пропускаем выбор способа доставки, для BTC показываем выбор
-		if crypto_type == "XMR":
-			# Для XMR устанавливаем обычную доставку и сразу переходим к созданию заявки
+		# Для XMR и USDT пропускаем выбор способа доставки, для BTC показываем выбор
+		if crypto_type == "XMR" or crypto_type == "USDT":
+			# Для XMR и USDT устанавливаем обычную доставку и сразу переходим к созданию заявки
 			delivery_type = "normal"
 			await state.update_data(delivery_method=delivery_type)
 			
-			# Рассчитываем сумму (без VIP для XMR)
+			# Рассчитываем сумму (без VIP для XMR и USDT)
 			final_amount = amount_currency
 			
 			# Получаем реквизиты пользователя
@@ -881,7 +1031,14 @@ async def main() -> None:
 					requisites_text = "\n".join(requisites_list)
 			
 			# Формируем сообщение
-			crypto_short = "xmr"
+			# Определяем короткое название криптовалюты
+			if crypto_type == "XMR":
+				crypto_short = "xmr"
+			elif crypto_type == "USDT":
+				crypto_short = "usdt"
+			else:
+				crypto_short = crypto_type.lower()
+			
 			order_message = (
 				f"☑️Заявка успешно создана.\n"
 				f"Вы получаете: {amount_str} {crypto_short}\n"
@@ -920,7 +1077,7 @@ async def main() -> None:
 			# Сохраняем ID сообщения с заявкой в состоянии для последующего сохранения в БД
 			await state.update_data(order_message_id=final_message.message_id)
 		else:
-			# Для BTC и других криптовалют показываем выбор способа доставки
+			# Для BTC показываем выбор способа доставки (VIP или обычная)
 			order_info = (
 				f"Вам будет зачислено: {amount_str} {crypto_display}\n"
 				f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}\n\n"
@@ -1309,12 +1466,40 @@ async def main() -> None:
 			question_text=question_text
 		)
 		
+		# Получаем информацию о последней сделке и профите пользователя
+		last_order_info = ""
+		try:
+			user_id = await db_local.get_user_id_by_tg(user_tg_id)
+			if user_id:
+				user_data = await db_local.get_user_by_id(user_id)
+				if user_data:
+					last_order_id = user_data.get("last_order_id")
+					last_order_profit = user_data.get("last_order_profit")
+					
+					if last_order_id:
+						# Получаем информацию о последней сделке
+						last_order = await db_local.get_order_by_id(last_order_id)
+						if last_order:
+							crypto_display = last_order.get("crypto_display", "")
+							amount = last_order.get("amount", 0)
+							amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+							last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+							
+							if last_order_profit is not None:
+								try:
+									profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
+									last_order_info += f"\n💰 Профит: {profit_formatted} USD"
+								except (ValueError, TypeError):
+									last_order_info += f"\n💰 Профит: {last_order_profit} USD"
+		except Exception as e:
+			logging.getLogger("app.main").debug(f"Ошибка получения информации о последней сделке: {e}")
+		
 		# Формируем сообщение для админов
 		admin_message_text = (
 			f"❓ <b>Вопрос от пользователя</b>\n\n"
 			f"👤 Имя: {user_name}\n"
 			f"📱 Username: @{user_username}\n"
-			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
 			f"💬 <b>Вопрос:</b>\n{question_text}"
 		)
 		
@@ -1664,6 +1849,19 @@ async def main() -> None:
 		except Exception as e:
 			logging.getLogger("app.main").error(f"Ошибка отправки стикера пользователю {order['user_tg_id']}: {e}")
 		
+		# Показываем клавиатуру пользователю (как при /start)
+		try:
+			from app.keyboards import client_menu_kb
+			# Отправляем сообщение с клавиатурой
+			# Используем короткое сообщение, чтобы клавиатура точно отобразилась
+			await cb.bot.send_message(
+				chat_id=order["user_tg_id"],
+				text="Выберите действие:",
+				reply_markup=client_menu_kb()
+			)
+		except Exception as e:
+			logging.getLogger("app.main").error(f"Ошибка отправки клавиатуры пользователю {order['user_tg_id']}: {e}")
+		
 		# Записываем данные в Google Sheets
 		from app.config import get_settings
 		from app.google_sheets import write_order_to_google_sheet, read_profit
@@ -1735,6 +1933,18 @@ async def main() -> None:
 				except (ValueError, AttributeError):
 					# Если не число, используем как есть
 					additional_info += f"\n\n📈 Профит: {profit_value} USD"
+			
+			# Сохраняем информацию о последней сделке и профите пользователя
+			try:
+				profit_num = None
+				if profit_value is not None:
+					try:
+						profit_num = float(str(profit_value).replace(",", ".").replace(" ", ""))
+					except (ValueError, AttributeError):
+						pass
+				await db_local.update_user_last_order(order["user_tg_id"], order_id, profit_num)
+			except Exception as e:
+				logging.getLogger("app.main").warning(f"Ошибка сохранения информации о последней сделке: {e}")
 		
 		# Обновляем сообщение админа
 		await cb.answer("✅ Заявка отмечена как выполненная!")
@@ -1810,14 +2020,15 @@ async def main() -> None:
 				await cb.message.delete()
 				await cb.answer("✅ Сообщение удалено")
 				
-				# Отправляем главное меню с кнопками "Купить" и "Продать" без текста
+				# Отправляем главное меню с кнопками "Купить" и "Продать"
 				from app.keyboards import client_menu_kb
 				from app.di import get_db
 				db_local = get_db()
 				if await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+					# Используем невидимый символ вместо пробела (Telegram не принимает пустой текст)
 					await cb.bot.send_message(
 						chat_id=cb.from_user.id,
-						text=" ",
+						text="\u200b",  # Невидимый символ (zero-width space)
 						reply_markup=client_menu_kb()
 					)
 			else:
@@ -1891,6 +2102,11 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		
+		# Проверяем, не является ли это командой - если да, пропускаем обработку
+		# чтобы команда обработалась в своем обработчике
+		if message.text and message.text.startswith("/"):
+			return  # Пропускаем команды, они обработаются в своих обработчиках
 		
 		if message.text == "⬅️ Назад":
 			await delete_user_message(message)
@@ -2955,6 +3171,10 @@ async def main() -> None:
 		if not message.from_user:
 			return
 		
+		# Проверяем, не является ли это командой - если да, пропускаем обработку
+		if message.text and message.text.startswith("/"):
+			return  # Пропускаем команды, они обработаются в своих обработчиках
+		
 		from app.di import get_db
 		db_local = get_db()
 		
@@ -3332,6 +3552,21 @@ async def main() -> None:
 			)
 			await db_local.touch_user_by_tg(message.from_user.id)
 		# не отвечаем
+	
+	# Периодическая очистка старых логов (раз в день)
+	async def periodic_log_cleanup():
+		"""Периодическая очистка старых логов"""
+		while True:
+			await asyncio.sleep(24 * 60 * 60)  # Ждем 24 часа
+			try:
+				cleanup_old_logs(keep_days=30)
+				logger.debug("🧹 Периодическая очистка старых логов выполнена")
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка при периодической очистке логов: {e}")
+	
+	# Запускаем задачу очистки логов в фоне
+	asyncio.create_task(periodic_log_cleanup())
+	
 	logger.debug("Starting polling...")
 	try:
 		await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
