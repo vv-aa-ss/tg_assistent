@@ -509,7 +509,7 @@ class Database:
 	async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
 		assert self._db
 		query = (
-			"SELECT id, tg_id, username, full_name FROM users WHERE id = ?"
+			"SELECT id, tg_id, username, full_name, last_order_id, last_order_profit FROM users WHERE id = ?"
 		)
 		cur = await self._db.execute(query, (user_id,))
 		row = await cur.fetchone()
@@ -520,6 +520,8 @@ class Database:
 			"tg_id": row[1],
 			"username": row[2],
 			"full_name": row[3],
+			"last_order_id": row[4] if len(row) > 4 else None,
+			"last_order_profit": row[5] if len(row) > 5 else None,
 			"cards": await self.list_cards_for_user(row[0]),
 		}
 

@@ -7024,11 +7024,50 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 					if debt_lines:
 						total_debt_info = f"\n💳 Общий долг пользователя: {', '.join(debt_lines)}"
 				
+				# Получаем информацию о последней сделке и профите пользователя
+				last_order_info = ""
+				try:
+					user_tg_id = order.get("user_tg_id")
+					user_id = await db.get_user_id_by_tg(user_tg_id)
+					if user_id:
+						user_data = await db.get_user_by_id(user_id)
+						if user_data:
+							last_order_id = user_data.get("last_order_id")
+							last_order_profit = user_data.get("last_order_profit")
+							
+							if last_order_id:
+								# Получаем информацию о последней сделке
+								last_order = await db.get_order_by_id(last_order_id)
+								if last_order:
+									last_crypto_display = last_order.get("crypto_display", "")
+									last_amount = last_order.get("amount", 0)
+									last_amount_str = f"{last_amount:.8f}".rstrip('0').rstrip('.') if last_amount < 1 else f"{last_amount:.2f}".rstrip('0').rstrip('.')
+									last_order_info = f"\n📦 Последнее обращение: {last_amount_str} {last_crypto_display}"
+									
+									if last_order_profit is not None:
+										try:
+											profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
+											last_order_info += f"\n💰 Профит от последней сделки: {profit_formatted} USD"
+										except (ValueError, TypeError):
+											last_order_info += f"\n💰 Профит от последней сделки: {last_order_profit} USD"
+							
+							# Получаем профит за текущий месяц
+							monthly_profit = await db.get_user_monthly_profit(user_tg_id)
+							if monthly_profit and monthly_profit > 0:
+								try:
+									monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+								except (ValueError, TypeError):
+									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
+				except Exception as e:
+					logger.debug(f"Ошибка получения информации о последней сделке: {e}", exc_info=True)
+				
 				# Формируем информацию о заявке для админа
 				admin_order_info = (
 					f"Номер заявки за сегодня: {order_number}\n"
 					f"Имя пользователя: {user_name or 'Не указано'}\n"
-					f"Username: @{user_username}\n\n"
+					f"Username: @{user_username}\n"
+					f"🆔 ID: <code>{order.get('user_tg_id')}</code>{last_order_info}\n\n"
 					f"Количество монет: {amount_str} {crypto_display}\n"
 					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
 					f"Адрес кошелька: <code>{order.get('wallet_address', '')}</code>{debt_info}{total_debt_info}"
@@ -7454,6 +7493,43 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 		
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
 		
+		# Получаем информацию о последней сделке и профите пользователя
+		last_order_info = ""
+		try:
+			user_id = await db.get_user_id_by_tg(order["user_tg_id"])
+			if user_id:
+				user_data = await db.get_user_by_id(user_id)
+				if user_data:
+					last_order_id = user_data.get("last_order_id")
+					last_order_profit = user_data.get("last_order_profit")
+					
+					if last_order_id:
+						# Получаем информацию о последней сделке
+						last_order = await db.get_order_by_id(last_order_id)
+						if last_order:
+							last_crypto_display = last_order.get("crypto_display", "")
+							last_amount = last_order.get("amount", 0)
+							last_amount_str = f"{last_amount:.8f}".rstrip('0').rstrip('.') if last_amount < 1 else f"{last_amount:.2f}".rstrip('0').rstrip('.')
+							last_order_info = f"\n📦 Последнее обращение: {last_amount_str} {last_crypto_display}"
+							
+							if last_order_profit is not None:
+								try:
+									profit_formatted = f"{int(round(last_order_profit)):,}".replace(",", " ")
+									last_order_info += f"\n💰 Профит от последней сделки: {profit_formatted} USD"
+								except (ValueError, TypeError):
+									last_order_info += f"\n💰 Профит от последней сделки: {last_order_profit} USD"
+					
+					# Получаем профит за текущий месяц
+					monthly_profit = await db.get_user_monthly_profit(order["user_tg_id"])
+					if monthly_profit and monthly_profit > 0:
+						try:
+							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+						except (ValueError, TypeError):
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
+		except Exception as e:
+			logger.debug(f"Ошибка получения информации о последней сделке: {e}", exc_info=True)
+		
 		# Получаем долг для этой заявки
 		debt = await db.get_debt_by_order_id(order_id)
 		debt_info = ""
@@ -7473,7 +7549,8 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 		admin_order_info = (
 			f"Номер заявки за сегодня: {order_number}\n"
 			f"Имя пользователя: {user_name or 'Не указано'}\n"
-			f"Username: @{user_username}\n\n"
+			f"Username: @{user_username}\n"
+			f"🆔 ID: <code>{order['user_tg_id']}</code>{last_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
 			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
 			f"Адрес кошелька: <code>{wallet_address}</code>{debt_info}{total_debt_info}"
