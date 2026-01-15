@@ -7313,53 +7313,53 @@ async def order_debt_currency_selected(cb: CallbackQuery, state: FSMContext, bot
 	# Переводим в состояние ожидания суммы долга
 	await state.set_state(OrderEditStates.waiting_debt_amount)
 	
-		# Получаем информацию о заявке для восстановления клавиатуры
-		data = await state.get_data()
-		order_id = data.get("order_id")
-		if not order_id:
-			await cb.answer("Ошибка данных", show_alert=True)
-			return
-		
-		# Восстанавливаем клавиатуру заявки
-		from app.keyboards import order_action_kb
-		db = get_db()
-		messages = await db.get_order_messages(order_id)
-		is_expanded = len(messages) > 0
-		
-		# Обновляем сообщение админа
-		if cb.message.photo:
-			current_caption = cb.message.caption or ""
-			# Удаляем строку о выборе валюты
-			caption_lines = current_caption.split("\n")
-			if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
-				caption_lines = caption_lines[:-1]
-			current_caption = "\n".join(caption_lines)
-			await cb.message.edit_caption(
-				caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
-				parse_mode="HTML",
-				reply_markup=order_action_kb(order_id, expanded=is_expanded)
-			)
-		elif cb.message.document:
-			current_caption = cb.message.caption or ""
-			caption_lines = current_caption.split("\n")
-			if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
-				caption_lines = caption_lines[:-1]
-			current_caption = "\n".join(caption_lines)
-			await cb.message.edit_caption(
-				caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
-				parse_mode="HTML",
-				reply_markup=order_action_kb(order_id, expanded=is_expanded)
-			)
-		else:
-			text_lines = cb.message.text.split("\n")
-			if text_lines and "Выберите валюту долга" in text_lines[-1]:
-				text_lines = text_lines[:-1]
-			text = "\n".join(text_lines)
-			await cb.message.edit_text(
-				text + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
-				parse_mode="HTML",
-				reply_markup=order_action_kb(order_id, expanded=is_expanded)
-			)
+	# Получаем информацию о заявке для восстановления клавиатуры
+	data = await state.get_data()
+	order_id = data.get("order_id")
+	if not order_id:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Восстанавливаем клавиатуру заявки
+	from app.keyboards import order_action_kb
+	db = get_db()
+	messages = await db.get_order_messages(order_id)
+	is_expanded = len(messages) > 0
+	
+	# Обновляем сообщение админа
+	if cb.message.photo:
+		current_caption = cb.message.caption or ""
+		# Удаляем строку о выборе валюты
+		caption_lines = current_caption.split("\n")
+		if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
+			caption_lines = caption_lines[:-1]
+		current_caption = "\n".join(caption_lines)
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+			parse_mode="HTML",
+			reply_markup=order_action_kb(order_id, expanded=is_expanded)
+		)
+	elif cb.message.document:
+		current_caption = cb.message.caption or ""
+		caption_lines = current_caption.split("\n")
+		if caption_lines and "Выберите валюту долга" in caption_lines[-1]:
+			caption_lines = caption_lines[:-1]
+		current_caption = "\n".join(caption_lines)
+		await cb.message.edit_caption(
+			caption=current_caption + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+			parse_mode="HTML",
+			reply_markup=order_action_kb(order_id, expanded=is_expanded)
+		)
+	else:
+		text_lines = cb.message.text.split("\n")
+		if text_lines and "Выберите валюту долга" in text_lines[-1]:
+			text_lines = text_lines[:-1]
+		text = "\n".join(text_lines)
+		await cb.message.edit_text(
+			text + f"\n\n💳 Валюта: {currency_symbol}\nВведите сумму долга:",
+			parse_mode="HTML",
+			reply_markup=order_action_kb(order_id, expanded=is_expanded)
+		)
 	await cb.answer()
 
 @admin_router.message(OrderEditStates.waiting_debt_amount)
