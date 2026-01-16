@@ -102,6 +102,7 @@ class Database:
 		await self._ensure_question_messages_table()
 		await self._ensure_debts_table()
 		await self._ensure_user_debts_table()
+		await self._ensure_pending_requisites_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -3062,6 +3063,32 @@ class Database:
 				"CREATE INDEX IF NOT EXISTS idx_user_debts_user_tg_id ON user_debts(user_tg_id)"
 			)
 			_logger.debug("Created table user_debts")
+
+	async def _ensure_pending_requisites_table(self) -> None:
+		"""Создает таблицу для хранения ожидающих реквизитов"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='pending_requisites'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE pending_requisites (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					user_tg_id INTEGER NOT NULL UNIQUE,
+					message_id INTEGER NOT NULL,
+					crypto_type TEXT NOT NULL,
+					crypto_display TEXT NOT NULL,
+					amount REAL NOT NULL,
+					final_amount REAL NOT NULL,
+					currency_symbol TEXT NOT NULL,
+					wallet_address TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			_logger.debug("Created table pending_requisites")
 	
 	async def create_question(
 		self,
@@ -3327,6 +3354,75 @@ class Database:
 		)
 		await self._db.commit()
 		return True
+
+	async def save_pending_requisites(
+		self,
+		user_tg_id: int,
+		message_id: int,
+		crypto_type: str,
+		crypto_display: str,
+		amount: float,
+		final_amount: float,
+		currency_symbol: str,
+		wallet_address: str,
+	) -> bool:
+		"""Сохраняет ожидание реквизитов для пользователя"""
+		assert self._db
+		await self._db.execute(
+			"""
+			INSERT OR REPLACE INTO pending_requisites(
+				user_tg_id, message_id, crypto_type, crypto_display, amount,
+				final_amount, currency_symbol, wallet_address
+			) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+			""",
+			(user_tg_id, message_id, crypto_type, crypto_display, amount, final_amount, currency_symbol, wallet_address)
+		)
+		await self._db.commit()
+		return True
+
+	async def get_pending_requisites(self, user_tg_id: int) -> Optional[Dict[str, Any]]:
+		"""Возвращает ожидающие реквизиты по tg_id"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT user_tg_id, message_id, crypto_type, crypto_display, amount,
+			       final_amount, currency_symbol, wallet_address
+			FROM pending_requisites
+			WHERE user_tg_id = ?
+			""",
+			(user_tg_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"user_tg_id": row[0],
+			"message_id": row[1],
+			"crypto_type": row[2],
+			"crypto_display": row[3],
+			"amount": row[4],
+			"final_amount": row[5],
+			"currency_symbol": row[6],
+			"wallet_address": row[7],
+		}
+
+	async def delete_pending_requisites(self, user_tg_id: int) -> None:
+		"""Удаляет ожидание реквизитов"""
+		assert self._db
+		await self._db.execute(
+			"DELETE FROM pending_requisites WHERE user_tg_id = ?",
+			(user_tg_id,)
+		)
+		await self._db.commit()
+
+	async def update_pending_requisites_message_id(self, user_tg_id: int, message_id: int) -> None:
+		"""Обновляет message_id для ожидающих реквизитов"""
+		assert self._db
+		await self._db.execute(
+			"UPDATE pending_requisites SET message_id = ? WHERE user_tg_id = ?",
+			(message_id, user_tg_id)
+		)
+		await self._db.commit()
 
 	async def get_debtors_totals(self) -> List[Dict[str, Any]]:
 		"""Возвращает список должников с суммами по валютам"""

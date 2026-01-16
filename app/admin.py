@@ -46,6 +46,7 @@ from app.keyboards import (
 	multipliers_settings_kb,
 	markup_percents_settings_kb,
 	buy_calc_settings_kb,
+	buy_payment_confirmed_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -1582,6 +1583,46 @@ def _format_debt_totals(totals: Dict[str, float]) -> str:
 			amount_val = amount
 		parts.append(f"{amount_val} {curr}")
 	return ", ".join(parts)
+
+
+def _build_payment_order_message(
+	crypto_type: str,
+	crypto_display: str,
+	amount: float,
+	final_amount: float,
+	currency_symbol: str,
+	wallet_address: str,
+	requisites_text: str,
+) -> str:
+	if amount < 1:
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+	else:
+		amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+	
+	crypto_short = ""
+	if "BTC" in crypto_type or "Bitcoin" in crypto_display:
+		crypto_short = "btc"
+	elif "LTC" in crypto_type or "Litecoin" in crypto_display:
+		crypto_short = "ltc"
+	elif "USDT" in crypto_type:
+		crypto_short = "usdt"
+	elif "XMR" in crypto_type or "Monero" in crypto_display:
+		crypto_short = "xmr"
+	else:
+		crypto_short = crypto_type.lower()
+	
+	order_message = (
+		f"☑️Заявка успешно создана.\n"
+		f"Вы получаете: {amount_str} {crypto_short}\n"
+		f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
+		f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
+		f"Реквизиты для оплаты:\n\n"
+	)
+	if requisites_text:
+		order_message += requisites_text + "\n\n"
+	order_message += f"⏰Заявка действительна: 15 минут\n"
+	order_message += f"✅После оплаты необходимо нажать на кнопку 'ОПЛАТА СОВЕРШЕНА'"
+	return order_message
 
 
 async def _get_debtors_list_text_kb():
@@ -7040,6 +7081,48 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 				admin_id=cb.from_user.id if cb.from_user else None,
 			)
 		
+		# Если есть ожидающие реквизиты, обновляем сообщение пользователю
+		if user and user.get("tg_id"):
+			pending = await db.get_pending_requisites(user["tg_id"])
+			if pending:
+				requisites = await db.list_card_requisites(card_id)
+				requisites_list = [req["requisite_text"] for req in requisites]
+				user_msg = await db.get_card_user_message(card_id)
+				if user_msg and user_msg.strip():
+					requisites_list.append(user_msg)
+				requisites_text = "\n".join(requisites_list)
+				try:
+					order_message = _build_payment_order_message(
+						crypto_type=pending["crypto_type"],
+						crypto_display=pending["crypto_display"],
+						amount=pending["amount"],
+						final_amount=pending["final_amount"],
+						currency_symbol=pending["currency_symbol"],
+						wallet_address=pending["wallet_address"],
+						requisites_text=requisites_text
+					)
+					await bot.edit_message_text(
+						chat_id=user["tg_id"],
+						message_id=pending["message_id"],
+						text=order_message,
+						reply_markup=buy_payment_confirmed_kb()
+					)
+				except Exception as e:
+					logger.warning(f"⚠️ Не удалось обновить сообщение с реквизитами: {e}")
+					try:
+						sent_msg = await bot.send_message(
+							chat_id=user["tg_id"],
+							text=order_message,
+							reply_markup=buy_payment_confirmed_kb()
+						)
+						await db.update_pending_requisites_message_id(user["tg_id"], sent_msg.message_id)
+						try:
+							await bot.delete_message(chat_id=user["tg_id"], message_id=pending["message_id"])
+						except Exception:
+							pass
+					except Exception:
+						pass
+		
 		# Проверяем, есть ли в state сохраненный текст пересылаемого сообщения для отправки ссылки
 		data = await state.get_data()
 		forwarded_text = data.get("forwarded_message_text", "")
@@ -7240,12 +7323,12 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 							
 							# Получаем профит за текущий месяц
 							monthly_profit = await db.get_user_monthly_profit(user_tg_id)
-							if monthly_profit and monthly_profit > 0:
-								try:
-									monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
-									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
-								except (ValueError, TypeError):
-									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
+					if monthly_profit is not None:
+						try:
+							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+						except (ValueError, TypeError):
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
 				except Exception as e:
 					logger.debug(f"Ошибка получения информации о последней сделке: {e}")
 				
@@ -7493,12 +7576,12 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 							
 							# Получаем профит за текущий месяц
 							monthly_profit = await db.get_user_monthly_profit(user_tg_id)
-							if monthly_profit and monthly_profit > 0:
-								try:
-									monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
-									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
-								except (ValueError, TypeError):
-									last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
+					if monthly_profit is not None:
+						try:
+							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
+						except (ValueError, TypeError):
+							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit} USD"
 				except Exception as e:
 					logger.debug(f"Ошибка получения информации о последней сделке: {e}", exc_info=True)
 				
@@ -7968,6 +8051,22 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 		amount_currency = order.get("amount_currency", 0)
 		currency_symbol = order.get("currency_symbol", "₽")
 		wallet_address = order.get("wallet_address", "")
+		card_name = ""
+		group_name = ""
+		user_cards = await db.get_cards_for_user_tg(order["user_tg_id"])
+		if user_cards:
+			card = user_cards[0]
+			card_id = card["card_id"]
+			card_info = await db.get_card_by_id(card_id)
+			card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group_by_id(card_info["group_id"])
+				group_name = group.get("name") if group else ""
+		if card_name:
+			label = f"{group_name} ({card_name})" if group_name else card_name
+			pay_card_info = f"\n💳 Карта для оплаты: {label}"
+		else:
+			pay_card_info = ""
 		
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
 		
@@ -8001,7 +8100,7 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 					
 					# Получаем профит за текущий месяц
 					monthly_profit = await db.get_user_monthly_profit(order["user_tg_id"])
-					if monthly_profit and monthly_profit > 0:
+					if monthly_profit is not None:
 						try:
 							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
 							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
@@ -8033,7 +8132,7 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 			f"🆔 ID: <code>{order['user_tg_id']}</code>{last_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
 			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-			f"Адрес кошелька: <code>{wallet_address}</code>{debt_info}{total_debt_info}"
+			f"Адрес кошелька: <code>{wallet_address}</code>{pay_card_info}{debt_info}{total_debt_info}"
 		)
 		
 		# Формируем историю переписки
@@ -8079,7 +8178,7 @@ async def _update_user_order_message(bot: Bot, order_id: int, db):
 		if not order:
 			return
 		
-		user_message_id = order.get("user_message_id")
+		user_message_id = order.get("user_message_id") or order.get("order_message_id")
 		if not user_message_id:
 			return
 		
@@ -8090,6 +8189,11 @@ async def _update_user_order_message(bot: Bot, order_id: int, db):
 		currency_symbol = order.get("currency_symbol", "₽")
 		
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+		proof_details = (
+			f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
+			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Адрес кошелька: {order.get('wallet_address', '')}"
+		)
 		
 		# Получаем историю переписки
 		messages = await db.get_order_messages(order_id)
@@ -8119,14 +8223,32 @@ async def _update_user_order_message(bot: Bot, order_id: int, db):
 				parse_mode="HTML",
 				reply_markup=order_user_reply_kb(order_id)
 			)
-		except Exception:
-			sent_msg = await bot.send_message(
-				chat_id=user_tg_id,
-				text=user_message,
-				parse_mode="HTML",
-				reply_markup=order_user_reply_kb(order_id)
+		except Exception as e:
+			logger.warning(f"⚠️ Не удалось обновить сообщение пользователя: {e}")
+		
+		# Обновляем сообщение подтверждения скрина (если есть)
+		proof_confirmation_message_id = order.get("proof_confirmation_message_id")
+		if proof_confirmation_message_id:
+			proof_text = (
+				"✅ Спасибо! Ваш скриншот/чек получен. Ожидайте зачисления средств на указанный адрес кошелька."
+				+ proof_details
 			)
-			await db.update_order_user_message_id(order_id, sent_msg.message_id)
+			try:
+				await bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=proof_confirmation_message_id,
+					text=proof_text
+				)
+			except Exception:
+				try:
+					sent_msg = await bot.send_message(chat_id=user_tg_id, text=proof_text)
+					await db._db.execute(
+						"UPDATE orders SET proof_confirmation_message_id = ? WHERE id = ?",
+						(sent_msg.message_id, order_id)
+					)
+					await db._db.commit()
+				except Exception:
+					pass
 	except Exception as e:
 		logger.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
 
@@ -8718,7 +8840,7 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				
 				# Получаем профит за текущий месяц
 				monthly_profit = await db.get_user_monthly_profit(user_tg_id)
-				if monthly_profit and monthly_profit > 0:
+				if monthly_profit is not None:
 					try:
 						monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
 						last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"

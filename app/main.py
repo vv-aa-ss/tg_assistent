@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery, ForceReply
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -1148,11 +1149,21 @@ async def main() -> None:
 			# Получаем реквизиты пользователя
 			user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
 			requisites_text = ""
+			pay_card_info = ""
 			
 			if user_cards:
 				# Берем первую карту пользователя
 				card = user_cards[0]
 				card_id = card["card_id"]
+				card_info = await db_local.get_card_by_id(card_id)
+				card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+				group_name = ""
+				if card_info and card_info.get("group_id"):
+					group = await db_local.get_card_group_by_id(card_info["group_id"])
+					group_name = group.get("name") if group else ""
+				if card_name:
+					label = f"{group_name} ({card_name})" if group_name else card_name
+					pay_card_info = f"\n💳 Карта для оплаты: {label}"
 				
 				# Получаем реквизиты из таблицы card_requisites
 				requisites = await db_local.list_card_requisites(card_id)
@@ -1183,13 +1194,13 @@ async def main() -> None:
 				f"Вы получаете: {amount_str} {crypto_short}\n"
 				f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
 				f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
-				f"Реквизиты для оплаты:\n\n"
+				f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
 			)
 			
 			if requisites_text:
 				order_message += requisites_text + "\n\n"
 			else:
-				order_message += "Реквизиты не найдены. Обратитесь к администратору.\n\n"
+				order_message += "Реквизиты не найдены. Идет загрузка, ожидайте.\n\n"
 			
 			# Сохраняем время создания заявки (15 минут)
 			order_created_at = int(time.time())
@@ -1215,6 +1226,47 @@ async def main() -> None:
 			)
 			# Сохраняем ID сообщения с заявкой в состоянии для последующего сохранения в БД
 			await state.update_data(order_message_id=final_message.message_id)
+			
+			# Если реквизитов нет, сохраняем ожидание и уведомляем админов
+			if not requisites_text:
+				await db_local.save_pending_requisites(
+					user_tg_id=message.from_user.id,
+					message_id=final_message.message_id,
+					crypto_type=crypto_type,
+					crypto_display=crypto_display,
+					amount=amount,
+					final_amount=final_amount,
+					currency_symbol=currency_symbol,
+					wallet_address=wallet_address
+				)
+				user_id = await db_local.get_or_create_user(
+					message.from_user.id,
+					message.from_user.username,
+					message.from_user.full_name
+				)
+				admin_ids = get_admin_ids()
+				if admin_ids and user_id != -1:
+					kb = InlineKeyboardBuilder()
+					kb.button(text="🔗 Привязать карту", callback_data=f"user:bind:{user_id}")
+					kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
+					kb.adjust(1)
+					alert_text = (
+						"⚠️ У пользователя нет привязанной карты для оплаты.\n\n"
+						f"👤 {message.from_user.full_name} (@{message.from_user.username or 'нет'})\n"
+						f"🆔 ID: <code>{message.from_user.id}</code>\n"
+						f"Крипта: {crypto_display}\n"
+						f"Сумма: {int(final_amount)} {currency_symbol}"
+					)
+					for admin_id in admin_ids:
+						try:
+							await message.bot.send_message(
+								chat_id=admin_id,
+								text=alert_text,
+								parse_mode="HTML",
+								reply_markup=kb.as_markup()
+							)
+						except Exception:
+							pass
 		else:
 			# Для BTC показываем выбор способа доставки (VIP или обычная)
 			order_info = (
@@ -1286,11 +1338,21 @@ async def main() -> None:
 		# Получаем реквизиты пользователя
 		user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
 		requisites_text = ""
+		pay_card_info = ""
 		
 		if user_cards:
 			# Берем первую карту пользователя
 			card = user_cards[0]
 			card_id = card["card_id"]
+			card_info = await db_local.get_card_by_id(card_id)
+			card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db_local.get_card_group_by_id(card_info["group_id"])
+				group_name = group.get("name") if group else ""
+			if card_name:
+				label = f"{group_name} ({card_name})" if group_name else card_name
+				pay_card_info = f"\n💳 Карта для оплаты: {label}"
 			
 			# Получаем реквизиты из таблицы card_requisites
 			requisites = await db_local.list_card_requisites(card_id)
@@ -1331,13 +1393,13 @@ async def main() -> None:
 			f"Вы получаете: {amount_str} {crypto_short}\n"
 			f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
 			f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
-			f"Реквизиты для оплаты:\n\n"
+			f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
 		)
 		
 		if requisites_text:
 			order_message += requisites_text + "\n\n"
 		else:
-			order_message += "Реквизиты не найдены. Обратитесь к администратору.\n\n"
+			order_message += "Реквизиты не найдены. Идет загрузка, ожидайте.\n\n"
 		
 		# Сохраняем время создания заявки (15 минут)
 		order_created_at = int(time.time())
@@ -1363,6 +1425,47 @@ async def main() -> None:
 		)
 		# Сохраняем ID сообщения с заявкой в состоянии для последующего сохранения в БД
 		await state.update_data(order_message_id=final_message.message_id)
+		
+		# Если реквизитов нет, сохраняем ожидание и уведомляем админов
+		if not requisites_text:
+			await db_local.save_pending_requisites(
+				user_tg_id=message.from_user.id,
+				message_id=final_message.message_id,
+				crypto_type=crypto_type,
+				crypto_display=crypto_display,
+				amount=amount,
+				final_amount=final_amount,
+				currency_symbol=currency_symbol,
+				wallet_address=wallet_address
+			)
+			user_id = await db_local.get_or_create_user(
+				message.from_user.id,
+				message.from_user.username,
+				message.from_user.full_name
+			)
+			admin_ids = get_admin_ids()
+			if admin_ids and user_id != -1:
+				kb = InlineKeyboardBuilder()
+				kb.button(text="🔗 Привязать карту", callback_data=f"user:bind:{user_id}")
+				kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
+				kb.adjust(1)
+				alert_text = (
+					"⚠️ У пользователя нет привязанной карты для оплаты.\n\n"
+					f"👤 {message.from_user.full_name} (@{message.from_user.username or 'нет'})\n"
+					f"🆔 ID: <code>{message.from_user.id}</code>\n"
+					f"Крипта: {crypto_display}\n"
+					f"Сумма: {int(final_amount)} {currency_symbol}"
+				)
+				for admin_id in admin_ids:
+					try:
+						await message.bot.send_message(
+							chat_id=admin_id,
+							text=alert_text,
+							parse_mode="HTML",
+							reply_markup=kb.as_markup()
+						)
+					except Exception:
+						pass
 	
 	@dp.message(BuyStates.waiting_payment_confirmation, F.text == "ОПЛАТА СОВЕРШЕНА")
 	async def on_payment_confirmed(message: Message, state: FSMContext):
@@ -1379,6 +1482,10 @@ async def main() -> None:
 		
 		# Получаем данные о заказе
 		data = await state.get_data()
+		pending = await db_local.get_pending_requisites(message.from_user.id)
+		if pending:
+			await state.update_data(order_message_id=pending["message_id"])
+			await db_local.delete_pending_requisites(message.from_user.id)
 		order_expires_at = data.get("order_expires_at", 0)
 		
 		# Проверяем, не истекла ли заявка
@@ -1464,9 +1571,21 @@ async def main() -> None:
 		proof_request_message_id = data.get("proof_request_message_id")
 		
 		# Отправляем сообщение об успешной отправке скриншота ПЕРЕД созданием заявки
+		if amount < 1:
+			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+		else:
+			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+		proof_details = (
+			f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
+			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Адрес кошелька: {wallet_address}"
+		)
 		proof_confirmation_message = await message.bot.send_message(
 			chat_id=message.chat.id,
-			text="✅ Спасибо! Ваш скриншот/чек получен. Ожидайте зачисления средств на указанный адрес кошелька."
+			text=(
+				"✅ Спасибо! Ваш скриншот/чек получен. Ожидайте зачисления средств на указанный адрес кошелька."
+				+ proof_details
+			)
 		)
 		proof_confirmation_message_id = proof_confirmation_message.message_id
 		
@@ -1488,6 +1607,9 @@ async def main() -> None:
 			proof_request_message_id=proof_request_message_id,
 			proof_confirmation_message_id=proof_confirmation_message_id,
 		)
+		# Сохраняем сообщение пользователя как user_message_id для обновлений
+		if order_message_id:
+			await db_local.update_order_user_message_id(order_id, order_message_id)
 		
 		# Получаем заявку для получения номера
 		order = await db_local.get_order_by_id(order_id)
@@ -1540,7 +1662,7 @@ async def main() -> None:
 					
 					# Получаем профит за текущий месяц
 					monthly_profit = await db_local.get_user_monthly_profit(user_tg_id)
-					if monthly_profit and monthly_profit > 0:
+					if monthly_profit is not None:
 						try:
 							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
 							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
@@ -1551,6 +1673,22 @@ async def main() -> None:
 			logger_main.debug(f"Ошибка получения информации о последней сделке при создании заявки: {e}", exc_info=True)
 		
 		# Формируем сообщение для админа
+		card_name = ""
+		group_name = ""
+		user_cards = await db_local.get_cards_for_user_tg(user_tg_id)
+		if user_cards:
+			card = user_cards[0]
+			card_id = card["card_id"]
+			card_info = await db_local.get_card_by_id(card_id)
+			card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+			if card_info and card_info.get("group_id"):
+				group = await db_local.get_card_group_by_id(card_info["group_id"])
+				group_name = group.get("name") if group else ""
+		if card_name:
+			label = f"{group_name} ({card_name})" if group_name else card_name
+			pay_card_info = f"\n💳 Карта для оплаты: {label}"
+		else:
+			pay_card_info = ""
 		admin_message_text = (
 			f"Номер заявки за сегодня: {order_number}\n"
 			f"Имя пользователя: {user_name or 'Не указано'}\n"
@@ -1558,7 +1696,7 @@ async def main() -> None:
 			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
 			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-			f"Адрес кошелька: <code>{wallet_address}</code>{total_debt_info}"
+			f"Адрес кошелька: <code>{wallet_address}</code>{pay_card_info}{total_debt_info}"
 		)
 		
 		# Отправляем заявку всем админам
@@ -1687,7 +1825,7 @@ async def main() -> None:
 					
 					# Получаем профит за текущий месяц
 					monthly_profit = await db_local.get_user_monthly_profit(user_tg_id)
-					if monthly_profit and monthly_profit > 0:
+					if monthly_profit is not None:
 						try:
 							monthly_profit_formatted = f"{int(round(monthly_profit)):,}".replace(",", " ")
 							last_order_info += f"\n📊 Профит за текущий месяц: {monthly_profit_formatted} USD"
