@@ -101,6 +101,7 @@ class Database:
 		await self._ensure_questions_table()
 		await self._ensure_question_messages_table()
 		await self._ensure_debts_table()
+		await self._ensure_user_debts_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -512,6 +513,25 @@ class Database:
 			"SELECT id, tg_id, username, full_name, last_order_id, last_order_profit FROM users WHERE id = ?"
 		)
 		cur = await self._db.execute(query, (user_id,))
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"user_id": row[0],
+			"tg_id": row[1],
+			"username": row[2],
+			"full_name": row[3],
+			"last_order_id": row[4] if len(row) > 4 else None,
+			"last_order_profit": row[5] if len(row) > 5 else None,
+			"cards": await self.list_cards_for_user(row[0]),
+		}
+
+	async def get_user_by_tg(self, tg_id: int) -> Optional[Dict[str, Any]]:
+		assert self._db
+		query = (
+			"SELECT id, tg_id, username, full_name, last_order_id, last_order_profit FROM users WHERE tg_id = ?"
+		)
+		cur = await self._db.execute(query, (tg_id,))
 		row = await cur.fetchone()
 		if not row:
 			return None
@@ -3018,6 +3038,30 @@ class Database:
 				"CREATE INDEX IF NOT EXISTS idx_debts_user_tg_id ON debts(user_tg_id)"
 			)
 			_logger.debug("Created table debts")
+
+	async def _ensure_user_debts_table(self) -> None:
+		"""Создает таблицу для ручных долгов пользователей (без привязки к заявке)"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='user_debts'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE user_debts (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					user_tg_id INTEGER NOT NULL,
+					amount REAL NOT NULL,
+					currency_symbol TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_user_debts_user_tg_id ON user_debts(user_tg_id)"
+			)
+			_logger.debug("Created table user_debts")
 	
 	async def create_question(
 		self,
@@ -3255,13 +3299,55 @@ class Database:
 		"""Получает общую сумму долгов пользователя по валютам"""
 		assert self._db
 		cur = await self._db.execute(
-			"SELECT currency_symbol, SUM(debt_amount) FROM debts WHERE user_tg_id = ? GROUP BY currency_symbol",
-			(user_tg_id,)
+			"""
+			SELECT currency_symbol, SUM(amount) FROM (
+				SELECT currency_symbol, debt_amount AS amount
+				FROM debts
+				WHERE user_tg_id = ?
+				UNION ALL
+				SELECT currency_symbol, amount
+				FROM user_debts
+				WHERE user_tg_id = ?
+			)
+			GROUP BY currency_symbol
+			""",
+			(user_tg_id, user_tg_id)
 		)
 		result = {}
 		async for row in cur:
 			result[row[0]] = row[1]
 		return result
+
+	async def add_user_debt(self, user_tg_id: int, amount: float, currency_symbol: str) -> bool:
+		"""Добавляет ручной долг (amount может быть отрицательным для списания)"""
+		assert self._db
+		await self._db.execute(
+			"INSERT INTO user_debts(user_tg_id, amount, currency_symbol) VALUES(?, ?, ?)",
+			(user_tg_id, amount, currency_symbol)
+		)
+		await self._db.commit()
+		return True
+
+	async def get_debtors_totals(self) -> List[Dict[str, Any]]:
+		"""Возвращает список должников с суммами по валютам"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT user_tg_id, currency_symbol, SUM(amount) FROM (
+				SELECT user_tg_id, currency_symbol, debt_amount AS amount
+				FROM debts
+				UNION ALL
+				SELECT user_tg_id, currency_symbol, amount
+				FROM user_debts
+			)
+			GROUP BY user_tg_id, currency_symbol
+			"""
+		)
+		rows = await cur.fetchall()
+		result: Dict[int, Dict[str, float]] = {}
+		for user_tg_id, currency, total in rows:
+			result.setdefault(user_tg_id, {})[currency] = total
+		return [{"user_tg_id": k, "totals": v} for k, v in result.items()]
 	
 	async def update_order_user_message_id(self, order_id: int, user_message_id: int) -> bool:
 		"""Обновляет user_message_id для заявки"""

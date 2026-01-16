@@ -441,6 +441,12 @@ class OrderEditStates(StatesGroup):
 	waiting_debt_currency = State()  # Ожидание выбора валюты долга
 
 
+class DebtorsStates(StatesGroup):
+	"""Состояния для управления должниками"""
+	waiting_currency = State()
+	waiting_amount = State()
+
+
 class CryptoColumnEditStates(StatesGroup):
 	waiting_column = State()
 	waiting_crypto_name = State()
@@ -1424,6 +1430,186 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
 	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb())
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "settings:debtors")
+async def settings_debtors(cb: CallbackQuery, state: FSMContext):
+	await state.clear()
+	text, kb = await _get_debtors_list_text_kb()
+	await safe_edit_text(cb.message, text, reply_markup=kb)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("debtors:view:"))
+async def debtors_view(cb: CallbackQuery, state: FSMContext):
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	db = get_db()
+	totals = await db.get_user_total_debt(user_tg_id)
+	totals = {k: v for k, v in totals.items() if v and v > 0}
+	user = await db.get_user_by_tg(user_tg_id)
+	name = user.get("full_name") if user else None
+	username = user.get("username") if user else None
+	name_label = name or (f"@{username}" if username else str(user_tg_id))
+	
+	text = f"👤 Имя: {name_label}\n"
+	if username:
+		text += f"📱 Username: @{username}\n"
+	text += f"🆔 ID: <code>{user_tg_id}</code>\n"
+	text += f"💳 Долг: {_format_debt_totals(totals) if totals else '0'}\n\n"
+	text += "Выберите действие:"
+	
+	kb = InlineKeyboardBuilder()
+	kb.button(text="➕ Добавить долг", callback_data=f"debtors:add:{user_tg_id}")
+	kb.button(text="➖ Списать долг", callback_data=f"debtors:writeoff:{user_tg_id}")
+	kb.button(text="⬅️ Назад", callback_data="settings:debtors")
+	kb.adjust(1)
+	
+	await safe_edit_text(cb.message, text, reply_markup=kb.as_markup(), parse_mode="HTML")
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("debtors:add:") | F.data.startswith("debtors:writeoff:"))
+async def debtors_action_start(cb: CallbackQuery, state: FSMContext):
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	action = parts[1]
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	await state.update_data(debt_user_tg_id=user_tg_id, debt_action=action)
+	await state.set_state(DebtorsStates.waiting_currency)
+	
+	kb = InlineKeyboardBuilder()
+	kb.button(text="BYN", callback_data="debtors:currency:BYN")
+	kb.button(text="RUB", callback_data="debtors:currency:RUB")
+	kb.button(text="⬅️ Назад", callback_data=f"debtors:view:{user_tg_id}")
+	kb.adjust(1)
+	
+	await safe_edit_text(cb.message, "Выберите валюту долга:", reply_markup=kb.as_markup())
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("debtors:currency:"))
+async def debtors_currency_selected(cb: CallbackQuery, state: FSMContext):
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	currency = parts[2]
+	
+	await state.update_data(debt_currency=currency)
+	await state.set_state(DebtorsStates.waiting_amount)
+	
+	await safe_edit_text(cb.message, f"Введите сумму ({currency}):", reply_markup=cb.message.reply_markup)
+	await cb.answer()
+
+
+@admin_router.message(DebtorsStates.waiting_amount)
+async def debtors_amount_save(message: Message, state: FSMContext, bot: Bot):
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	if message.text and message.text.startswith("/"):
+		return
+	
+	data = await state.get_data()
+	user_tg_id = data.get("debt_user_tg_id")
+	action = data.get("debt_action")
+	currency = data.get("debt_currency")
+	if not user_tg_id or not action or not currency:
+		await message.answer("❌ Ошибка: данные не найдены.")
+		await state.clear()
+		return
+	
+	try:
+		amount_str = message.text.strip().replace(",", ".")
+		amount = float(amount_str)
+		if amount <= 0:
+			await message.answer("❌ Сумма должна быть больше нуля.")
+			return
+	except ValueError:
+		await message.answer("❌ Неверный формат суммы.")
+		return
+	
+	db = get_db()
+	totals = await db.get_user_total_debt(user_tg_id)
+	current_total = float(totals.get(currency, 0) or 0)
+	
+	if action == "writeoff":
+		if current_total <= 0:
+			await message.answer("❌ У пользователя нет долга в этой валюте.")
+			return
+		if amount > current_total:
+			await message.answer("❌ Сумма списания больше текущего долга.")
+			return
+		amount_to_save = -amount
+	else:
+		amount_to_save = amount
+	
+	await db.add_user_debt(user_tg_id, amount_to_save, currency)
+	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	
+	text, kb = await _get_debtors_list_text_kb()
+	await message.answer(text, reply_markup=kb)
+
+
+def _format_debt_totals(totals: Dict[str, float]) -> str:
+	parts = []
+	for curr, amount in totals.items():
+		try:
+			amount_val = int(amount)
+		except (ValueError, TypeError):
+			amount_val = amount
+		parts.append(f"{amount_val} {curr}")
+	return ", ".join(parts)
+
+
+async def _get_debtors_list_text_kb():
+	db = get_db()
+	debtors = await db.get_debtors_totals()
+	
+	# Формируем список с суммами
+	items = []
+	for row in debtors:
+		user_tg_id = row["user_tg_id"]
+		totals = {k: v for k, v in row["totals"].items() if v and v > 0}
+		if not totals:
+			continue
+		user = await db.get_user_by_tg(user_tg_id)
+		if user:
+			name = user.get("full_name") or f"@{user.get('username')}" or str(user_tg_id)
+		else:
+			name = str(user_tg_id)
+		items.append((user_tg_id, name, _format_debt_totals(totals)))
+	
+	kb = InlineKeyboardBuilder()
+	for user_tg_id, name, totals_str in items:
+		kb.button(text=f"{name} — {totals_str}", callback_data=f"debtors:view:{user_tg_id}")
+	kb.button(text="⬅️ Назад", callback_data="admin:back")
+	kb.adjust(1)
+	
+	text = "💳 Должники:\n" if items else "💳 Должников нет."
+	return text, kb.as_markup()
 
 
 def _parse_float(value: str, default: float) -> float:
@@ -8184,7 +8370,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
 				"DeleteRateStates", "DeleteMoveStates", "QuestionReplyStates",
 				"SellOrderMessageStates", "SellOrderUserReplyStates", "QuestionUserReplyStates",
-				"OrderMessageStates", "OrderUserReplyStates", "AlertMessageStates"
+				"OrderMessageStates", "OrderUserReplyStates", "AlertMessageStates", "DebtorsStates"
 			]):
 				# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
 				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
