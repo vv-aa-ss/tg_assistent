@@ -139,6 +139,7 @@ def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
 def admin_settings_kb() -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="👥 Пользователи", callback_data="settings:users")
+	kb.button(text="🧮 Расчет покупки", callback_data="settings:buy_calc")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
 	kb.adjust(1)
 	return kb.as_markup()
@@ -1155,6 +1156,29 @@ def markup_percents_settings_kb(percent_small: float, percent_large: float) -> I
 	kb = InlineKeyboardBuilder()
 	kb.button(text=f"📉 Меньше $100: {percent_small}%", callback_data="settings:markup_percent:small")
 	kb.button(text=f"📈 Больше $100: {percent_large}%", callback_data="settings:markup_percent:large")
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def buy_calc_settings_kb(settings: dict) -> InlineKeyboardMarkup:
+	"""Клавиатура для настройки расчета покупки"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text=f"📉 $0-100: {settings['buy_markup_percent_small']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_small")
+	kb.button(text=f"📈 $101-449: {settings['buy_markup_percent_101_449']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_101_449")
+	kb.button(text=f"📈 $450-699: {settings['buy_markup_percent_450_699']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_450_699")
+	kb.button(text=f"📈 $700-999: {settings['buy_markup_percent_700_999']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_700_999")
+	kb.button(text=f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_1000_1499")
+	kb.button(text=f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_1500_1999")
+	kb.button(text=f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_2000_plus")
+	kb.button(text=f"✅ Мин $: {settings['buy_min_usd']}", callback_data="settings:buy_calc:edit:buy_min_usd")
+	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +BYN {settings['buy_extra_fee_low_byn']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_byn")
+	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +BYN {settings['buy_extra_fee_mid_byn']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_byn")
+	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +RUB {settings['buy_extra_fee_low_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_rub")
+	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +RUB {settings['buy_extra_fee_mid_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_rub")
+	kb.button(text=f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}", callback_data="settings:buy_calc:edit:buy_alert_usd_threshold")
+	kb.button(text=f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_byn_rate")
+	kb.button(text=f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_rub_rate")
 	kb.button(text="⬅️ Назад", callback_data="admin:settings")
 	kb.adjust(1)
 	return kb.as_markup()

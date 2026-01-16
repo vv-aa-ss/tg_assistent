@@ -2045,6 +2045,76 @@ class Database:
 					"INSERT INTO settings(key, value) VALUES('markup_percent_large', '15')"
 				)
 			
+			# Настройки расчета покупки крипты
+			if 'buy_markup_percent_small' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_small', '15')"
+				)
+			if 'buy_markup_percent_101_449' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_101_449', '11')"
+				)
+			if 'buy_markup_percent_450_699' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_450_699', '9')"
+				)
+			if 'buy_markup_percent_700_999' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_700_999', '8')"
+				)
+			if 'buy_markup_percent_1000_1499' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1000_1499', '7')"
+				)
+			if 'buy_markup_percent_1500_1999' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1500_1999', '6')"
+				)
+			if 'buy_markup_percent_2000_plus' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_2000_plus', '5')"
+				)
+			if 'buy_min_usd' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_min_usd', '15')"
+				)
+			if 'buy_extra_fee_usd_low' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_usd_low', '50')"
+				)
+			if 'buy_extra_fee_usd_mid' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_usd_mid', '67')"
+				)
+			if 'buy_extra_fee_low_byn' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_low_byn', '10')"
+				)
+			if 'buy_extra_fee_mid_byn' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_mid_byn', '5')"
+				)
+			if 'buy_extra_fee_low_rub' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_low_rub', '10')"
+				)
+			if 'buy_extra_fee_mid_rub' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_extra_fee_mid_rub', '5')"
+				)
+			if 'buy_alert_usd_threshold' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_alert_usd_threshold', '400')"
+				)
+			if 'buy_usd_to_byn_rate' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_usd_to_byn_rate', '2.97')"
+				)
+			if 'buy_usd_to_rub_rate' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_usd_to_rub_rate', '95')"
+				)
+			
 			if 'delete_range' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO settings(key, value) VALUES('delete_range', 'A:BB')"
@@ -2866,6 +2936,7 @@ class Database:
 					user_name TEXT,
 					user_username TEXT,
 					question_text TEXT NOT NULL,
+					initiated_by_admin INTEGER NOT NULL DEFAULT 0,
 					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
 					completed_at INTEGER,
 					admin_message_id INTEGER,
@@ -2891,6 +2962,9 @@ class Database:
 			if 'user_message_id' not in columns:
 				await self._db.execute("ALTER TABLE questions ADD COLUMN user_message_id INTEGER")
 				_logger.debug("Added column user_message_id to questions table")
+			if 'initiated_by_admin' not in columns:
+				await self._db.execute("ALTER TABLE questions ADD COLUMN initiated_by_admin INTEGER NOT NULL DEFAULT 0")
+				_logger.debug("Added column initiated_by_admin to questions table")
 	
 	async def _ensure_question_messages_table(self) -> None:
 		"""Создает таблицу для хранения сообщений по вопросам"""
@@ -2952,6 +3026,7 @@ class Database:
 		user_username: str,
 		question_text: str,
 		admin_message_id: int = None,
+		initiated_by_admin: int = 0,
 	) -> int:
 		"""
 		Создает новый вопрос и возвращает его ID.
@@ -2971,16 +3046,17 @@ class Database:
 		# Создаем вопрос
 		cur = await self._db.execute(
 			"""
-			INSERT INTO questions (question_number, user_tg_id, user_name, user_username, question_text, admin_message_id)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO questions (question_number, user_tg_id, user_name, user_username, question_text, admin_message_id, initiated_by_admin)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			""",
-			(question_number, user_tg_id, user_name, user_username, question_text, admin_message_id)
+			(question_number, user_tg_id, user_name, user_username, question_text, admin_message_id, initiated_by_admin)
 		)
 		await self._db.commit()
 		question_id = cur.lastrowid
 		
-		# Сохраняем первое сообщение (вопрос пользователя)
-		await self.add_question_message(question_id, "user", question_text)
+		# Сохраняем первое сообщение (вопрос пользователя), если это не инициировано админом
+		if not initiated_by_admin:
+			await self.add_question_message(question_id, "user", question_text)
 		
 		return question_id
 	
@@ -2990,7 +3066,7 @@ class Database:
 		cur = await self._db.execute(
 			"""
 			SELECT id, question_number, user_tg_id, user_name, user_username, question_text,
-				created_at, completed_at, admin_message_id, user_message_id
+				initiated_by_admin, created_at, completed_at, admin_message_id, user_message_id
 			FROM questions
 			WHERE id = ?
 			""",
@@ -3006,10 +3082,11 @@ class Database:
 			"user_name": row[3],
 			"user_username": row[4],
 			"question_text": row[5],
-			"created_at": row[6],
-			"completed_at": row[7],
-			"admin_message_id": row[8],
-			"user_message_id": row[9] if len(row) > 9 else None,
+			"initiated_by_admin": row[6],
+			"created_at": row[7],
+			"completed_at": row[8],
+			"admin_message_id": row[9],
+			"user_message_id": row[10] if len(row) > 10 else None,
 		}
 	
 	async def add_question_message(

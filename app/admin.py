@@ -45,6 +45,7 @@ from app.keyboards import (
 	user_menu_button_kb,
 	multipliers_settings_kb,
 	markup_percents_settings_kb,
+	buy_calc_settings_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
@@ -453,6 +454,15 @@ class MultiplierEditStates(StatesGroup):
 
 class MarkupPercentEditStates(StatesGroup):
 	waiting_percent = State()
+
+
+class BuyCalcEditStates(StatesGroup):
+	waiting_value = State()
+
+
+class AlertMessageStates(StatesGroup):
+	"""Состояние для отправки сообщения пользователю из раннего алерта"""
+	waiting_message = State()
 
 
 class CardGroupStates(StatesGroup):
@@ -1416,6 +1426,133 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
+def _parse_float(value: str, default: float) -> float:
+	try:
+		return float(value) if value is not None else default
+	except (ValueError, TypeError):
+		return default
+
+
+async def _get_buy_calc_settings(db) -> dict:
+	return {
+		"buy_markup_percent_small": _parse_float(await db.get_setting("buy_markup_percent_small", "15"), 15),
+		"buy_markup_percent_101_449": _parse_float(await db.get_setting("buy_markup_percent_101_449", "11"), 11),
+		"buy_markup_percent_450_699": _parse_float(await db.get_setting("buy_markup_percent_450_699", "9"), 9),
+		"buy_markup_percent_700_999": _parse_float(await db.get_setting("buy_markup_percent_700_999", "8"), 8),
+		"buy_markup_percent_1000_1499": _parse_float(await db.get_setting("buy_markup_percent_1000_1499", "7"), 7),
+		"buy_markup_percent_1500_1999": _parse_float(await db.get_setting("buy_markup_percent_1500_1999", "6"), 6),
+		"buy_markup_percent_2000_plus": _parse_float(await db.get_setting("buy_markup_percent_2000_plus", "5"), 5),
+		"buy_min_usd": _parse_float(await db.get_setting("buy_min_usd", "15"), 15),
+		"buy_extra_fee_usd_low": _parse_float(await db.get_setting("buy_extra_fee_usd_low", "50"), 50),
+		"buy_extra_fee_usd_mid": _parse_float(await db.get_setting("buy_extra_fee_usd_mid", "67"), 67),
+		"buy_extra_fee_low_byn": _parse_float(await db.get_setting("buy_extra_fee_low_byn", "10"), 10),
+		"buy_extra_fee_mid_byn": _parse_float(await db.get_setting("buy_extra_fee_mid_byn", "5"), 5),
+		"buy_extra_fee_low_rub": _parse_float(await db.get_setting("buy_extra_fee_low_rub", "10"), 10),
+		"buy_extra_fee_mid_rub": _parse_float(await db.get_setting("buy_extra_fee_mid_rub", "5"), 5),
+	"buy_alert_usd_threshold": _parse_float(await db.get_setting("buy_alert_usd_threshold", "400"), 400),
+		"buy_usd_to_byn_rate": _parse_float(await db.get_setting("buy_usd_to_byn_rate", "2.97"), 2.97),
+		"buy_usd_to_rub_rate": _parse_float(await db.get_setting("buy_usd_to_rub_rate", "95"), 95),
+	}
+
+
+@admin_router.callback_query(F.data == "settings:buy_calc")
+async def settings_buy_calc(cb: CallbackQuery):
+	"""Показывает настройки расчета покупки"""
+	db = get_db()
+	settings = await _get_buy_calc_settings(db)
+	await safe_edit_text(
+		cb.message,
+		"🧮 Настройки расчета покупки:\n\n"
+		f"📉 $0-100: {settings['buy_markup_percent_small']}%\n"
+		f"📈 $101-449: {settings['buy_markup_percent_101_449']}%\n"
+		f"📈 $450-699: {settings['buy_markup_percent_450_699']}%\n"
+		f"📈 $700-999: {settings['buy_markup_percent_700_999']}%\n"
+		f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%\n"
+		f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%\n"
+		f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%\n"
+		f"✅ Мин. сумма сделки: {settings['buy_min_usd']}$\n"
+		f"💵 Порог 1: < {settings['buy_extra_fee_usd_low']}$\n"
+		f"💵 Порог 2: < {settings['buy_extra_fee_usd_mid']}$\n"
+		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
+		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
+		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}\n\n"
+		"Выберите параметр для редактирования:",
+		reply_markup=buy_calc_settings_kb(settings),
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:buy_calc:edit:"))
+async def settings_buy_calc_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование параметра расчета покупки"""
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	key = parts[3]
+	
+	db = get_db()
+	current_value = await db.get_setting(key, "")
+	await state.update_data(buy_calc_key=key)
+	await state.set_state(BuyCalcEditStates.waiting_value)
+	
+	await safe_edit_text(
+		cb.message,
+		f"🧮 Введите новое значение для '{key}':\n\n"
+		f"Текущее значение: {current_value}\n\n"
+		"Введите число (например: 2.97 или 15):",
+		reply_markup=simple_back_kb("admin:settings")
+	)
+	await cb.answer()
+
+
+@admin_router.message(BuyCalcEditStates.waiting_value)
+async def settings_buy_calc_save(message: Message, state: FSMContext):
+	"""Сохраняет параметр расчета покупки"""
+	data = await state.get_data()
+	key = data.get("buy_calc_key")
+	if not key:
+		await state.clear()
+		await message.answer("❌ Ошибка: не найден ключ настройки.")
+		return
+	
+	value_str = message.text.strip().replace(",", ".")
+	try:
+		value = float(value_str)
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите число.")
+		return
+	
+	db = get_db()
+	await db.set_setting(key, str(value))
+	await state.clear()
+	await message.answer(f"✅ Настройка {key} обновлена: {value}")
+	
+	settings = await _get_buy_calc_settings(db)
+	await message.answer(
+		"🧮 Настройки расчета покупки:\n\n"
+		f"📉 $0-100: {settings['buy_markup_percent_small']}%\n"
+		f"📈 $101-449: {settings['buy_markup_percent_101_449']}%\n"
+		f"📈 $450-699: {settings['buy_markup_percent_450_699']}%\n"
+		f"📈 $700-999: {settings['buy_markup_percent_700_999']}%\n"
+		f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%\n"
+		f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%\n"
+		f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%\n"
+		f"✅ Мин. сумма сделки: {settings['buy_min_usd']}$\n"
+		f"💵 Порог 1: < {settings['buy_extra_fee_usd_low']}$\n"
+		f"💵 Порог 2: < {settings['buy_extra_fee_usd_mid']}$\n"
+		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
+		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
+		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}\n\n"
+		"Выберите параметр для редактирования:",
+		reply_markup=buy_calc_settings_kb(settings),
+	)
+
+
 @admin_router.callback_query(F.data == "settings:multipliers")
 async def settings_multipliers(cb: CallbackQuery):
 	"""Показывает настройки коэффициентов"""
@@ -1629,6 +1766,110 @@ async def settings_markup_percent_save(message: Message, state: FSMContext):
 		"Выберите процент для редактирования:",
 		reply_markup=markup_percents_settings_kb(percent_small, percent_large)
 	)
+
+
+@admin_router.callback_query(F.data.startswith("alert:message:"))
+async def alert_message_start(cb: CallbackQuery, state: FSMContext):
+	"""Начало отправки сообщения пользователю из раннего алерта"""
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	await state.update_data(alert_user_tg_id=user_tg_id)
+	await state.set_state(AlertMessageStates.waiting_message)
+	
+	await safe_edit_text(
+		cb.message,
+		(cb.message.text or "") + "\n\n📝 Введите ваше сообщение пользователю:",
+		parse_mode="HTML",
+		reply_markup=cb.message.reply_markup
+	)
+	await cb.answer()
+
+
+@admin_router.message(AlertMessageStates.waiting_message)
+async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
+	"""Отправка сообщения пользователю из раннего алерта"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	data = await state.get_data()
+	user_tg_id = data.get("alert_user_tg_id")
+	if not user_tg_id:
+		await message.answer("❌ Ошибка: не найден ID пользователя.")
+		await state.clear()
+		return
+	
+	text = message.text or message.caption or ""
+	if not text.strip():
+		await message.answer("❌ Пожалуйста, введите текст сообщения.")
+		return
+	
+	db = get_db()
+	try:
+		# Создаем вопрос, чтобы включить функционал переписки как в /questions
+		user_id = await db.get_user_id_by_tg(user_tg_id)
+		user = await db.get_user_by_id(user_id) if user_id else None
+		user_name = (user or {}).get("full_name") or "Не указано"
+		user_username = (user or {}).get("username") or "Не указано"
+		
+		question_id = await db.create_question(
+			user_tg_id=user_tg_id,
+			user_name=user_name,
+			user_username=user_username,
+			question_text="Сообщение администратора",
+			initiated_by_admin=1
+		)
+		await db.add_question_message(question_id, "admin", text)
+		
+		from app.keyboards import question_user_reply_kb, question_reply_kb
+		
+		# Сообщение пользователю с кнопкой "Ответить"
+		user_msg = await bot.send_message(
+			chat_id=user_tg_id,
+			text=text,
+			reply_markup=question_user_reply_kb(question_id)
+		)
+		await db.update_question_user_message_id(question_id, user_msg.message_id)
+		
+		# Сообщение админам с кнопкой "Ответить" и "Закрыть"
+		admin_message_text = (
+			f"❗ <b>Сообщение админу (ранний алерт)</b>\n\n"
+			f"👤 Имя: {user_name}\n"
+			f"📱 Username: @{user_username}\n"
+			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+			f"💬 <b>Сообщение:</b>\n{text}"
+		)
+		
+		admin_message_id = None
+		for admin_id in admin_ids:
+			try:
+				sent_msg = await bot.send_message(
+					chat_id=admin_id,
+					text=admin_message_text,
+					parse_mode="HTML",
+					reply_markup=question_reply_kb(question_id)
+				)
+				if admin_message_id is None:
+					admin_message_id = sent_msg.message_id
+					await db.update_question_admin_message_id(question_id, admin_message_id)
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось отправить вопрос админу {admin_id}: {e}")
+		
+		await message.answer("✅ Сообщение отправлено пользователю (с возможностью ответа).")
+	except Exception as e:
+		logger.error(f"❌ Ошибка отправки сообщения пользователю {user_tg_id}: {e}", exc_info=True)
+		await message.answer("❌ Не удалось отправить сообщение пользователю.")
+	
+	await state.clear()
 
 
 @admin_router.callback_query(F.data == "settings:users")
@@ -6781,6 +7022,7 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 				user_name = question.get("user_name", "Не указано")
 				user_username = question.get("user_username", "Не указано")
 				question_text = question["question_text"]
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
 				
 				# Получаем информацию о последней сделке и профите пользователя
 				last_order_info = ""
@@ -6796,10 +7038,12 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 								# Получаем информацию о последней сделке
 								last_order = await db.get_order_by_id(last_order_id)
 								if last_order:
-									crypto_display = last_order.get("crypto_display", "")
-									amount = last_order.get("amount", 0)
-									amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
-									last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+									last_created_at = last_order.get("created_at")
+									if last_created_at:
+										last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+									else:
+										last_order_date = "неизвестно"
+									last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 									
 									if last_order_profit is not None:
 										try:
@@ -6820,13 +7064,21 @@ async def question_reply_send(message: Message, state: FSMContext, bot: Bot):
 					logger.debug(f"Ошибка получения информации о последней сделке: {e}")
 				
 				# Формируем информацию о вопросе для админа
-				admin_question_info = (
-					f"❓ <b>Вопрос от пользователя</b>\n\n"
-					f"👤 Имя: {user_name}\n"
-					f"📱 Username: @{user_username}\n"
-					f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
-					f"💬 <b>Вопрос:</b>\n{question_text}"
-				)
+				if initiated_by_admin:
+					admin_question_info = (
+						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}"
+					)
+				else:
+					admin_question_info = (
+						f"❓ <b>Вопрос от пользователя</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
+						f"💬 <b>Вопрос:</b>\n{question_text}"
+					)
 				
 				# Формируем историю переписки для админа
 				admin_history_lines = []
@@ -7039,10 +7291,12 @@ async def order_message_send(message: Message, state: FSMContext, bot: Bot):
 								# Получаем информацию о последней сделке
 								last_order = await db.get_order_by_id(last_order_id)
 								if last_order:
-									last_crypto_display = last_order.get("crypto_display", "")
-									last_amount = last_order.get("amount", 0)
-									last_amount_str = f"{last_amount:.8f}".rstrip('0').rstrip('.') if last_amount < 1 else f"{last_amount:.2f}".rstrip('0').rstrip('.')
-									last_order_info = f"\n📦 Последнее обращение: {last_amount_str} {last_crypto_display}"
+									last_created_at = last_order.get("created_at")
+									if last_created_at:
+										last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+									else:
+										last_order_date = "неизвестно"
+									last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 									
 									if last_order_profit is not None:
 										try:
@@ -7188,6 +7442,8 @@ async def order_edit_amount_save(message: Message, state: FSMContext, bot: Bot):
 	
 	# Обновляем сообщение админа с новыми данными
 	await _update_admin_order_message(bot, order_id, db, admin_ids)
+	# Обновляем сообщение пользователя с новыми данными
+	await _update_user_order_message(bot, order_id, db)
 	
 	# Очищаем состояние
 	await state.clear()
@@ -7256,6 +7512,8 @@ async def order_edit_crypto_amount_save(message: Message, state: FSMContext, bot
 	
 	# Обновляем сообщение админа с новыми данными
 	await _update_admin_order_message(bot, order_id, db, admin_ids)
+	# Обновляем сообщение пользователя с новыми данными
+	await _update_user_order_message(bot, order_id, db)
 	
 	# Очищаем состояние
 	await state.clear()
@@ -7444,8 +7702,40 @@ async def order_debt_amount_save(message: Message, state: FSMContext, bot: Bot):
 		await message.answer(f"❌ Неверный формат суммы. Введите число (например: 5000):")
 		return
 	
+	# Проверяем соответствие валюты долга валюте сделки
+	currency_symbol = order.get("currency_symbol", "₽")
+	if currency_symbol in ("Br", "BYN"):
+		order_currency_code = "BYN"
+	elif currency_symbol in ("₽", "RUB"):
+		order_currency_code = "RUB"
+	else:
+		order_currency_code = currency_symbol
+	
+	if debt_currency != order_currency_code:
+		await message.answer("❌ Валюта долга должна совпадать с валютой сделки.")
+		return
+	
 	# Проверяем, есть ли уже долг для этой заявки
 	existing_debt = await db.get_debt_by_order_id(order_id)
+	
+	# Пересчитываем сумму к оплате с учетом долга
+	base_amount_currency = order.get("amount_currency", 0)
+	if existing_debt and existing_debt.get("currency_symbol") == debt_currency:
+		try:
+			base_amount_currency = float(base_amount_currency) + float(existing_debt.get("debt_amount", 0))
+		except (ValueError, TypeError):
+			pass
+	
+	if debt_amount > base_amount_currency:
+		await message.answer("❌ Долг не может быть больше суммы сделки.")
+		return
+	
+	new_amount_currency = base_amount_currency - debt_amount
+	await db._db.execute(
+		"UPDATE orders SET amount_currency = ? WHERE id = ?",
+		(new_amount_currency, order_id)
+	)
+	await db._db.commit()
 	if existing_debt:
 		# Обновляем существующий долг
 		await db._db.execute(
@@ -7463,6 +7753,8 @@ async def order_debt_amount_save(message: Message, state: FSMContext, bot: Bot):
 	
 	# Обновляем сообщение админа с новыми данными
 	await _update_admin_order_message(bot, order_id, db, admin_ids)
+	# Обновляем сообщение пользователя с новыми данными
+	await _update_user_order_message(bot, order_id, db)
 	
 	# Очищаем состояние
 	await state.clear()
@@ -7507,10 +7799,12 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 						# Получаем информацию о последней сделке
 						last_order = await db.get_order_by_id(last_order_id)
 						if last_order:
-							last_crypto_display = last_order.get("crypto_display", "")
-							last_amount = last_order.get("amount", 0)
-							last_amount_str = f"{last_amount:.8f}".rstrip('0').rstrip('.') if last_amount < 1 else f"{last_amount:.2f}".rstrip('0').rstrip('.')
-							last_order_info = f"\n📦 Последнее обращение: {last_amount_str} {last_crypto_display}"
+							last_created_at = last_order.get("created_at")
+							if last_created_at:
+								last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+							else:
+								last_order_date = "неизвестно"
+							last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 							
 							if last_order_profit is not None:
 								try:
@@ -7590,6 +7884,65 @@ async def _update_admin_order_message(bot: Bot, order_id: int, db, admin_ids: Li
 				)
 	except Exception as e:
 		logger.error(f"❌ Ошибка обновления сообщения админа: {e}", exc_info=True)
+
+
+async def _update_user_order_message(bot: Bot, order_id: int, db):
+	"""Вспомогательная функция для обновления сообщения пользователя с данными заявки"""
+	try:
+		order = await db.get_order_by_id(order_id)
+		if not order:
+			return
+		
+		user_message_id = order.get("user_message_id")
+		if not user_message_id:
+			return
+		
+		user_tg_id = order["user_tg_id"]
+		crypto_display = order.get("crypto_display", "")
+		amount = order.get("amount", 0)
+		amount_currency = order.get("amount_currency", 0)
+		currency_symbol = order.get("currency_symbol", "₽")
+		
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+		
+		# Получаем историю переписки
+		messages = await db.get_order_messages(order_id)
+		
+		order_info = (
+			f"💵 Криптовалюта: {crypto_display}\n"
+			f"💸 Сумма: {amount_str} {crypto_display}\n"
+			f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
+		)
+		
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+		
+		history_text = "\n\n".join(history_lines)
+		user_message = order_info + ("\n" + history_text if history_text else "")
+		
+		from app.keyboards import order_user_reply_kb
+		try:
+			await bot.edit_message_text(
+				chat_id=user_tg_id,
+				message_id=user_message_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=order_user_reply_kb(order_id)
+			)
+		except Exception:
+			sent_msg = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=order_user_reply_kb(order_id)
+			)
+			await db.update_order_user_message_id(order_id, sent_msg.message_id)
+	except Exception as e:
+		logger.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
 
 # Обработчики для сделок на продажу - должны быть ПЕРЕД handle_forwarded_from_admin
 @admin_router.message(SellOrderMessageStates.waiting_message)
@@ -7831,7 +8184,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 				"CardColumnBindStates", "CashColumnEditStates", "DeleteRowStates",
 				"DeleteRateStates", "DeleteMoveStates", "QuestionReplyStates",
 				"SellOrderMessageStates", "SellOrderUserReplyStates", "QuestionUserReplyStates",
-				"OrderMessageStates", "OrderUserReplyStates"
+				"OrderMessageStates", "OrderUserReplyStates", "AlertMessageStates"
 			]):
 				# Пользователь находится в состоянии, которое имеет свой обработчик, пропускаем
 				logger.debug(f"⚠️ Пропуск обработки: пользователь находится в состоянии {current_state}, которое имеет свой обработчик")
@@ -8065,13 +8418,19 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			if groups:
 				await state.set_state(ForwardBindStates.waiting_select_group)
 				await state.update_data(original_tg_id=orig_tg_id, user_id=user_id, reply_only=False)
-				await message.answer(f"✅ Пользователь найден в БД, но не привязан к карте.\n\nВыберите группу карт:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+				await message.answer(
+					"✅ Пользователь найден в БД, но не привязан к карте.\n\nВыберите группу карт:",
+					reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True)
+				)
 			else:
 				rows = await db.list_cards()
 				cards = [(r[0], r[1]) for r in rows]
 				await state.set_state(ForwardBindStates.waiting_select_card)
 				await state.update_data(original_tg_id=orig_tg_id, user_id=user_id, reply_only=False)
-				await message.answer(f"✅ Пользователь найден в БД, но не привязан к карте.\n\nГрупп пока нет. Выберите карту:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+				await message.answer(
+					"✅ Пользователь найден в БД, но не привязан к карте.\n\nГрупп пока нет. Выберите карту:",
+					reply_markup=cards_select_kb(cards, back_to="admin:back")
+				)
 			return
 	else:
 		# orig_tg_id is None - пользователь не найден после всех попыток
@@ -8081,7 +8440,7 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 			await check_and_send_btc_address_links(bot, message.chat.id, text)
 			logger.info(f"✅ Функция check_and_send_btc_address_links завершена для chat_id={message.chat.id}")
 		else:
-			logger.warning(f"❌ Пользователь не найден и нет текста для проверки BTC адресов")
+			logger.warning("❌ Пользователь не найден и нет текста для проверки BTC адресов")
 		
 		# Предлагаем создать пользователя и привязать карту
 		# Используем full_name, если он был извлечен из пересылки
@@ -8091,13 +8450,19 @@ async def handle_forwarded_from_admin(message: Message, bot: Bot, state: FSMCont
 		if groups:
 			await state.set_state(ForwardBindStates.waiting_select_group)
 			await state.update_data(hidden_user_name=hidden_name, reply_only=False, existing_user_id=None)
-			await message.answer(f"❌ Пользователь не найден в БД.\n\nВыберите группу карт для привязки:", reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True))
+			await message.answer(
+				"❌ Пользователь не найден в БД.\n\nВыберите группу карт для привязки:",
+				reply_markup=card_groups_select_kb(groups, back_to="admin:back", forward_mode=True)
+			)
 		else:
 			rows = await db.list_cards()
 			cards = [(r[0], r[1]) for r in rows]
 			await state.set_state(ForwardBindStates.waiting_select_card)
 			await state.update_data(hidden_user_name=hidden_name, reply_only=False, existing_user_id=None)
-			await message.answer(f"❌ Пользователь не найден в БД.\n\nГрупп пока нет. Выберите карту для привязки:", reply_markup=cards_select_kb(cards, back_to="admin:back"))
+			await message.answer(
+				"❌ Пользователь не найден в БД.\n\nГрупп пока нет. Выберите карту для привязки:",
+				reply_markup=cards_select_kb(cards, back_to="admin:back")
+			)
 
 
 @admin_router.callback_query(F.data.startswith("question:reply:"))
@@ -8135,6 +8500,7 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 	user_name = question.get("user_name", "Не указано")
 	user_username = question.get("user_username", "Не указано")
 	question_text = question["question_text"]
+	initiated_by_admin = bool(question.get("initiated_by_admin"))
 	
 	# Получаем информацию о последней сделке и профите пользователя
 	last_order_info = ""
@@ -8150,10 +8516,12 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 					# Получаем информацию о последней сделке
 					last_order = await db.get_order_by_id(last_order_id)
 					if last_order:
-						crypto_display = last_order.get("crypto_display", "")
-						amount = last_order.get("amount", 0)
-						amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
-						last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+						last_created_at = last_order.get("created_at")
+						if last_created_at:
+							last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+						else:
+							last_order_date = "неизвестно"
+						last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 						
 						if last_order_profit is not None:
 							try:
@@ -8174,13 +8542,21 @@ async def question_reply_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
 		logger.debug(f"Ошибка получения информации о последней сделке: {e}")
 	
 	# Формируем сообщение для админа с историей
-	question_info = (
-		f"❓ <b>Вопрос от пользователя</b>\n\n"
-		f"👤 Имя: {user_name}\n"
-		f"📱 Username: @{user_username}\n"
-		f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
-		f"💬 <b>Вопрос:</b>\n{question_text}"
-	)
+	if initiated_by_admin:
+		question_info = (
+			f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+			f"👤 Имя: {user_name}\n"
+			f"📱 Username: @{user_username}\n"
+			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}"
+		)
+	else:
+		question_info = (
+			f"❓ <b>Вопрос от пользователя</b>\n\n"
+			f"👤 Имя: {user_name}\n"
+			f"📱 Username: @{user_username}\n"
+			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
+			f"💬 <b>Вопрос:</b>\n{question_text}"
+		)
 	
 	# Добавляем историю переписки
 	history_lines = []
@@ -8623,11 +8999,18 @@ async def question_complete(cb: CallbackQuery, bot: Bot):
 	user_tg_id = question["user_tg_id"]
 	
 	try:
-		await bot.send_message(
-			chat_id=user_tg_id,
-			text="✅ Ваш вопрос закрыт администратором.\n\nСпасибо за обращение!",
-			parse_mode="HTML"
-		)
+		if question.get("initiated_by_admin"):
+			await bot.send_message(
+				chat_id=user_tg_id,
+				text="✅ Диалог завершен администратором.",
+				parse_mode="HTML"
+			)
+		else:
+			await bot.send_message(
+				chat_id=user_tg_id,
+				text="✅ Ваш вопрос закрыт администратором.\n\nСпасибо за обращение!",
+				parse_mode="HTML"
+			)
 		logger.info(f"✅ Вопрос {question_id} закрыт, уведомление отправлено пользователю {user_tg_id}")
 	except Exception as e:
 		logger.error(f"❌ Ошибка отправки уведомления пользователю {user_tg_id}: {e}", exc_info=True)

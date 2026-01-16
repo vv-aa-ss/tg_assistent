@@ -7,7 +7,7 @@ import glob
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery
+from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery, ForceReply
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -792,31 +792,64 @@ async def main() -> None:
 		selected_country = data.get("selected_country", "RUB")
 		
 		# Получаем курс USD к валюте (сколько единиц валюты за 1 USD)
-		# Формула: (цена_монеты_в_USD + процент) × количество_монет × курс_валюты_к_USD
 		if selected_country == "BYN":
-			# Курс USD к BYN (1 USD = 3.00 BYN)
-			usd_to_currency_rate = 3.0  # Можно получать из API
+			usd_to_currency_rate_str = await db_local.get_setting("buy_usd_to_byn_rate", "2.97")
+			try:
+				usd_to_currency_rate = float(usd_to_currency_rate_str) if usd_to_currency_rate_str else 2.97
+			except (ValueError, TypeError):
+				usd_to_currency_rate = 2.97
 			currency_symbol = "Br"
 		else:  # RUB
-			# Курс USD к RUB (1 USD = ~95 RUB)
-			usd_to_currency_rate = 95.0  # Можно получать из API
+			usd_to_currency_rate_str = await db_local.get_setting("buy_usd_to_rub_rate", "95")
+			try:
+				usd_to_currency_rate = float(usd_to_currency_rate_str) if usd_to_currency_rate_str else 95.0
+			except (ValueError, TypeError):
+				usd_to_currency_rate = 95.0
 			currency_symbol = "₽"
 		
 		# Рассчитываем сумму заказа в USD для определения процента наценки
 		amount_usd = amount * crypto_price_usd
 		
+		# Проверяем минимальную сумму сделки
+		min_usd_str = await db_local.get_setting("buy_min_usd", "15")
+		try:
+			min_usd = float(min_usd_str) if min_usd_str else 15.0
+		except (ValueError, TypeError):
+			min_usd = 15.0
+		if amount_usd < min_usd:
+			await send_and_save_message(
+				message,
+				f"❌ Минимальная сумма сделки {min_usd}$.\n"
+				f"Введите сумму больше {min_usd}$:",
+				state=state
+			)
+			return
+		
 		# Определяем процент наценки в зависимости от суммы заказа
-		# Если сумма < 100 USD: используем markup_percent_small (по умолчанию 20%)
-		# Если сумма >= 100 USD: используем markup_percent_large (по умолчанию 15%)
-		if amount_usd < 100:
-			markup_percent_key = "markup_percent_small"
-			default_markup = 20
-		else:
-			markup_percent_key = "markup_percent_large"
+		if amount_usd <= 100:
+			markup_percent_key = "buy_markup_percent_small"
 			default_markup = 15
+		elif amount_usd <= 449:
+			markup_percent_key = "buy_markup_percent_101_449"
+			default_markup = 11
+		elif amount_usd <= 699:
+			markup_percent_key = "buy_markup_percent_450_699"
+			default_markup = 9
+		elif amount_usd <= 999:
+			markup_percent_key = "buy_markup_percent_700_999"
+			default_markup = 8
+		elif amount_usd <= 1499:
+			markup_percent_key = "buy_markup_percent_1000_1499"
+			default_markup = 7
+		elif amount_usd <= 1999:
+			markup_percent_key = "buy_markup_percent_1500_1999"
+			default_markup = 6
+		else:
+			markup_percent_key = "buy_markup_percent_2000_plus"
+			default_markup = 5
 		
 		# Получаем процент наценки из БД
-		markup_percent_str = await db_local.get_google_sheets_setting(markup_percent_key, str(default_markup))
+		markup_percent_str = await db_local.get_setting(markup_percent_key, str(default_markup))
 		try:
 			markup_percent = float(markup_percent_str) if markup_percent_str else default_markup
 		except (ValueError, TypeError):
@@ -825,12 +858,92 @@ async def main() -> None:
 		# Рассчитываем цену монеты с наценкой: цена_USD × (1 + процент/100)
 		crypto_price_with_markup = crypto_price_usd * (1 + markup_percent / 100)
 		
-		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты
-		amount_currency = crypto_price_with_markup * amount * usd_to_currency_rate
+		# Рассчитываем итоговую сумму в USD после наценки
+		total_usd = crypto_price_with_markup * amount
+		
+		# Алерт админу при больших суммах (после ввода суммы)
+		try:
+			alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+			alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+		except (ValueError, TypeError):
+			alert_threshold = 400.0
+		
+		if total_usd >= alert_threshold:
+			alert_text = (
+				f"🚨 <b>Крупная заявка</b>\n\n"
+				f"Пользователь: {message.from_user.full_name or 'Не указано'} (@{message.from_user.username or 'нет'})\n"
+				f"Сумма: {total_usd:.2f}$\n"
+				f"Крипта: {crypto_display}\n"
+				f"Кол-во: {amount}"
+			)
+			from aiogram.utils.keyboard import InlineKeyboardBuilder
+			kb = InlineKeyboardBuilder()
+			kb.button(text="💬 Написать", callback_data=f"alert:message:{message.from_user.id}")
+			admin_ids = get_admin_ids()
+			for admin_id in admin_ids:
+				try:
+					await message.bot.send_message(
+						chat_id=admin_id,
+						text=alert_text,
+						parse_mode=ParseMode.HTML,
+						reply_markup=kb.as_markup()
+					)
+				except Exception as e:
+					logging.getLogger("app.main").warning(
+						f"⚠️ Не удалось отправить алерт админу {admin_id}: {e}"
+					)
+		
+		# Дополнительные комиссии по порогам USD
+		extra_fee_usd_low_str = await db_local.get_setting("buy_extra_fee_usd_low", "50")
+		extra_fee_usd_mid_str = await db_local.get_setting("buy_extra_fee_usd_mid", "67")
+		try:
+			extra_fee_usd_low = float(extra_fee_usd_low_str) if extra_fee_usd_low_str else 50.0
+		except (ValueError, TypeError):
+			extra_fee_usd_low = 50.0
+		try:
+			extra_fee_usd_mid = float(extra_fee_usd_mid_str) if extra_fee_usd_mid_str else 67.0
+		except (ValueError, TypeError):
+			extra_fee_usd_mid = 67.0
+		
+		if selected_country == "BYN":
+			fee_low_str = await db_local.get_setting("buy_extra_fee_low_byn", "10")
+			fee_mid_str = await db_local.get_setting("buy_extra_fee_mid_byn", "5")
+			try:
+				fee_low = float(fee_low_str) if fee_low_str else 10.0
+			except (ValueError, TypeError):
+				fee_low = 10.0
+			try:
+				fee_mid = float(fee_mid_str) if fee_mid_str else 5.0
+			except (ValueError, TypeError):
+				fee_mid = 5.0
+		else:
+			fee_low_str = await db_local.get_setting("buy_extra_fee_low_rub", "10")
+			fee_mid_str = await db_local.get_setting("buy_extra_fee_mid_rub", "5")
+			try:
+				fee_low = float(fee_low_str) if fee_low_str else 10.0
+			except (ValueError, TypeError):
+				fee_low = 10.0
+			try:
+				fee_mid = float(fee_mid_str) if fee_mid_str else 5.0
+			except (ValueError, TypeError):
+				fee_mid = 5.0
+		
+		extra_fee_currency = 0.0
+		if total_usd < extra_fee_usd_low:
+			extra_fee_currency = fee_low
+		elif total_usd < extra_fee_usd_mid:
+			extra_fee_currency = fee_mid
+		
+		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты + доп. комиссия
+		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
 		
 		# Логируем расчет для отладки
 		logger = logging.getLogger("app.main")
-		logger.debug(f"Расчет: ({crypto_price_usd} USD + {markup_percent}%) × {amount} {crypto_type} × {usd_to_currency_rate} {currency_symbol}/USD = {amount_currency} {currency_symbol}")
+		logger.debug(
+			f"Расчет: ({crypto_price_usd} USD + {markup_percent}%) × {amount} {crypto_type} = {total_usd} USD; "
+			f"курс {usd_to_currency_rate} {currency_symbol}/USD, доп. комиссия {extra_fee_currency} {currency_symbol}; "
+			f"итого {amount_currency} {currency_symbol}"
+		)
 		
 		# Сохраняем данные о сделке
 		await state.update_data(
@@ -841,6 +954,8 @@ async def main() -> None:
 			crypto_price_usd=crypto_price_usd,
 			crypto_price_with_markup=crypto_price_with_markup,
 			markup_percent=markup_percent,
+			total_usd=total_usd,
+			extra_fee_currency=extra_fee_currency,
 			selected_country=selected_country,
 			currency_symbol=currency_symbol,
 			usd_to_currency_rate=usd_to_currency_rate
@@ -929,6 +1044,9 @@ async def main() -> None:
 		# Переходим в состояние ожидания адреса кошелька
 		await state.set_state(BuyStates.waiting_wallet_address)
 		
+		# Убираем клавиатуру подтверждения
+		await send_and_save_message(message, "✅ Принято.", reply_markup=ReplyKeyboardRemove(), state=state)
+		
 		# Объединяем уведомление о заказе и запрос адреса в одно сообщение
 		wallet_request = f"Введите адрес кошелька для {crypto_display}:"
 		combined_message = f"{order_notification}\n\n{wallet_request}"
@@ -947,10 +1065,23 @@ async def main() -> None:
 		# Удаляем сообщение пользователя
 		await delete_user_message(message)
 		
+		# Убираем клавиатуру подтверждения
+		await send_and_save_message(message, "❌ Отменено.", reply_markup=ReplyKeyboardRemove(), state=state)
+		
 		# Возвращаемся в главное меню
 		from app.keyboards import client_menu_kb
 		await state.clear()
 		await send_and_save_message(message, "Выберите действие:", reply_markup=client_menu_kb(), state=state)
+
+	@dp.message(BuyStates.waiting_confirmation)
+	async def on_buy_confirm_other(message: Message, state: FSMContext):
+		"""Обработчик прочих сообщений на шаге подтверждения"""
+		data = await state.get_data()
+		pending_question_id = data.get("pending_question_reply_id")
+		pending_prompt_id = data.get("pending_question_reply_prompt_id")
+		if pending_question_id and message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id:
+			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
+			return
 	
 	@dp.message(BuyStates.waiting_wallet_address)
 	async def on_wallet_address_entered(message: Message, state: FSMContext):
@@ -960,6 +1091,14 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		
+		# Если это ответ на запрос сообщения админу, обрабатываем как чат
+		data = await state.get_data()
+		pending_question_id = data.get("pending_question_reply_id")
+		pending_prompt_id = data.get("pending_question_reply_prompt_id")
+		if pending_question_id and message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id:
+			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
 			return
 		
 		# Проверяем, не является ли это командой - если да, пропускаем обработку
@@ -1385,10 +1524,12 @@ async def main() -> None:
 						# Получаем информацию о последней сделке
 						last_order = await db_local.get_order_by_id(last_order_id)
 						if last_order:
-							last_crypto_display = last_order.get("crypto_display", "")
-							last_amount = last_order.get("amount", 0)
-							last_amount_str = f"{last_amount:.8f}".rstrip('0').rstrip('.') if last_amount < 1 else f"{last_amount:.2f}".rstrip('0').rstrip('.')
-							last_order_info = f"\n📦 Последнее обращение: {last_amount_str} {last_crypto_display}"
+							last_created_at = last_order.get("created_at")
+							if last_created_at:
+								last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+							else:
+								last_order_date = "неизвестно"
+							last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 							
 							if last_order_profit is not None:
 								try:
@@ -1530,10 +1671,12 @@ async def main() -> None:
 						# Получаем информацию о последней сделке
 						last_order = await db_local.get_order_by_id(last_order_id)
 						if last_order:
-							crypto_display = last_order.get("crypto_display", "")
-							amount = last_order.get("amount", 0)
-							amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
-							last_order_info = f"\n📦 Последнее обращение: {amount_str} {crypto_display}"
+							last_created_at = last_order.get("created_at")
+							if last_created_at:
+								last_order_date = datetime.fromtimestamp(last_created_at).strftime("%d.%m.%Y %H:%M")
+							else:
+								last_order_date = "неизвестно"
+							last_order_info = f"\n📦 Последнее обращение: {last_order_date}"
 							
 							if last_order_profit is not None:
 								try:
@@ -1607,9 +1750,10 @@ async def main() -> None:
 			messages = await db_local.get_question_messages(question_id)
 			
 			# Формируем информацию о вопросе
-			question_info = (
-				f"❓ <b>Ваш вопрос</b>\n\n"
-			)
+			if question.get("initiated_by_admin"):
+				question_info = "💬 <b>Сообщение администратора</b>\n\n"
+			else:
+				question_info = "❓ <b>Ваш вопрос</b>\n\n"
 			
 			# Добавляем историю переписки
 			history_lines = []
@@ -2597,20 +2741,100 @@ async def main() -> None:
 		logger_main = logging.getLogger("app.main")
 		logger_main.info(f"🔵 USER_REPLY: Проверка обновления сообщения админа: admin_ids={admin_ids}, admin_message_id={order.get('admin_message_id')}")
 		if admin_ids and order.get("admin_message_id"):
+			user_name = order.get("user_name", "Не указано")
+			user_username = order.get("user_username", "Не указано")
+			user_tg_id = order["user_tg_id"]
+			wallet_address = order.get("wallet_address", "")
+			
+			admin_order_info = (
+				f"Имя пользователя: {user_name or 'Не указано'}\n"
+				f"Username: @{user_username}\n\n"
+				f"Количество монет: {amount_str} {crypto_display}\n"
+				f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+				f"Адрес кошелька: <code>{wallet_address}</code>"
+			)
+		
+		# Алерт по крупной заявке (с кнопкой "Написать", когда есть order_id)
+		try:
+			alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+			alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+		except (ValueError, TypeError):
+			alert_threshold = 400.0
+		
+		total_usd = data.get("total_usd")
+		if total_usd is None:
+			crypto_price_with_markup = data.get("crypto_price_with_markup")
+			if crypto_price_with_markup:
+				total_usd = crypto_price_with_markup * amount
+			else:
+				crypto_price_usd = data.get("crypto_price_usd", 0)
+				markup_percent = data.get("markup_percent", 0)
+				amount_usd = amount * crypto_price_usd
+				total_usd = amount_usd * (1 + (markup_percent / 100))
+		
+		if total_usd and total_usd >= alert_threshold:
+			alert_text = (
+				f"🚨 <b>Крупная заявка</b>\n\n"
+				f"Номер заявки: {order_number}\n"
+				f"Пользователь: {user_name or 'Не указано'} (@{user_username})\n"
+				f"Сумма: {total_usd:.2f}$\n"
+				f"Крипта: {crypto_display}\n"
+				f"Кол-во: {amount}"
+			)
+			admin_ids = get_admin_ids()
+			for admin_id in admin_ids:
+				try:
+					await message.bot.send_message(
+						chat_id=admin_id,
+						text=alert_text,
+						parse_mode=ParseMode.HTML,
+						reply_markup=order_action_kb(order_id, expanded=True)
+					)
+				except Exception as e:
+					logging.getLogger("app.main").warning(
+						f"⚠️ Не удалось отправить алерт админу {admin_id}: {e}"
+					)
+			
+			# Алерт, если сумма в USD превышает порог
 			try:
-				user_name = order.get("user_name", "Не указано")
-				user_username = order.get("user_username", "Не указано")
-				user_tg_id = order["user_tg_id"]
-				wallet_address = order.get("wallet_address", "")
-				
-				admin_order_info = (
-					f"Имя пользователя: {user_name or 'Не указано'}\n"
-					f"Username: @{user_username}\n\n"
-					f"Количество монет: {amount_str} {crypto_display}\n"
-					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-					f"Адрес кошелька: <code>{wallet_address}</code>"
+				alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+				alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+			except (ValueError, TypeError):
+				alert_threshold = 400.0
+			
+			total_usd = data.get("total_usd")
+			if total_usd is None:
+				crypto_price_with_markup = data.get("crypto_price_with_markup")
+				if crypto_price_with_markup:
+					total_usd = crypto_price_with_markup * amount
+				else:
+					crypto_price_usd = data.get("crypto_price_usd", 0)
+					markup_percent = data.get("markup_percent", 0)
+					amount_usd = amount * crypto_price_usd
+					total_usd = amount_usd * (1 + (markup_percent / 100))
+			
+			if total_usd and total_usd >= alert_threshold:
+				alert_text = (
+					f"🚨 <b>Крупная заявка</b>\n\n"
+					f"Номер заявки: {order_number}\n"
+					f"Пользователь: {user_name or 'Не указано'} (@{user_username})\n"
+					f"Сумма: {total_usd:.2f}$\n"
+					f"Крипта: {crypto_display}\n"
+					f"Кол-во: {amount}"
 				)
-				
+				for admin_id in admin_ids:
+					try:
+						await message.bot.send_message(
+							chat_id=admin_id,
+							text=alert_text,
+							parse_mode=ParseMode.HTML
+						)
+					except Exception as e:
+						logging.getLogger("app.main").warning(
+							f"⚠️ Не удалось отправить алерт админу {admin_id}: {e}"
+						)
+			
+			try:
 				admin_history_lines = []
 				for msg in messages:
 					if msg["sender_type"] == "admin":
@@ -3101,15 +3325,25 @@ async def main() -> None:
 				user_name = question.get("user_name", "Не указано")
 				user_username = question.get("user_username", "Не указано")
 				question_text = question["question_text"]
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
 				
 				# Формируем исходное сообщение о вопросе
-				question_info = (
-					f"❓ <b>Вопрос от пользователя</b>\n\n"
-					f"👤 Имя: {user_name}\n"
-					f"📱 Username: @{user_username}\n"
-					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
-					f"💬 <b>Вопрос:</b>\n{question_text}"
-				)
+				if initiated_by_admin:
+					question_info = (
+						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>"
+					)
+				else:
+					question_info = (
+						f"❓ <b>Вопрос от пользователя</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+						f"💬 <b>Вопрос:</b>\n{question_text}"
+					)
 				
 				# Обновляем сообщение админа с историей переписки
 				from app.keyboards import question_reply_kb
@@ -3143,9 +3377,10 @@ async def main() -> None:
 		if user_message_id:
 			try:
 				# Формируем полное сообщение для пользователя
-				question_info = (
-					f"❓ <b>Ваш вопрос</b>\n\n"
-				)
+				if question.get("initiated_by_admin"):
+					question_info = "💬 <b>Сообщение администратора</b>\n\n"
+				else:
+					question_info = "❓ <b>Ваш вопрос</b>\n\n"
 				
 				# Получаем обновленную историю переписки
 				updated_messages = await db_local.get_question_messages(question_id)
@@ -3205,6 +3440,20 @@ async def main() -> None:
 			await cb.answer("Вопрос уже завершен", show_alert=True)
 			return
 		
+		# Если пользователь в процессе покупки, не меняем состояние покупки
+		current_state = await state.get_state()
+		if current_state in (BuyStates.waiting_confirmation.state, BuyStates.waiting_wallet_address.state):
+			prompt_msg = await cb.message.answer(
+				"📝 Напишите сообщение администратору:",
+				reply_markup=ForceReply(selective=True)
+			)
+			await state.update_data(
+				pending_question_reply_id=question_id,
+				pending_question_reply_prompt_id=prompt_msg.message_id
+			)
+			await cb.answer()
+			return
+		
 		# Сохраняем question_id в состоянии
 		await state.update_data(question_id=question_id)
 		
@@ -3230,6 +3479,175 @@ async def main() -> None:
 		)
 		await cb.answer()
 	
+	async def _handle_question_user_reply(message: Message, state: FSMContext, question_id: int, keep_state: bool) -> None:
+		"""Отправка ответа пользователя по вопросу без смены состояния покупки"""
+		if not message.from_user:
+			return
+		
+		# Проверяем, не является ли это командой - если да, пропускаем обработку
+		if message.text and message.text.startswith("/"):
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		
+		# Получаем текст ответа
+		reply_text = message.text or message.caption or ""
+		if not reply_text.strip():
+			await message.answer("❌ Пожалуйста, введите текст ответа.")
+			return
+		
+		# Получаем информацию о вопросе
+		question = await db_local.get_question_by_id(question_id)
+		if not question:
+			await message.answer("❌ Вопрос не найден")
+			if keep_state:
+				await state.update_data(pending_question_reply_id=None, pending_question_reply_prompt_id=None)
+			else:
+				await state.clear()
+			return
+		
+		# Проверяем, что вопрос принадлежит пользователю
+		if question["user_tg_id"] != message.from_user.id:
+			await message.answer("❌ Ошибка доступа")
+			if keep_state:
+				await state.update_data(pending_question_reply_id=None, pending_question_reply_prompt_id=None)
+			else:
+				await state.clear()
+			return
+		
+		# Проверяем, не закрыт ли вопрос
+		if question.get("completed_at"):
+			await message.answer("❌ Вопрос уже закрыт. Вы не можете отправлять сообщения по закрытому вопросу.")
+			if keep_state:
+				await state.update_data(pending_question_reply_id=None, pending_question_reply_prompt_id=None)
+			else:
+				await state.clear()
+			return
+		
+		# Сохраняем сообщение в истории переписки
+		await db_local.add_question_message(question_id, "user", reply_text)
+		
+		# Получаем всю историю переписки
+		messages = await db_local.get_question_messages(question_id)
+		
+		# Формируем сообщение для пользователя: информация + история
+		if question.get("initiated_by_admin"):
+			question_info = "💬 <b>Сообщение администратора</b>\n\n"
+		else:
+			question_info = "❓ <b>Ваш вопрос</b>\n\n"
+		
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+		
+		history_text = "\n\n".join(history_lines)
+		user_message = question_info + history_text
+		
+		# Обновляем сообщение пользователя
+		from app.keyboards import question_user_reply_kb
+		try:
+			user_message_id = question.get("user_message_id")
+			if user_message_id:
+				await message.bot.edit_message_text(
+					chat_id=message.from_user.id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=question_user_reply_kb(question_id)
+				)
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
+		
+		# Обновляем сообщение админа
+		admin_ids = get_admin_ids()
+		if admin_ids and question.get("admin_message_id"):
+			try:
+				user_name = question.get("user_name", "Не указано")
+				user_username = question.get("user_username", "Не указано")
+				user_tg_id = question["user_tg_id"]
+				question_text = question["question_text"]
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
+				
+				if initiated_by_admin:
+					admin_question_info = (
+						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>"
+					)
+				else:
+					admin_question_info = (
+						f"❓ <b>Вопрос от пользователя</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+						f"💬 <b>Вопрос:</b>\n{question_text}"
+					)
+				
+				admin_history_lines = []
+				for msg in messages:
+					if msg["sender_type"] == "admin":
+						admin_history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+					else:
+						admin_history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+				
+				admin_history_text = "\n\n".join(admin_history_lines)
+				admin_message = admin_question_info + "\n\n" + admin_history_text
+				
+				from app.keyboards import question_reply_kb
+				# Отправляем уведомление перед обновлением
+				try:
+					notif_msg = await message.bot.send_message(
+						chat_id=admin_ids[0],
+						text="💬 <b>Новое сообщение от пользователя</b>",
+						parse_mode="HTML"
+					)
+					notification_ids[(admin_ids[0], question_id, 'question')] = notif_msg.message_id
+				except Exception as e:
+					logger_main = logging.getLogger("app.main")
+					logger_main.warning(f"⚠️ Не удалось отправить уведомление админу {admin_ids[0]}: {e}")
+				
+				await message.bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=question["admin_message_id"],
+					text=admin_message,
+					parse_mode="HTML",
+					reply_markup=question_reply_kb(question_id)
+				)
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		if keep_state:
+			current_state = await state.get_state()
+			await state.update_data(pending_question_reply_id=None, pending_question_reply_prompt_id=None)
+			if current_state == BuyStates.waiting_confirmation.state:
+				data = await state.get_data()
+				amount = data.get("amount", 0)
+				amount_currency = data.get("amount_currency", 0)
+				crypto_display = data.get("crypto_display", "")
+				currency_symbol = data.get("currency_symbol", "")
+				if amount < 1:
+					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
+				else:
+					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+				confirmation_text = (
+					f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+					f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+				)
+				from app.keyboards import buy_confirmation_kb
+				await message.answer(confirmation_text, reply_markup=buy_confirmation_kb())
+		else:
+			await state.clear()
+
 	@dp.message(QuestionUserReplyStates.waiting_reply)
 	async def on_question_user_reply_send(message: Message, state: FSMContext):
 		"""Обработчик отправки ответа пользователя на вопрос админа"""
@@ -3284,9 +3702,10 @@ async def main() -> None:
 		messages = await db_local.get_question_messages(question_id)
 		
 		# Формируем полное сообщение для пользователя: информация о вопросе + история
-		question_info = (
-			f"❓ <b>Ваш вопрос</b>\n\n"
-		)
+		if question.get("initiated_by_admin"):
+			question_info = "💬 <b>Сообщение администратора</b>\n\n"
+		else:
+			question_info = "❓ <b>Ваш вопрос</b>\n\n"
 		
 		# Добавляем историю переписки
 		history_lines = []
@@ -3323,14 +3742,23 @@ async def main() -> None:
 				user_username = question.get("user_username", "Не указано")
 				user_tg_id = question["user_tg_id"]
 				question_text = question["question_text"]
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
 				
-				admin_question_info = (
-					f"❓ <b>Вопрос от пользователя</b>\n\n"
-					f"👤 Имя: {user_name}\n"
-					f"📱 Username: @{user_username}\n"
-					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
-					f"💬 <b>Вопрос:</b>\n{question_text}"
-				)
+				if initiated_by_admin:
+					admin_question_info = (
+						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>"
+					)
+				else:
+					admin_question_info = (
+						f"❓ <b>Вопрос от пользователя</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+						f"💬 <b>Вопрос:</b>\n{question_text}"
+					)
 				
 				admin_history_lines = []
 				for msg in messages:

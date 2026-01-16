@@ -16,6 +16,7 @@
 					user_name TEXT,
 					user_username TEXT,
 					question_text TEXT NOT NULL,
+					initiated_by_admin INTEGER NOT NULL DEFAULT 0,
 					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
 					completed_at INTEGER,
 					admin_message_id INTEGER,
@@ -41,6 +42,9 @@
 			if 'user_message_id' not in columns:
 				await self._db.execute("ALTER TABLE questions ADD COLUMN user_message_id INTEGER")
 				_logger.debug("Added column user_message_id to questions table")
+			if 'initiated_by_admin' not in columns:
+				await self._db.execute("ALTER TABLE questions ADD COLUMN initiated_by_admin INTEGER NOT NULL DEFAULT 0")
+				_logger.debug("Added column initiated_by_admin to questions table")
 	
 	async def _ensure_question_messages_table(self) -> None:
 		"""Создает таблицу для хранения сообщений по вопросам"""
@@ -73,6 +77,7 @@
 		user_username: str,
 		question_text: str,
 		admin_message_id: int = None,
+		initiated_by_admin: int = 0,
 	) -> int:
 		"""
 		Создает новый вопрос и возвращает его ID.
@@ -92,16 +97,17 @@
 		# Создаем вопрос
 		cur = await self._db.execute(
 			"""
-			INSERT INTO questions (question_number, user_tg_id, user_name, user_username, question_text, admin_message_id)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO questions (question_number, user_tg_id, user_name, user_username, question_text, admin_message_id, initiated_by_admin)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			""",
-			(question_number, user_tg_id, user_name, user_username, question_text, admin_message_id)
+			(question_number, user_tg_id, user_name, user_username, question_text, admin_message_id, initiated_by_admin)
 		)
 		await self._db.commit()
 		question_id = cur.lastrowid
 		
-		# Сохраняем первое сообщение (вопрос пользователя)
-		await self.add_question_message(question_id, "user", question_text)
+		# Сохраняем первое сообщение (вопрос пользователя), если это не инициировано админом
+		if not initiated_by_admin:
+			await self.add_question_message(question_id, "user", question_text)
 		
 		return question_id
 	
@@ -111,7 +117,7 @@
 		cur = await self._db.execute(
 			"""
 			SELECT id, question_number, user_tg_id, user_name, user_username, question_text,
-				created_at, completed_at, admin_message_id, user_message_id
+				initiated_by_admin, created_at, completed_at, admin_message_id, user_message_id
 			FROM questions
 			WHERE id = ?
 			""",
@@ -127,10 +133,11 @@
 			"user_name": row[3],
 			"user_username": row[4],
 			"question_text": row[5],
-			"created_at": row[6],
-			"completed_at": row[7],
-			"admin_message_id": row[8],
-			"user_message_id": row[9] if len(row) > 9 else None,
+			"initiated_by_admin": row[6],
+			"created_at": row[7],
+			"completed_at": row[8],
+			"admin_message_id": row[9],
+			"user_message_id": row[10] if len(row) > 10 else None,
 		}
 	
 	async def add_question_message(
