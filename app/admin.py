@@ -471,6 +471,18 @@ class AlertMessageStates(StatesGroup):
 	"""Состояние для отправки сообщения пользователю из раннего алерта"""
 	waiting_message = State()
 
+class AlertRequisitesStates(StatesGroup):
+	"""Состояние для выбора реквизитов для крупной заявки"""
+	waiting_card = State()
+
+class AlertAmountStates(StatesGroup):
+	"""Состояние для установки суммы для крупной заявки"""
+	waiting_amount = State()
+
+class AlertCryptoStates(StatesGroup):
+	"""Состояние для установки количества монет для крупной заявки"""
+	waiting_crypto = State()
+
 
 class CardGroupStates(StatesGroup):
 	waiting_group_name = State()
@@ -2011,9 +2023,50 @@ async def alert_message_start(cb: CallbackQuery, state: FSMContext):
 	await state.update_data(alert_user_tg_id=user_tg_id)
 	await state.set_state(AlertMessageStates.waiting_message)
 	
+	# Получаем текущее состояние пользователя для определения этапа
+	from app.main import get_user_stage_name
+	from aiogram.fsm.storage.base import StorageKey
+	
+	stage_name = "Неизвестно"
+	try:
+		# Получаем storage из dispatcher
+		storage = state.storage
+		if storage:
+			# Формируем key для получения состояния пользователя
+			bot_id = cb.message.bot.id
+			key = StorageKey(
+				bot_id=bot_id,
+				chat_id=user_tg_id,
+				user_id=user_tg_id
+			)
+			state_data = await storage.get_state(key)
+			if state_data:
+				stage_name = get_user_stage_name(str(state_data))
+	except Exception as e:
+		logger.debug(f"Не удалось получить этап пользователя: {e}")
+	
+	# Обновляем сообщение, добавляя/обновляя информацию об этапе
+	message_text = cb.message.text or ""
+	
+	# Если в сообщении уже есть этап, обновляем его
+	if "📍" in message_text:
+		lines = message_text.split("\n")
+		new_lines = []
+		for line in lines:
+			if "📍" in line:
+				new_lines.append(f"📍 <b>Этап:</b> {stage_name}")
+			else:
+				new_lines.append(line)
+		message_text = "\n".join(new_lines)
+	else:
+		# Добавляем этап в конец сообщения перед добавлением текста о вводе
+		message_text = message_text.rstrip()
+		if message_text:
+			message_text += f"\n\n📍 <b>Этап:</b> {stage_name}"
+	
 	await safe_edit_text(
 		cb.message,
-		(cb.message.text or "") + "\n\n📝 Введите ваше сообщение пользователю:",
+		message_text + "\n\n📝 Введите ваше сообщение пользователю:",
 		parse_mode="HTML",
 		reply_markup=cb.message.reply_markup
 	)
@@ -2042,61 +2095,850 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 	
 	db = get_db()
 	try:
-		# Создаем вопрос, чтобы включить функционал переписки как в /questions
+		# Получаем информацию о пользователе
 		user_id = await db.get_user_id_by_tg(user_tg_id)
 		user = await db.get_user_by_id(user_id) if user_id else None
 		user_name = (user or {}).get("full_name") or "Не указано"
 		user_username = (user or {}).get("username") or "Не указано"
 		
-		question_id = await db.create_question(
-			user_tg_id=user_tg_id,
-			user_name=user_name,
-			user_username=user_username,
-			question_text="Сообщение администратора",
-			initiated_by_admin=1
-		)
+		# Проверяем, есть ли уже вопрос для этого пользователя
+		from app.main import large_order_alerts
+		question_id = None
+		if user_tg_id in large_order_alerts:
+			user_data = large_order_alerts[user_tg_id]
+			logger.info(f"🔍 alert_message_send: user_data={user_data}")
+			if isinstance(user_data, dict) and "question_id" in user_data:
+				question_id = user_data.get("question_id")
+				logger.info(f"🔍 alert_message_send: найден существующий question_id={question_id}")
+		
+		# Если вопроса нет, создаем новый
+		if not question_id:
+			logger.info(f"🔍 alert_message_send: создаем новый вопрос для user_tg_id={user_tg_id}")
+			question_id = await db.create_question(
+				user_tg_id=user_tg_id,
+				user_name=user_name,
+				user_username=user_username,
+				question_text="Сообщение администратора",
+				initiated_by_admin=1
+			)
+			# Сохраняем question_id в large_order_alerts
+			logger.info(f"🔍 alert_message_send: сохраняем question_id={question_id} для user_tg_id={user_tg_id}")
+			if user_tg_id not in large_order_alerts:
+				large_order_alerts[user_tg_id] = {"message_ids": {}, "question_id": question_id}
+				logger.info(f"✅ alert_message_send: создана новая запись в large_order_alerts: {large_order_alerts[user_tg_id]}")
+			else:
+				if isinstance(large_order_alerts[user_tg_id], dict):
+					if "message_ids" in large_order_alerts[user_tg_id]:
+						# Новая структура
+						large_order_alerts[user_tg_id]["question_id"] = question_id
+						logger.info(f"✅ alert_message_send: обновлен question_id в новой структуре: {large_order_alerts[user_tg_id]}")
+					else:
+						# Старая структура, конвертируем
+						old_data = large_order_alerts[user_tg_id]
+						large_order_alerts[user_tg_id] = {"message_ids": old_data, "question_id": question_id}
+						logger.info(f"✅ alert_message_send: конвертирована старая структура: {large_order_alerts[user_tg_id]}")
+				else:
+					# Старая структура (dict, но не с message_ids)
+					old_data = large_order_alerts[user_tg_id]
+					large_order_alerts[user_tg_id] = {"message_ids": old_data, "question_id": question_id}
+					logger.info(f"✅ alert_message_send: конвертирована старая структура (не dict): {large_order_alerts[user_tg_id]}")
+		
+		# Добавляем сообщение в историю переписки
 		await db.add_question_message(question_id, "admin", text)
 		
-		from app.keyboards import question_user_reply_kb, question_reply_kb
+		from app.keyboards import question_user_reply_kb
 		
-		# Сообщение пользователю с кнопкой "Ответить"
-		user_msg = await bot.send_message(
-			chat_id=user_tg_id,
-			text=text,
-			reply_markup=question_user_reply_kb(question_id)
-		)
-		await db.update_question_user_message_id(question_id, user_msg.message_id)
+		# Сообщение пользователю с кнопкой "Ответить" (обновляем существующее, если есть)
+		messages = await db.get_question_messages(question_id)
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+		history_text = "\n\n".join(history_lines) if history_lines else text
+		user_message = "💬 <b>Сообщение администратора</b>\n\n" + history_text
+
+		user_message_id = None
+		question = await db.get_question_by_id(question_id)
+		if question:
+			user_message_id = question.get("user_message_id")
+
+		if user_message_id:
+			await bot.edit_message_text(
+				chat_id=user_tg_id,
+				message_id=user_message_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=question_user_reply_kb(question_id)
+			)
+		else:
+			user_msg = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_message,
+				parse_mode="HTML",
+				reply_markup=question_user_reply_kb(question_id)
+			)
+			await db.update_question_user_message_id(question_id, user_msg.message_id)
 		
-		# Сообщение админам с кнопкой "Ответить" и "Закрыть"
-		admin_message_text = (
-			f"❗ <b>Сообщение админу (ранний алерт)</b>\n\n"
-			f"👤 Имя: {user_name}\n"
-			f"📱 Username: @{user_username}\n"
-			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
-			f"💬 <b>Сообщение:</b>\n{text}"
-		)
-		
-		admin_message_id = None
-		for admin_id in admin_ids:
-			try:
-				sent_msg = await bot.send_message(
-					chat_id=admin_id,
-					text=admin_message_text,
-					parse_mode="HTML",
-					reply_markup=question_reply_kb(question_id)
+		# Обновляем сообщение о крупной заявке, добавляя переписку
+		if user_tg_id in large_order_alerts:
+			user_data = large_order_alerts[user_tg_id]
+			# Поддерживаем обратную совместимость
+			if isinstance(user_data, dict) and "message_ids" in user_data:
+				message_ids = user_data["message_ids"]
+			else:
+				message_ids = user_data
+			
+			# Получаем историю переписки
+			messages = await db.get_question_messages(question_id)
+			history_lines = []
+			for msg in messages:
+				if msg["sender_type"] == "admin":
+					history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+				else:
+					history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+			history_text = "\n\n".join(history_lines) if history_lines else ""
+			
+			# Получаем данные о заявке для формирования сообщения
+			order_id = await db.get_active_order_by_user(user_tg_id)
+			from app.main import get_user_stage_name
+			from aiogram.fsm.storage.base import StorageKey
+			
+			storage = state.storage
+			stage_name = "Неизвестно"
+			if storage:
+				try:
+					bot_id = bot.id
+					key = StorageKey(
+						bot_id=bot_id,
+						chat_id=user_tg_id,
+						user_id=user_tg_id
+					)
+					state_data = await storage.get_state(key)
+					if state_data:
+						stage_name = get_user_stage_name(str(state_data))
+				except:
+					pass
+			
+			# Формируем текст сообщения
+			if order_id:
+				order = await db.get_order_by_id(order_id)
+				if order:
+					amount_currency = order.get("amount_currency", 0)
+					currency_symbol = order.get("currency_symbol", "₽")
+					amount = order.get("amount", 0)
+					crypto_display = order.get("crypto_display", "")
+					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+					alert_text = (
+						f"🚨 <b>Крупная заявка</b>\n\n"
+						f"Пользователь: {user_name} (@{user_username or 'нет'})\n"
+						f"Сумма: {int(amount_currency)} {currency_symbol}\n"
+						f"Крипта: {crypto_display}\n"
+						f"Кол-во: {amount_str} {crypto_display}\n\n"
+						f"📍 <b>Этап:</b> {stage_name}"
+					)
+				else:
+					alert_text = (
+						f"🚨 <b>Крупная заявка</b>\n\n"
+						f"Пользователь: {user_name} (@{user_username or 'нет'})\n\n"
+						f"📍 <b>Этап:</b> {stage_name}"
+					)
+			else:
+				alert_text = (
+					f"🚨 <b>Крупная заявка</b>\n\n"
+					f"Пользователь: {user_name} (@{user_username or 'нет'})\n\n"
+					f"📍 <b>Этап:</b> {stage_name}"
 				)
-				if admin_message_id is None:
-					admin_message_id = sent_msg.message_id
-					await db.update_question_admin_message_id(question_id, admin_message_id)
-			except Exception as e:
-				logger.warning(f"⚠️ Не удалось отправить вопрос админу {admin_id}: {e}")
+			
+			# Добавляем историю переписки
+			if history_text:
+				alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+			
+			# Обновляем сообщения для всех админов
+			from aiogram.utils.keyboard import InlineKeyboardBuilder
+			kb = InlineKeyboardBuilder()
+			kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+			kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+			kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+			kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+			kb.adjust(2, 2)
+			
+			for admin_id, msg_id in message_ids.items():
+				try:
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=msg_id,
+						text=alert_text,
+						parse_mode="HTML",
+						reply_markup=kb.as_markup()
+					)
+				except Exception as e:
+					logger.warning(f"⚠️ Не удалось обновить сообщение о крупной заявке для админа {admin_id}: {e}")
 		
-		await message.answer("✅ Сообщение отправлено пользователю (с возможностью ответа).")
+		# Удаляем сообщение админа
+		from app.main import delete_user_message
+		await delete_user_message(message)
+		
+		await message.answer("✅ Сообщение отправлено пользователю.")
 	except Exception as e:
 		logger.error(f"❌ Ошибка отправки сообщения пользователю {user_tg_id}: {e}", exc_info=True)
 		await message.answer("❌ Не удалось отправить сообщение пользователю.")
 	
 	await state.clear()
+
+
+@admin_router.callback_query(F.data.startswith("alert:requisites:"))
+async def alert_requisites_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора реквизитов для крупной заявки"""
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем активную заявку пользователя
+	db = get_db()
+	order_id = await db.get_active_order_by_user(user_tg_id)
+	if not order_id:
+		await cb.answer("Активная заявка не найдена", show_alert=True)
+		return
+	
+	# Получаем информацию о пользователе
+	user_id = await db.get_user_id_by_tg(user_tg_id)
+	if not user_id:
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	
+	# Получаем список всех карт
+	rows = await db.list_cards()
+	cards = [(r[0], r[1]) for r in rows]
+	
+	if not cards:
+		await cb.answer("Нет доступных карт", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		alert_user_tg_id=user_tg_id,
+		alert_order_id=order_id
+	)
+	await state.set_state(AlertRequisitesStates.waiting_card)
+	
+	# Показываем список карт для выбора
+	from app.keyboards import user_cards_reply_kb
+	buttons = [(card_id, card_name) for card_id, card_name in cards]
+	await safe_edit_text(
+		cb.message,
+		"💳 Выберите карту с реквизитами для пользователя:",
+		reply_markup=user_cards_reply_kb(buttons, user_tg_id, back_to="admin:back")
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(AlertRequisitesStates.waiting_card, F.data.startswith("select:card:"))
+async def alert_requisites_select_card(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик выбора карты для реквизитов крупной заявки"""
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		card_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	user_tg_id = data.get("alert_user_tg_id")
+	order_id = data.get("alert_order_id")
+	
+	if not user_tg_id or not order_id:
+		await cb.answer("Ошибка: не найдены данные заявки", show_alert=True)
+		await state.clear()
+		return
+	
+	# Получаем информацию о карте
+	db = get_db()
+	card = await db.get_card_by_id(card_id)
+	if not card:
+		await cb.answer("Карта не найдена", show_alert=True)
+		return
+	
+	# Привязываем карту к пользователю (если еще не привязана)
+	user_id = await db.get_user_id_by_tg(user_tg_id)
+	if user_id:
+		user_cards = await db.list_cards_for_user(user_id)
+		card_ids = [c["card_id"] for c in user_cards]
+		if card_id not in card_ids:
+			await db.bind_user_to_card(user_id, card_id)
+			await db.log_card_delivery_by_tg(
+				user_tg_id,
+				card_id,
+				admin_id=cb.from_user.id if cb.from_user else None
+			)
+	
+	# Обновляем сообщение пользователя с новыми реквизитами
+	await _update_user_order_message(bot, order_id, db)
+	
+	await cb.answer("✅ Реквизиты обновлены")
+	await state.clear()
+	
+	# Возвращаемся к сообщению о крупной заявке
+	from app.main import large_order_alerts
+	if user_tg_id in large_order_alerts:
+		admin_id = cb.from_user.id if cb.from_user else None
+		user_data = large_order_alerts[user_tg_id]
+		# Поддерживаем обратную совместимость
+		if isinstance(user_data, dict) and "message_ids" in user_data:
+			message_ids = user_data["message_ids"]
+		else:
+			message_ids = user_data
+		if admin_id and admin_id in message_ids:
+			message_id = message_ids[admin_id]
+			try:
+				order = await db.get_order_by_id(order_id)
+				if order:
+					from app.main import get_user_stage_name
+					from aiogram.fsm.storage.base import StorageKey
+					storage = state.storage
+					stage_name = "Неизвестно"
+					state_data = {}
+					if storage:
+						try:
+							bot_id = bot.id
+							key = StorageKey(
+								bot_id=bot_id,
+								chat_id=user_tg_id,
+								user_id=user_tg_id
+							)
+							state_str = await storage.get_state(key)
+							if state_str:
+								stage_name = get_user_stage_name(str(state_str))
+							state_data = await storage.get_data(key)
+						except:
+							pass
+					
+					# Получаем историю переписки, если есть
+					question_id = user_data.get("question_id") if isinstance(user_data, dict) else None
+					history_text = ""
+					if question_id:
+						messages = await db.get_question_messages(question_id)
+						if messages:
+							history_lines = []
+							for msg in messages:
+								if msg["sender_type"] == "admin":
+									history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+								else:
+									history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+							history_text = "\n\n".join(history_lines)
+					
+					alert_text = (
+						f"🚨 <b>Крупная заявка</b>\n\n"
+						f"Пользователь: {order.get('user_name', 'Не указано')} (@{order.get('user_username', 'нет')})\n"
+						f"Сумма: {order.get('amount_currency', 0)} {order.get('currency_symbol', '₽')}\n"
+						f"Крипта: {order.get('crypto_display', '')}\n"
+						f"Кол-во: {order.get('amount', 0)}\n\n"
+						f"📍 <b>Этап:</b> {stage_name}"
+					)
+					
+					# Добавляем историю переписки, если есть
+					if history_text:
+						alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+					
+					from aiogram.utils.keyboard import InlineKeyboardBuilder
+					kb = InlineKeyboardBuilder()
+					kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+					kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+					kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+					kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+					kb.adjust(2, 2)
+					
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode="HTML",
+						reply_markup=kb.as_markup()
+					)
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось обновить сообщение о крупной заявке: {e}")
+
+
+@admin_router.callback_query(F.data.startswith("alert:amount:"))
+async def alert_amount_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик установки суммы для крупной заявки"""
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем активную заявку пользователя (может отсутствовать до этапа оплаты)
+	db = get_db()
+	order_id = await db.get_active_order_by_user(user_tg_id)
+	current_amount = 0
+	currency_symbol = "₽"
+	alert_from_state = False
+	if order_id:
+		order = await db.get_order_by_id(order_id)
+		if not order:
+			await cb.answer("Заявка не найдена", show_alert=True)
+			return
+		current_amount = order.get("amount_currency", 0)
+		currency_symbol = order.get("currency_symbol", "₽")
+	else:
+		from aiogram.fsm.storage.base import StorageKey
+		storage = bot.session.storage if hasattr(bot, "session") else None
+		if storage:
+			try:
+				key = StorageKey(bot_id=bot.id, chat_id=user_tg_id, user_id=user_tg_id)
+				state_data = await storage.get_data(key)
+				current_amount = state_data.get("final_amount", state_data.get("amount_currency", 0))
+				currency_symbol = state_data.get("currency_symbol", "₽")
+				alert_from_state = True
+			except Exception:
+				pass
+	
+	# Сохраняем данные в FSM
+	await state.update_data(
+		alert_user_tg_id=user_tg_id,
+		alert_order_id=order_id,
+		current_amount=current_amount,
+		currency_symbol=currency_symbol,
+		alert_from_state=alert_from_state
+	)
+	await state.set_state(AlertAmountStates.waiting_amount)
+	
+	try:
+		await safe_edit_text(
+			cb.message,
+			f"💰 Текущая сумма: {int(current_amount)} {currency_symbol}\n\nВведите новую сумму:",
+			reply_markup=cb.message.reply_markup
+		)
+	except Exception as e:
+		logger.warning(f"⚠️ Не удалось отредактировать сообщение для ввода суммы: {e}")
+	await cb.answer()
+
+
+@admin_router.message(AlertAmountStates.waiting_amount)
+async def alert_amount_save(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик сохранения суммы для крупной заявки"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Проверяем, не является ли это командой
+	if message.text and message.text.startswith("/"):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("alert_order_id")
+	user_tg_id = data.get("alert_user_tg_id")
+	current_amount = data.get("current_amount", 0)
+	currency_symbol = data.get("currency_symbol", "₽")
+	alert_from_state = data.get("alert_from_state", False)
+	
+	if not order_id and not user_tg_id:
+		await message.answer("❌ Ошибка: не найден ID пользователя")
+		await state.clear()
+		return
+	
+	# Валидируем введенную сумму
+	try:
+		new_amount_str = message.text.strip().replace(",", ".")
+		new_amount = float(new_amount_str)
+		if new_amount <= 0:
+			await message.answer(f"❌ Сумма должна быть больше нуля. Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите новую сумму:")
+			return
+	except ValueError:
+		await message.answer(f"❌ Неверный формат суммы. Текущая сумма: {int(current_amount)} {currency_symbol}\nВведите число (например: 5000):")
+		return
+	
+	db = get_db()
+	if order_id:
+		# Обновляем сумму в БД
+		await db._db.execute(
+			"UPDATE orders SET amount_currency = ? WHERE id = ?",
+			(new_amount, order_id)
+		)
+		await db._db.commit()
+		
+		logger.info(f"✅ Сумма крупной заявки {order_id} обновлена: {int(current_amount)} {currency_symbol} -> {int(new_amount)} {currency_symbol}")
+		
+		# Обновляем сообщение пользователя с новыми данными
+		await _update_user_order_message(bot, order_id, db)
+	else:
+		logger.info(f"✅ Сумма крупной заявки обновлена через FSM: {int(current_amount)} {currency_symbol} -> {int(new_amount)} {currency_symbol}")
+	
+	# Обновляем состояние пользователя, чтобы разрешить продолжение
+	try:
+		from aiogram.fsm.storage.base import StorageKey
+		from app.main import BuyStates
+		storage = bot.session.storage if hasattr(bot, "session") else None
+		if storage and user_tg_id:
+			key = StorageKey(bot_id=bot.id, chat_id=user_tg_id, user_id=user_tg_id)
+			state_data = await storage.get_data(key)
+			state_data["admin_amount_set"] = True
+			state_data["admin_amount_value"] = new_amount
+			state_data["amount_currency"] = new_amount
+			state_data["final_amount"] = new_amount
+			await storage.set_data(key, state_data)
+			current_state = await storage.get_state(key)
+			
+			# Если пользователь сейчас на этапах до оплаты, обновим сообщение
+			if current_state in (
+				BuyStates.waiting_confirmation.state,
+				BuyStates.waiting_wallet_address.state,
+				BuyStates.waiting_delivery_method.state,
+			):
+				amount = state_data.get("amount", 0)
+				crypto_display = state_data.get("crypto_display", "")
+				selected_country = state_data.get("selected_country", "RUB")
+				amount_str = f"{amount:.8f}".rstrip("0").rstrip(".") if amount < 1 else f"{amount:.2f}".rstrip("0").rstrip(".")
+				payment_text = f"{int(new_amount)} {currency_symbol}"
+				
+				from app.keyboards import buy_confirmation_kb, buy_delivery_method_kb
+				message_id = state_data.get("last_bot_message_id")
+				if message_id:
+					if current_state == BuyStates.waiting_confirmation.state:
+						text = (
+							f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+							f"Вам необходимо оплатить: {payment_text}"
+						)
+						await bot.edit_message_text(
+							chat_id=user_tg_id,
+							message_id=message_id,
+							text=text,
+							reply_markup=buy_confirmation_kb()
+						)
+					elif current_state == BuyStates.waiting_wallet_address.state:
+						wallet_request = f"Введите адрес кошелька для {crypto_display}:"
+						text = (
+							f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+							f"Вам необходимо оплатить: {payment_text}\n\n"
+							f"{wallet_request}"
+						)
+						await bot.edit_message_text(
+							chat_id=user_tg_id,
+							message_id=message_id,
+							text=text
+						)
+					elif current_state == BuyStates.waiting_delivery_method.state:
+						text = (
+							f"Вам будет зачислено: {amount_str} {crypto_display}\n"
+							f"Вам необходимо оплатить: {payment_text}\n\n"
+							f"Выберите способ доставки:"
+						)
+						is_byn = selected_country == "BYN"
+						await bot.edit_message_text(
+							chat_id=user_tg_id,
+							message_id=message_id,
+							text=text,
+							reply_markup=buy_delivery_method_kb(currency_symbol, is_byn)
+						)
+	except Exception as e:
+		logger.warning(f"⚠️ Не удалось обновить состояние/сообщение пользователя: {e}")
+	
+	# Обновляем сообщение о крупной заявке
+	order = await db.get_order_by_id(order_id) if order_id else None
+	if order or user_tg_id:
+		from app.main import large_order_alerts, get_user_stage_name
+		from aiogram.fsm.storage.base import StorageKey
+		if user_tg_id in large_order_alerts:
+			admin_id = message.from_user.id if message.from_user else None
+			user_data = large_order_alerts[user_tg_id]
+			# Поддерживаем обратную совместимость
+			if isinstance(user_data, dict) and "message_ids" in user_data:
+				message_ids = user_data["message_ids"]
+				question_id = user_data.get("question_id")
+			else:
+				message_ids = user_data
+				question_id = None
+			if admin_id and admin_id in message_ids:
+				message_id = message_ids[admin_id]
+				try:
+					storage = state.storage
+					stage_name = "Неизвестно"
+					if storage:
+						try:
+							bot_id = bot.id
+							key = StorageKey(
+								bot_id=bot_id,
+								chat_id=user_tg_id,
+								user_id=user_tg_id
+							)
+							state_data = await storage.get_state(key)
+							if state_data:
+								stage_name = get_user_stage_name(str(state_data))
+						except:
+							pass
+					
+					# Получаем историю переписки, если есть
+					history_text = ""
+					if question_id:
+						messages = await db.get_question_messages(question_id)
+						if messages:
+							history_lines = []
+							for msg in messages:
+								if msg["sender_type"] == "admin":
+									history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+								else:
+									history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+							history_text = "\n\n".join(history_lines)
+					
+					if order:
+						user_name = order.get("user_name", "Не указано")
+						user_username = order.get("user_username", "нет")
+						crypto_display = order.get("crypto_display", "")
+						amount = order.get("amount", 0)
+					else:
+						user_id = await db.get_user_id_by_tg(user_tg_id)
+						user = await db.get_user_by_id(user_id) if user_id else None
+						user_name = (user or {}).get("full_name", "Не указано")
+						user_username = (user or {}).get("username", "нет")
+						crypto_display = state_data.get("crypto_display", "")
+						amount = state_data.get("amount", 0)
+					
+					amount_str = f"{amount:.8f}".rstrip("0").rstrip(".") if amount < 1 else f"{amount:.2f}".rstrip("0").rstrip(".")
+					alert_text = (
+						f"🚨 <b>Крупная заявка</b>\n\n"
+						f"Пользователь: {user_name} (@{user_username})\n"
+						f"Сумма: {int(new_amount)} {currency_symbol}\n"
+						f"Крипта: {crypto_display}\n"
+						f"Кол-во: {amount_str} {crypto_display}\n\n"
+						f"📍 <b>Этап:</b> {stage_name}"
+					)
+					
+					# Добавляем историю переписки, если есть
+					if history_text:
+						alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+					
+					from aiogram.utils.keyboard import InlineKeyboardBuilder
+					kb = InlineKeyboardBuilder()
+					kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+					kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+					kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+					kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+					kb.adjust(2, 2)
+					
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode="HTML",
+						reply_markup=kb.as_markup()
+					)
+				except Exception as e:
+					logger.warning(f"⚠️ Не удалось обновить сообщение о крупной заявке: {e}")
+	
+	# Очищаем состояние
+	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	
+	await message.answer(f"✅ Сумма обновлена: {int(new_amount)} {currency_symbol}")
+
+
+@admin_router.callback_query(F.data.startswith("alert:crypto:"))
+async def alert_crypto_start(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Обработчик установки количества монет для крупной заявки"""
+	parts = cb.data.split(":")
+	if len(parts) < 3:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_tg_id = int(parts[2])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	# Получаем активную заявку пользователя
+	db = get_db()
+	order_id = await db.get_active_order_by_user(user_tg_id)
+	if not order_id:
+		await cb.answer("Активная заявка не найдена", show_alert=True)
+		return
+	
+	order = await db.get_order_by_id(order_id)
+	if not order:
+		await cb.answer("Заявка не найдена", show_alert=True)
+		return
+	
+	# Сохраняем данные в FSM
+	current_crypto_amount = order.get("amount", 0)
+	crypto_display = order.get("crypto_display", "")
+	
+	await state.update_data(
+		alert_user_tg_id=user_tg_id,
+		alert_order_id=order_id,
+		current_crypto_amount=current_crypto_amount,
+		crypto_display=crypto_display
+	)
+	await state.set_state(AlertCryptoStates.waiting_crypto)
+	
+	current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+	
+	await safe_edit_text(
+		cb.message,
+		f"🪙 Текущее количество: {current_str} {crypto_display}\n\nВведите новое количество:",
+		reply_markup=cb.message.reply_markup
+	)
+	await cb.answer()
+
+
+@admin_router.message(AlertCryptoStates.waiting_crypto)
+async def alert_crypto_save(message: Message, state: FSMContext, bot: Bot):
+	"""Обработчик сохранения количества монет для крупной заявки"""
+	# Проверяем, что это админ
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	# Проверяем, не является ли это командой
+	if message.text and message.text.startswith("/"):
+		return
+	
+	# Получаем данные из FSM
+	data = await state.get_data()
+	order_id = data.get("alert_order_id")
+	current_crypto_amount = data.get("current_crypto_amount", 0)
+	crypto_display = data.get("crypto_display", "")
+	
+	if not order_id:
+		await message.answer("❌ Ошибка: не найден ID заявки")
+		await state.clear()
+		return
+	
+	# Валидируем введенное количество
+	try:
+		new_amount_str = message.text.strip().replace(",", ".")
+		new_crypto_amount = float(new_amount_str)
+		if new_crypto_amount <= 0:
+			current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+			await message.answer(f"❌ Количество должно быть больше нуля. Текущее количество: {current_str} {crypto_display}\nВведите новое количество:")
+			return
+	except ValueError:
+		current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+		await message.answer(f"❌ Неверный формат количества. Текущее количество: {current_str} {crypto_display}\nВведите число (например: 0.008 или 100):")
+		return
+	
+	# Обновляем количество крипты в БД
+	db = get_db()
+	await db._db.execute(
+		"UPDATE orders SET amount = ? WHERE id = ?",
+		(new_crypto_amount, order_id)
+	)
+	await db._db.commit()
+	
+	current_str = f"{current_crypto_amount:.8f}".rstrip('0').rstrip('.') if current_crypto_amount < 1 else f"{current_crypto_amount:.2f}".rstrip('0').rstrip('.')
+	new_str = f"{new_crypto_amount:.8f}".rstrip('0').rstrip('.') if new_crypto_amount < 1 else f"{new_crypto_amount:.2f}".rstrip('0').rstrip('.')
+	logger.info(f"✅ Количество крипты крупной заявки {order_id} обновлено: {current_str} {crypto_display} -> {new_str} {crypto_display}")
+	
+	# Обновляем сообщение пользователя с новыми данными
+	await _update_user_order_message(bot, order_id, db)
+	
+	# Обновляем сообщение о крупной заявке
+	order = await db.get_order_by_id(order_id)
+	if order:
+		user_tg_id = order.get("user_tg_id")
+		from app.main import large_order_alerts, get_user_stage_name
+		from aiogram.fsm.storage.base import StorageKey
+		if user_tg_id in large_order_alerts:
+			admin_id = message.from_user.id if message.from_user else None
+			user_data = large_order_alerts[user_tg_id]
+			# Поддерживаем обратную совместимость
+			if isinstance(user_data, dict) and "message_ids" in user_data:
+				message_ids = user_data["message_ids"]
+			else:
+				message_ids = user_data
+			if admin_id and admin_id in message_ids:
+				message_id = message_ids[admin_id]
+				try:
+					storage = state.storage
+					stage_name = "Неизвестно"
+					if storage:
+						try:
+							bot_id = bot.id
+							key = StorageKey(
+								bot_id=bot_id,
+								chat_id=user_tg_id,
+								user_id=user_tg_id
+							)
+							state_data = await storage.get_state(key)
+							if state_data:
+								stage_name = get_user_stage_name(str(state_data))
+						except:
+							pass
+					
+					# Получаем историю переписки, если есть
+					question_id = user_data.get("question_id") if isinstance(user_data, dict) else None
+					history_text = ""
+					if question_id:
+						messages = await db.get_question_messages(question_id)
+						if messages:
+							history_lines = []
+							for msg in messages:
+								if msg["sender_type"] == "admin":
+									history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+								else:
+									history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+							history_text = "\n\n".join(history_lines)
+					
+					alert_text = (
+						f"🚨 <b>Крупная заявка</b>\n\n"
+						f"Пользователь: {order.get('user_name', 'Не указано')} (@{order.get('user_username', 'нет')})\n"
+						f"Сумма: {order.get('amount_currency', 0)} {order.get('currency_symbol', '₽')}\n"
+						f"Крипта: {order.get('crypto_display', '')}\n"
+						f"Кол-во: {new_str} {crypto_display}\n\n"
+						f"📍 <b>Этап:</b> {stage_name}"
+					)
+					
+					# Добавляем историю переписки, если есть
+					if history_text:
+						alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+					
+					from aiogram.utils.keyboard import InlineKeyboardBuilder
+					kb = InlineKeyboardBuilder()
+					kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+					kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+					kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+					kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+					kb.adjust(2, 2)
+					
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode="HTML",
+						reply_markup=kb.as_markup()
+					)
+				except Exception as e:
+					logger.warning(f"⚠️ Не удалось обновить сообщение о крупной заявке: {e}")
+	
+	# Очищаем состояние
+	await state.clear()
+	
+	# Удаляем сообщение админа
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	
+	await message.answer(f"✅ Количество обновлено: {new_str} {crypto_display}")
 
 
 @admin_router.callback_query(F.data == "settings:users")
@@ -8184,44 +9026,80 @@ async def _update_user_order_message(bot: Bot, order_id: int, db):
 		
 		user_tg_id = order["user_tg_id"]
 		crypto_display = order.get("crypto_display", "")
+		crypto_type = order.get("crypto_type", "")
 		amount = order.get("amount", 0)
 		amount_currency = order.get("amount_currency", 0)
 		currency_symbol = order.get("currency_symbol", "₽")
+		wallet_address = order.get("wallet_address", "")
 		
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
-		proof_details = (
-			f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
-			f"Адрес кошелька: {order.get('wallet_address', '')}"
+		
+		# Определяем короткое название криптовалюты
+		if crypto_type == "XMR":
+			crypto_short = "xmr"
+		elif crypto_type == "USDT":
+			crypto_short = "usdt"
+		else:
+			crypto_short = crypto_type.lower()
+		
+		# Получаем реквизиты пользователя
+		user_cards = await db.get_cards_for_user_tg(user_tg_id)
+		requisites_text = ""
+		pay_card_info = ""
+		
+		if user_cards:
+			# Берем первую карту пользователя
+			card = user_cards[0]
+			card_id = card["card_id"]
+			card_info = await db.get_card_by_id(card_id)
+			card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+			group_name = ""
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group_by_id(card_info["group_id"])
+				group_name = group.get("name") if group else ""
+			if card_name:
+				label = f"{group_name} ({card_name})" if group_name else card_name
+				pay_card_info = f"\n💳 Карта для оплаты: {label}"
+			
+			# Получаем реквизиты из таблицы card_requisites
+			requisites = await db.list_card_requisites(card_id)
+			
+			# Формируем текст реквизитов
+			requisites_list = []
+			for req in requisites:
+				requisites_list.append(req["requisite_text"])
+			
+			# Добавляем user_message, если есть
+			if card.get("user_message") and card["user_message"].strip():
+				requisites_list.append(card["user_message"])
+			
+			if requisites_list:
+				requisites_text = "\n".join(requisites_list)
+		
+		# Формируем обновленное сообщение заявки
+		order_message = (
+			f"☑️Заявка успешно создана.\n"
+			f"Вы получаете: {amount_str} {crypto_short}\n"
+			f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
+			f"💳Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Реквизиты для оплаты:{pay_card_info}\n\n"
 		)
 		
-		# Получаем историю переписки
-		messages = await db.get_order_messages(order_id)
+		if requisites_text:
+			order_message += requisites_text + "\n\n"
+		else:
+			order_message += "Реквизиты не найдены. Идет загрузка, ожидайте.\n\n"
 		
-		order_info = (
-			f"💵 Криптовалюта: {crypto_display}\n"
-			f"💸 Сумма: {amount_str} {crypto_display}\n"
-			f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
-		)
+		order_message += f"⏰Заявка действительна: 15 минут\n"
+		order_message += f"✅После оплаты необходимо нажать на кнопку 'ОПЛАТА СОВЕРШЕНА'"
 		
-		history_lines = []
-		for msg in messages:
-			if msg["sender_type"] == "admin":
-				history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
-			else:
-				history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
-		
-		history_text = "\n\n".join(history_lines)
-		user_message = order_info + ("\n" + history_text if history_text else "")
-		
-		from app.keyboards import order_user_reply_kb
+		from app.keyboards import buy_payment_confirmed_kb
 		try:
 			await bot.edit_message_text(
 				chat_id=user_tg_id,
 				message_id=user_message_id,
-				text=user_message,
-				parse_mode="HTML",
-				reply_markup=order_user_reply_kb(order_id)
+				text=order_message,
+				reply_markup=buy_payment_confirmed_kb()
 			)
 		except Exception as e:
 			logger.warning(f"⚠️ Не удалось обновить сообщение пользователя: {e}")
@@ -8229,6 +9107,11 @@ async def _update_user_order_message(bot: Bot, order_id: int, db):
 		# Обновляем сообщение подтверждения скрина (если есть)
 		proof_confirmation_message_id = order.get("proof_confirmation_message_id")
 		if proof_confirmation_message_id:
+			proof_details = (
+				f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
+				f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+				f"Адрес кошелька: {wallet_address}"
+			)
 			proof_text = (
 				"✅ Спасибо! Ваш скриншот/чек получен. Ожидайте зачисления средств на указанный адрес кошелька."
 				+ proof_details

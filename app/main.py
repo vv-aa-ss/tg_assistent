@@ -26,6 +26,251 @@ from app.di import set_dependencies
 from app.notifications import notification_ids
 
 
+# Глобальный словарь для хранения message_id сообщений о крупных заявках и question_id для переписки
+# Формат: {user_tg_id: {"message_ids": {admin_id: message_id}, "question_id": question_id}}
+# Будет инициализирован в main()
+large_order_alerts: dict[int, dict] = {}
+
+
+def is_not_admin_message(message: Message) -> bool:
+	"""Фильтр: пропускаем только сообщения от НЕ админов."""
+	if not message.from_user:
+		return False
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	return not is_admin(
+		message.from_user.id,
+		message.from_user.username,
+		admin_ids,
+		admin_usernames
+	)
+
+
+def get_user_stage_name(state: str) -> str:
+	"""Определяет название этапа пользователя на основе его FSM состояния"""
+	if not state:
+		return "Неизвестно"
+	
+	if "waiting_confirmation" in state:
+		return "Согласование цены"
+	elif "waiting_wallet_address" in state:
+		return "Ввод кошелька"
+	elif "waiting_delivery_method" in state:
+		return "Выбор реквизитов"
+	elif "waiting_payment_confirmation" in state:
+		return "Оплата"
+	elif "waiting_payment_proof" in state:
+		return "Оплата"
+	else:
+		return "Неизвестно"
+
+
+async def update_large_order_alert(
+	bot: Bot,
+	user_tg_id: int,
+	user_name: str,
+	user_username: str,
+	total_usd: float,
+	crypto_display: str,
+	amount: float,
+	stage_name: str,
+	admin_ids: list[int],
+	state_amount_currency: float | None = None,
+	state_currency_symbol: str | None = None,
+	current_state: str | None = None
+) -> None:
+	"""Обновляет сообщение о крупной заявке с текущим этапом пользователя"""
+	global large_order_alerts
+	logger_main = logging.getLogger("app.main")
+	
+	logger_main.info(f"🔍 update_large_order_alert вызвана: user_tg_id={user_tg_id}, stage_name={stage_name}")
+	logger_main.info(f"🔍 large_order_alerts содержит: {list(large_order_alerts.keys())}")
+	
+	if user_tg_id not in large_order_alerts:
+		logger_main.warning(f"❌ Пользователь {user_tg_id} не найден в large_order_alerts. Доступные: {list(large_order_alerts.keys())}")
+		return
+	
+	user_alerts_data = large_order_alerts[user_tg_id]
+	# Поддерживаем обратную совместимость со старой структурой
+	if isinstance(user_alerts_data, dict) and "message_ids" in user_alerts_data:
+		user_alerts = user_alerts_data["message_ids"]
+		question_id = user_alerts_data.get("question_id")
+	else:
+		# Старая структура: {admin_id: message_id}
+		user_alerts = user_alerts_data
+		question_id = None
+	
+	logger_main.info(f"🔍 Данные для пользователя {user_tg_id}: {user_alerts}")
+	logger_main.info(f"🔍 Админы для обновления: {admin_ids}")
+	
+	# Пытаемся получить данные из БД, если заявка уже создана
+	from app.di import get_db
+	db = get_db()
+	order_id = await db.get_active_order_by_user(user_tg_id)
+	amount_currency = None
+	currency_symbol = None
+
+	pre_order_states = {
+		"BuyStates:waiting_confirmation",
+		"BuyStates:waiting_wallet_address",
+		"BuyStates:waiting_delivery_method",
+		"BuyStates:waiting_payment_confirmation",
+		"BuyStates:waiting_payment_proof",
+	}
+
+	# Если пользователь на ранних этапах, берем сумму из FSM-состояния
+	if current_state in pre_order_states and state_amount_currency is not None:
+		amount_currency = state_amount_currency
+		currency_symbol = state_currency_symbol or "₽"
+	elif order_id:
+		order = await db.get_order_by_id(order_id)
+		if order:
+			amount_currency = order.get("amount_currency", 0)
+			currency_symbol = order.get("currency_symbol", "₽")
+	
+	# Получаем историю переписки, если есть question_id
+	history_text = ""
+	if question_id:
+		messages = await db.get_question_messages(question_id)
+		if messages:
+			history_lines = []
+			for msg in messages:
+				if msg["sender_type"] == "admin":
+					history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+				else:
+					history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+			history_text = "\n\n".join(history_lines)
+	
+	# Формируем текст сообщения с этапом
+	if amount_currency is not None and currency_symbol:
+		# Если заявка создана, показываем сумму в валюте заявки
+		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+		alert_text = (
+			f"🚨 <b>Крупная заявка</b>\n\n"
+			f"Пользователь: {user_name or 'Не указано'} (@{user_username or 'нет'})\n"
+			f"Сумма: {int(amount_currency)} {currency_symbol}\n"
+			f"Крипта: {crypto_display}\n"
+			f"Кол-во: {amount_str} {crypto_display}\n\n"
+			f"📍 <b>Этап:</b> {stage_name}"
+		)
+	else:
+		# Если заявка еще не создана, показываем сумму в USD
+		alert_text = (
+			f"🚨 <b>Крупная заявка</b>\n\n"
+			f"Пользователь: {user_name or 'Не указано'} (@{user_username or 'нет'})\n"
+			f"Сумма: {total_usd:.2f}$\n"
+			f"Крипта: {crypto_display}\n"
+			f"Кол-во: {amount}\n\n"
+			f"📍 <b>Этап:</b> {stage_name}"
+		)
+	
+	# Добавляем историю переписки, если есть
+	if history_text:
+		alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+	
+	logger_main.info(f"📝 Текст сообщения для обновления:\n{alert_text}")
+	
+	from aiogram.utils.keyboard import InlineKeyboardBuilder
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+	kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+	kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+	kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+	kb.adjust(2, 2)
+	
+	# Обновляем сообщения для всех админов
+	logger_main.info(f"🔄 Попытка обновить сообщение для пользователя {user_tg_id}, админов: {list(user_alerts.keys())}")
+	
+	updated_count = 0
+	for admin_id, message_id in user_alerts.items():
+		logger_main.info(f"🔍 Проверка админа {admin_id}: message_id={message_id}, admin_id в списке админов: {admin_id in admin_ids}")
+		if admin_id in admin_ids:
+			try:
+				logger_main.info(f"📝 Обновление сообщения админа {admin_id}, message_id={message_id}, этап={stage_name}")
+				result = await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text=alert_text,
+					parse_mode=ParseMode.HTML,
+					reply_markup=kb.as_markup()
+				)
+				logger_main.info(f"✅ Сообщение успешно обновлено для админа {admin_id}, message_id={message_id}, результат: {result}")
+				updated_count += 1
+			except Exception as e:
+				logger_main.error(
+					f"❌ ОШИБКА при обновлении сообщения для админа {admin_id}, message_id={message_id}: {type(e).__name__}: {e}",
+					exc_info=True
+				)
+		else:
+			logger_main.warning(f"⚠️ Админ {admin_id} не в списке админов для обновления. Список админов: {admin_ids}")
+	
+	logger_main.info(f"📊 Итого обновлено сообщений: {updated_count} из {len(user_alerts)}")
+
+
+async def try_update_large_order_alert(
+	bot: Bot,
+	state: FSMContext,
+	user_tg_id: int,
+	user_name: str,
+	user_username: str
+) -> None:
+	"""Пытается обновить сообщение о крупной заявке, если она активна"""
+	global large_order_alerts
+	logger_main = logging.getLogger("app.main")
+	
+	logger_main.info(f"🔍 try_update_large_order_alert вызвана для user_tg_id={user_tg_id}")
+	logger_main.info(f"🔍 large_order_alerts содержит ключи: {list(large_order_alerts.keys())}")
+	
+	if user_tg_id not in large_order_alerts:
+		logger_main.warning(f"❌ Пользователь {user_tg_id} не найден в large_order_alerts. Доступные ключи: {list(large_order_alerts.keys())}")
+		return
+	
+	logger_main.info(f"✅ Пользователь {user_tg_id} найден в large_order_alerts: {large_order_alerts[user_tg_id]}")
+	
+	# Получаем данные из состояния
+	data = await state.get_data()
+	logger_main.info(f"🔍 Данные из состояния: keys={list(data.keys())}")
+	
+	total_usd = data.get("total_usd", 0)
+	alert_threshold = data.get("alert_threshold", 400.0)
+	crypto_display = data.get("crypto_display", "")
+	amount = data.get("amount", 0)
+	state_amount_currency = data.get("final_amount", data.get("amount_currency"))
+	state_currency_symbol = data.get("currency_symbol")
+	
+	logger_main.info(f"🔄 Обновление этапа для пользователя {user_tg_id}: total_usd={total_usd}, threshold={alert_threshold}")
+	
+	# Проверяем, является ли это крупной заявкой
+	if total_usd < alert_threshold:
+		logger_main.warning(f"⚠️ Заявка не является крупной: {total_usd} < {alert_threshold}")
+		return
+	
+	# Получаем текущий этап
+	current_state = await state.get_state()
+	stage_name = get_user_stage_name(str(current_state) if current_state else "")
+	
+	logger_main.info(f"📍 Текущий этап пользователя {user_tg_id}: {stage_name} (состояние: {current_state})")
+	
+	# Обновляем сообщение
+	admin_ids = get_admin_ids()
+	logger_main.info(f"🔍 Список админов для обновления: {admin_ids}")
+	
+	await update_large_order_alert(
+		bot=bot,
+		user_tg_id=user_tg_id,
+		user_name=user_name,
+		user_username=user_username,
+		total_usd=total_usd,
+		crypto_display=crypto_display,
+		amount=amount,
+		stage_name=stage_name,
+		admin_ids=admin_ids,
+		state_amount_currency=state_amount_currency,
+		state_currency_symbol=state_currency_symbol,
+		current_state=str(current_state) if current_state else None
+	)
+
+
 class BuyStates(StatesGroup):
 	"""Состояния для процесса покупки криптовалюты"""
 	waiting_crypto_amount = State()  # Ожидание ввода суммы
@@ -365,6 +610,11 @@ async def main() -> None:
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 	dp = Dispatcher(storage=MemoryStorage())
 	
+	# Инициализируем глобальный словарь для хранения message_id сообщений о крупных заявках
+	# Формат: {user_tg_id: {admin_id: message_id}}
+	global large_order_alerts
+	large_order_alerts = {}
+	
 	# Определяем команды для админов
 	from aiogram.types import BotCommand, BotCommandScopeDefault
 	admin_commands = [
@@ -400,8 +650,23 @@ async def main() -> None:
 	class LoggingMiddleware:
 		async def __call__(self, handler, event, data):
 			if isinstance(event, Message):
-				# Чтобы не раздувать лог, пишем это на DEBUG (и только если включен DEBUG)
-				logger.debug(f"🟢 DISPATCHER: Получено сообщение message_id={event.message_id}, text='{event.text}', user_id={event.from_user.id if event.from_user else None}")
+				# Получаем состояние FSM для логирования
+				state: FSMContext = data.get("state")
+				current_state = None
+				if state:
+					try:
+						current_state = await state.get_state()
+					except:
+						pass
+				
+				text = event.text or event.caption or ""
+				forward_origin = getattr(event, "forward_origin", None)
+				forward_from = getattr(event, "forward_from", None)
+				is_forward = bool(forward_origin or forward_from)
+				is_command = text.startswith("/") if text else False
+				
+				# Логируем ВСЕ сообщения на INFO для отладки
+				logger.info(f"🟢🟢🟢 MIDDLEWARE: message_id={event.message_id}, from_user={event.from_user.id if event.from_user else None}, text='{text[:100]}', state={current_state}, is_forward={is_forward}, is_command={is_command}, handler={handler.__name__ if hasattr(handler, '__name__') else 'unknown'}")
 			return await handler(event, data)
 	
 	dp.message.middleware(LoggingMiddleware())
@@ -862,6 +1127,9 @@ async def main() -> None:
 		# Рассчитываем итоговую сумму в USD после наценки
 		total_usd = crypto_price_with_markup * amount
 		
+		# Сохраняем total_usd в состоянии для проверки крупной сделки
+		await state.update_data(total_usd=total_usd)
+		
 		# Алерт админу при больших суммах (после ввода суммы)
 		try:
 			alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
@@ -869,30 +1137,72 @@ async def main() -> None:
 		except (ValueError, TypeError):
 			alert_threshold = 400.0
 		
-		if total_usd >= alert_threshold:
+		# Сохраняем alert_threshold в состоянии
+		await state.update_data(alert_threshold=alert_threshold)
+		
+		# Определяем, является ли это крупной заявкой
+		is_large_order = total_usd >= alert_threshold
+		
+		if is_large_order:
+			# Получаем текущий этап пользователя
+			current_state = await state.get_state()
+			stage_name = get_user_stage_name(str(current_state) if current_state else "")
+			
 			alert_text = (
 				f"🚨 <b>Крупная заявка</b>\n\n"
 				f"Пользователь: {message.from_user.full_name or 'Не указано'} (@{message.from_user.username or 'нет'})\n"
 				f"Сумма: {total_usd:.2f}$\n"
 				f"Крипта: {crypto_display}\n"
-				f"Кол-во: {amount}"
+				f"Кол-во: {amount}\n\n"
+				f"📍 <b>Этап:</b> {stage_name}"
 			)
 			from aiogram.utils.keyboard import InlineKeyboardBuilder
 			kb = InlineKeyboardBuilder()
 			kb.button(text="💬 Написать", callback_data=f"alert:message:{message.from_user.id}")
+			kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{message.from_user.id}")
+			kb.button(text="💰 Сумма", callback_data=f"alert:amount:{message.from_user.id}")
+			kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{message.from_user.id}")
+			kb.adjust(2, 2)
 			admin_ids = get_admin_ids()
+			
+			# Сохраняем message_id для обновления
+			user_tg_id = message.from_user.id
+			logger_main = logging.getLogger("app.main")
+			logger_main.info(f"🔍 Создание записи для user_tg_id={user_tg_id} в large_order_alerts")
+			logger_main.info(f"🔍 Текущее состояние large_order_alerts: {list(large_order_alerts.keys())}")
+			
+			if user_tg_id not in large_order_alerts:
+				large_order_alerts[user_tg_id] = {"message_ids": {}, "question_id": None}
+				logger_main.info(f"✅ Создан новый словарь для user_tg_id={user_tg_id}")
+			else:
+				# Поддерживаем обратную совместимость
+				if not isinstance(large_order_alerts[user_tg_id], dict) or "message_ids" not in large_order_alerts[user_tg_id]:
+					# Старая структура, конвертируем в новую
+					old_data = large_order_alerts[user_tg_id]
+					large_order_alerts[user_tg_id] = {"message_ids": old_data, "question_id": None}
+				logger_main.info(f"⚠️ Запись для user_tg_id={user_tg_id} уже существует: {large_order_alerts[user_tg_id]}")
+			
+			logger_main.info(f"🔍 Админы для отправки: {admin_ids}")
+			
 			for admin_id in admin_ids:
 				try:
-					await message.bot.send_message(
+					logger_main.info(f"📤 Отправка сообщения админу {admin_id}")
+					sent_msg = await message.bot.send_message(
 						chat_id=admin_id,
 						text=alert_text,
 						parse_mode=ParseMode.HTML,
 						reply_markup=kb.as_markup()
 					)
+					large_order_alerts[user_tg_id]["message_ids"][admin_id] = sent_msg.message_id
+					logger_main.info(f"✅ Сообщение о крупной заявке отправлено админу {admin_id}, message_id={sent_msg.message_id}, user_tg_id={user_tg_id}")
+					logger_main.info(f"✅ large_order_alerts[{user_tg_id}] = {large_order_alerts[user_tg_id]}")
 				except Exception as e:
-					logging.getLogger("app.main").warning(
-						f"⚠️ Не удалось отправить алерт админу {admin_id}: {e}"
+					logger_main.error(
+						f"❌ ОШИБКА при отправке алерта админу {admin_id}: {type(e).__name__}: {e}",
+						exc_info=True
 					)
+			
+			logger_main.info(f"📊 Финальное состояние large_order_alerts для user_tg_id={user_tg_id}: {large_order_alerts.get(user_tg_id, 'НЕ НАЙДЕНО')}")
 		
 		# Дополнительные комиссии по порогам USD
 		extra_fee_usd_low_str = await db_local.get_setting("buy_extra_fee_usd_low", "50")
@@ -969,14 +1279,35 @@ async def main() -> None:
 		else:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
+		# Проверяем, является ли это крупной заявкой
+		data = await state.get_data()
+		alert_threshold = data.get("alert_threshold", 400.0)
+		total_usd = data.get("total_usd", 0)
+		is_large_order = total_usd >= alert_threshold
+		
+		# Для крупных заявок не показываем сумму оплаты
+		if is_large_order:
+			payment_text = "ожидайте сообщение администратора"
+		else:
+			payment_text = f"{int(amount_currency)} {currency_symbol}"
+		
 		confirmation_text = (
 			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
-			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+			f"Вам необходимо оплатить: {payment_text}"
 		)
 		
 		# Показываем сообщение с кнопками подтверждения
 		from app.keyboards import buy_confirmation_kb
 		await state.set_state(BuyStates.waiting_confirmation)
+		
+		# Обновляем сообщение о крупной заявке, если она активна
+		await try_update_large_order_alert(
+			bot=message.bot,
+			state=state,
+			user_tg_id=message.from_user.id,
+			user_name=message.from_user.full_name or "",
+			user_username=message.from_user.username or ""
+		)
 		# Для inline-клавиатуры используем обычный answer
 		bot = message.bot
 		chat_id = message.chat.id
@@ -1033,10 +1364,35 @@ async def main() -> None:
 		else:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
+		# Проверяем, является ли это крупной заявкой
+		alert_threshold = data.get("alert_threshold", 400.0)
+		total_usd = data.get("total_usd", 0)
+		is_large_order = total_usd >= alert_threshold
+		admin_amount_set = data.get("admin_amount_set", False)
+		admin_amount_value = data.get("admin_amount_value")
+
+		# Для крупных заявок не даем продолжить без суммы от админа
+		if is_large_order and not admin_amount_set:
+			await send_and_save_message(
+				message,
+				"⏳ Ожидайте сообщение администратора с суммой оплаты.",
+				state=state
+			)
+			return
+		
+		# Для крупных заявок не показываем сумму оплаты
+		if is_large_order:
+			if admin_amount_set and admin_amount_value is not None:
+				payment_text = f"{int(admin_amount_value)} {currency_symbol}"
+			else:
+				payment_text = "ожидайте сообщение администратора"
+		else:
+			payment_text = f"{int(amount_currency)} {currency_symbol}"
+		
 		# Показываем уведомление о заказе
 		order_notification = (
 			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
-			f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+			f"Вам необходимо оплатить: {payment_text}"
 		)
 		
 		# Сохраняем ID предыдущего сообщения для удаления
@@ -1044,6 +1400,21 @@ async def main() -> None:
 		
 		# Переходим в состояние ожидания адреса кошелька
 		await state.set_state(BuyStates.waiting_wallet_address)
+		
+		# Небольшая задержка, чтобы состояние точно сохранилось
+		await asyncio.sleep(0.1)
+		
+		# Обновляем сообщение о крупной заявке, если она активна
+		total_usd = data.get("total_usd", 0)
+		alert_threshold = data.get("alert_threshold", 400.0)
+		if total_usd >= alert_threshold:
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
 		
 		# Убираем клавиатуру подтверждения
 		await send_and_save_message(message, "✅ Принято.", reply_markup=ReplyKeyboardRemove(), state=state)
@@ -1080,7 +1451,13 @@ async def main() -> None:
 		data = await state.get_data()
 		pending_question_id = data.get("pending_question_reply_id")
 		pending_prompt_id = data.get("pending_question_reply_prompt_id")
-		if pending_question_id and message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id:
+		if pending_question_id and (
+			message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id
+		):
+			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
+			return
+		# Если пользователь нажал "Ответить", но не ответил на prompt, все равно считаем это ответом админу
+		if pending_question_id:
 			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
 			return
 	
@@ -1098,7 +1475,13 @@ async def main() -> None:
 		data = await state.get_data()
 		pending_question_id = data.get("pending_question_reply_id")
 		pending_prompt_id = data.get("pending_question_reply_prompt_id")
-		if pending_question_id and message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id:
+		if pending_question_id and (
+			message.reply_to_message and message.reply_to_message.message_id == pending_prompt_id
+		):
+			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
+			return
+		# Если пользователь нажал "Ответить", но не ответил на prompt, все равно считаем это ответом админу
+		if pending_question_id:
 			await _handle_question_user_reply(message, state, pending_question_id, keep_state=True)
 			return
 		
@@ -1131,6 +1514,22 @@ async def main() -> None:
 		# Сохраняем адрес кошелька
 		await state.update_data(wallet_address=wallet_address)
 		
+		# Проверяем, является ли сделка крупной
+		total_usd = data.get("total_usd", 0)
+		alert_threshold = data.get("alert_threshold", 400.0)
+		is_large_order = total_usd >= alert_threshold
+		
+		# Обновляем сообщение о крупной заявке на этапе "Ввод кошелька" (состояние уже waiting_wallet_address)
+		if is_large_order:
+			await asyncio.sleep(0.1)  # Небольшая задержка для сохранения данных
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
+		
 		# Форматируем суммы для отображения
 		if amount < 1:
 			amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
@@ -1138,13 +1537,24 @@ async def main() -> None:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		
 		# Для XMR и USDT пропускаем выбор способа доставки, для BTC показываем выбор
-		if crypto_type == "XMR" or crypto_type == "USDT":
-			# Для XMR и USDT устанавливаем обычную доставку и сразу переходим к созданию заявки
-			delivery_type = "normal"
+		# Для крупных сделок автоматически устанавливаем VIP доставку
+		if crypto_type == "XMR" or crypto_type == "USDT" or is_large_order:
+			# Для XMR и USDT устанавливаем обычную доставку
+			# Для крупных сделок устанавливаем VIP доставку
+			if is_large_order:
+				delivery_type = "vip"
+			else:
+				delivery_type = "normal"
 			await state.update_data(delivery_method=delivery_type)
 			
-			# Рассчитываем сумму (без VIP для XMR и USDT)
+			# Рассчитываем сумму (без VIP для XMR и USDT, с VIP для крупных сделок)
 			final_amount = amount_currency
+			if is_large_order and delivery_type == "vip":
+				# Добавляем VIP надбавку для крупных сделок
+				if selected_country == "BYN":
+					final_amount += 4
+				else:  # RUB
+					final_amount += 1000
 			
 			# Получаем реквизиты пользователя
 			user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
@@ -1189,11 +1599,22 @@ async def main() -> None:
 			else:
 				crypto_short = crypto_type.lower()
 			
+			# Проверяем, является ли это крупной заявкой
+			alert_threshold = data.get("alert_threshold", 400.0)
+			total_usd = data.get("total_usd", 0)
+			is_large_order = total_usd >= alert_threshold
+			
+			# Для крупных заявок не показываем сумму оплаты
+			if is_large_order:
+				payment_text = "ожидайте сообщение администратора"
+			else:
+				payment_text = f"{int(final_amount)} {currency_symbol}"
+			
 			order_message = (
 				f"☑️Заявка успешно создана.\n"
 				f"Вы получаете: {amount_str} {crypto_short}\n"
 				f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
-				f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
+				f"💳Сумма к оплате: {payment_text}\n"
 				f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
 			)
 			
@@ -1218,6 +1639,18 @@ async def main() -> None:
 			
 			# Отправляем финальное сообщение
 			await state.set_state(BuyStates.waiting_payment_confirmation)
+			
+			# Небольшая задержка, чтобы состояние точно сохранилось
+			await asyncio.sleep(0.1)
+			
+			# Обновляем сообщение о крупной заявке, если она активна
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
 			final_message = await send_and_save_message(
 				message,
 				order_message,
@@ -1269,15 +1702,38 @@ async def main() -> None:
 							pass
 		else:
 			# Для BTC показываем выбор способа доставки (VIP или обычная)
+			# Проверяем, является ли это крупной заявкой
+			alert_threshold = data.get("alert_threshold", 400.0)
+			total_usd = data.get("total_usd", 0)
+			is_large_order = total_usd >= alert_threshold
+			
+			# Для крупных заявок не показываем сумму оплаты
+			if is_large_order:
+				payment_text = "ожидайте сообщение администратора"
+			else:
+				payment_text = f"{int(amount_currency)} {currency_symbol}"
+			
 			order_info = (
 				f"Вам будет зачислено: {amount_str} {crypto_display}\n"
-				f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}\n\n"
+				f"Вам необходимо оплатить: {payment_text}\n\n"
 				f"Выберите способ доставки:"
 			)
 			
 			# Показываем клавиатуру выбора способа доставки
 			is_byn = selected_country == "BYN"
 			await state.set_state(BuyStates.waiting_delivery_method)
+			
+			# Небольшая задержка, чтобы состояние точно сохранилось
+			await asyncio.sleep(0.1)
+			
+			# Обновляем сообщение о крупной заявке, если она активна
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
 			await send_and_save_message(
 				message,
 				order_info,
@@ -1307,6 +1763,15 @@ async def main() -> None:
 			# Возвращаемся к вводу адреса кошелька
 			crypto_display = data.get("crypto_display", "")
 			await state.set_state(BuyStates.waiting_wallet_address)
+			await asyncio.sleep(0.1)
+			# Обновляем сообщение о крупной заявке
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
 			await send_and_save_message(message, f"Введите адрес кошелька для {crypto_display}:", state=state)
 			return
 		
@@ -1417,6 +1882,22 @@ async def main() -> None:
 		
 		# Отправляем финальное сообщение
 		await state.set_state(BuyStates.waiting_payment_confirmation)
+		
+		# Небольшая задержка, чтобы состояние точно сохранилось
+		await asyncio.sleep(0.1)
+		
+		# Обновляем сообщение о крупной заявке, если она активна
+		total_usd = data.get("total_usd", 0)
+		alert_threshold = data.get("alert_threshold", 400.0)
+		if total_usd >= alert_threshold:
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=message.from_user.id,
+				user_name=message.from_user.full_name or "",
+				user_username=message.from_user.username or ""
+			)
+		
 		final_message = await send_and_save_message(
 			message,
 			order_message,
@@ -1470,52 +1951,148 @@ async def main() -> None:
 	@dp.message(BuyStates.waiting_payment_confirmation, F.text == "ОПЛАТА СОВЕРШЕНА")
 	async def on_payment_confirmed(message: Message, state: FSMContext):
 		"""Обработчик подтверждения оплаты"""
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🔵 on_payment_confirmed: Начало обработки для user_id={message.from_user.id if message.from_user else None}")
+		
 		if not message.from_user:
-			return
-		from app.di import get_db
-		db_local = get_db()
-		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			logger_main.warning("❌ on_payment_confirmed: message.from_user is None")
 			return
 		
-		# Удаляем сообщение пользователя
-		await delete_user_message(message)
+		try:
+			from app.di import get_db
+			db_local = get_db()
+			logger_main.info(f"🔵 on_payment_confirmed: Проверка доступа для user_id={message.from_user.id}")
+			
+			if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+				logger_main.warning(f"❌ on_payment_confirmed: Пользователь {message.from_user.id} не имеет доступа")
+				return
+			
+			logger_main.info(f"✅ on_payment_confirmed: Пользователь {message.from_user.id} имеет доступ")
+			
+			# Удаляем сообщение пользователя
+			logger_main.info(f"🔵 on_payment_confirmed: Удаление сообщения пользователя")
+			await delete_user_message(message)
+			
+			# Получаем данные о заказе
+			logger_main.info(f"🔵 on_payment_confirmed: Получение данных из состояния")
+			data = await state.get_data()
+			logger_main.info(f"🔵 on_payment_confirmed: Данные получены, keys={list(data.keys())}")
+			
+			logger_main.info(f"🔵 on_payment_confirmed: Проверка pending_requisites")
+			pending = await db_local.get_pending_requisites(message.from_user.id)
+			if pending:
+				logger_main.info(f"🔵 on_payment_confirmed: Найдены pending_requisites, message_id={pending.get('message_id')}")
+				await state.update_data(order_message_id=pending["message_id"])
+				await db_local.delete_pending_requisites(message.from_user.id)
+			else:
+				logger_main.info(f"🔵 on_payment_confirmed: pending_requisites не найдены")
+			
+			order_expires_at = data.get("order_expires_at", 0)
+			logger_main.info(f"🔵 on_payment_confirmed: order_expires_at={order_expires_at}")
+			
+			# Проверяем, не истекла ли заявка
+			current_time = int(time.time())
+			logger_main.info(f"🔵 on_payment_confirmed: current_time={current_time}, order_expires_at={order_expires_at}")
+			if current_time > order_expires_at:
+				logger_main.warning(f"⚠️ on_payment_confirmed: Заявка истекла")
+				# Возвращаемся в главное меню
+				from app.keyboards import client_menu_kb
+				await state.clear()
+				await send_and_save_message(
+					message,
+					"❌ Время действия заявки истекло. Пожалуйста, создайте новую заявку.\n\n"
+					"🔒 Сервис не поддерживает подозрительные или незаконные транзакции.\n"
+					"🔞 Только для пользователей старше 18 лет.\n\n"
+					"✅Выберите нужную функцию в меню ниже, чтобы начать работу.",
+					reply_markup=client_menu_kb(),
+					state=state
+				)
+				return
+			
+			logger_main.info(f"✅ on_payment_confirmed: Заявка не истекла, продолжаем")
+			
+			# Переходим в состояние ожидания скриншота/чека
+			logger_main.info(f"🔵 on_payment_confirmed: Установка состояния waiting_payment_proof")
+			await state.set_state(BuyStates.waiting_payment_proof)
+			
+			# Небольшая задержка, чтобы состояние точно сохранилось
+			logger_main.info(f"🔵 on_payment_confirmed: Задержка 0.1 сек")
+			await asyncio.sleep(0.1)
+			
+			# Обновляем сообщение о крупной заявке, если она активна
+			logger_main.info(f"🔵 on_payment_confirmed: Обновление сообщения о крупной заявке")
+			try:
+				await try_update_large_order_alert(
+					bot=message.bot,
+					state=state,
+					user_tg_id=message.from_user.id,
+					user_name=message.from_user.full_name or "",
+					user_username=message.from_user.username or ""
+				)
+				logger_main.info(f"✅ on_payment_confirmed: Сообщение о крупной заявке обновлено")
+			except Exception as e:
+				logger_main.error(f"❌ on_payment_confirmed: Ошибка при обновлении сообщения о крупной заявке: {e}", exc_info=True)
+			
+			# Запрашиваем скриншот/чек оплаты
+			logger_main.info(f"🔵 on_payment_confirmed: Отправка запроса скриншота")
+			try:
+				proof_request_message = await send_and_save_message(
+					message,
+					"Отправьте скрин перевода, либо чек оплаты.",
+					state=state
+				)
+				logger_main.info(f"✅ on_payment_confirmed: Запрос скриншота отправлен, message_id={proof_request_message.message_id}")
+			except Exception as e:
+				logger_main.error(f"❌ on_payment_confirmed: Ошибка при отправке запроса скриншота: {e}", exc_info=True)
+				raise
+			
+			# Сохраняем ID сообщения с запросом скриншота
+			logger_main.info(f"🔵 on_payment_confirmed: Сохранение proof_request_message_id")
+			await state.update_data(proof_request_message_id=proof_request_message.message_id)
+			logger_main.info(f"✅ on_payment_confirmed: Обработка завершена успешно")
+			
+		except Exception as e:
+			logger_main.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА в on_payment_confirmed: {e}", exc_info=True)
+			# Пытаемся отправить сообщение пользователю об ошибке
+			try:
+				await message.answer("❌ Произошла ошибка при обработке подтверждения оплаты. Попробуйте позже.")
+			except:
+				pass
+			raise
+	
+	# Дополнительный обработчик для случая, когда пользователь в состоянии переписки,
+	# но нажимает "ОПЛАТА СОВЕРШЕНА" (данные о заказе все еще в состоянии FSM)
+	@dp.message(F.text == "ОПЛАТА СОВЕРШЕНА")
+	async def on_payment_confirmed_any_state(message: Message, state: FSMContext):
+		"""Обработчик подтверждения оплаты для любого состояния (если есть данные о заказе)"""
+		logger_main = logging.getLogger("app.main")
+		current_state = await state.get_state()
+		logger_main.info(f"🔵 on_payment_confirmed_any_state: Получено сообщение 'ОПЛАТА СОВЕРШЕНА' для user_id={message.from_user.id if message.from_user else None}, state={current_state}")
 		
-		# Получаем данные о заказе
+		# Проверяем, есть ли данные о заказе в состоянии
 		data = await state.get_data()
-		pending = await db_local.get_pending_requisites(message.from_user.id)
-		if pending:
-			await state.update_data(order_message_id=pending["message_id"])
-			await db_local.delete_pending_requisites(message.from_user.id)
-		order_expires_at = data.get("order_expires_at", 0)
+		has_order_data = any(key in data for key in ["total_usd", "crypto_display", "amount", "final_amount"])
 		
-		# Проверяем, не истекла ли заявка
-		current_time = int(time.time())
-		if current_time > order_expires_at:
-			# Возвращаемся в главное меню
-			from app.keyboards import client_menu_kb
-			await state.clear()
-			await send_and_save_message(
-				message,
-				"❌ Время действия заявки истекло. Пожалуйста, создайте новую заявку.\n\n"
-				"🔒 Сервис не поддерживает подозрительные или незаконные транзакции.\n"
-				"🔞 Только для пользователей старше 18 лет.\n\n"
-				"✅Выберите нужную функцию в меню ниже, чтобы начать работу.",
-				reply_markup=client_menu_kb(),
-				state=state
-			)
+		# Если состояние уже BuyStates.waiting_payment_confirmation, пропускаем (обработает основной обработчик)
+		if current_state == BuyStates.waiting_payment_confirmation.state:
+			logger_main.info(f"🔵 on_payment_confirmed_any_state: Состояние уже waiting_payment_confirmation, пропускаем")
 			return
 		
-		# Переходим в состояние ожидания скриншота/чека
-		await state.set_state(BuyStates.waiting_payment_proof)
+		# Если нет данных о заказе, пропускаем
+		if not has_order_data:
+			logger_main.info(f"🔵 on_payment_confirmed_any_state: Нет данных о заказе, пропускаем")
+			return
 		
-		# Запрашиваем скриншот/чек оплаты
-		proof_request_message = await send_and_save_message(
-			message,
-			"Отправьте скрин перевода, либо чек оплаты.",
-			state=state
-		)
-		# Сохраняем ID сообщения с запросом скриншота
-		await state.update_data(proof_request_message_id=proof_request_message.message_id)
+		# Если есть данные о заказе, но состояние не waiting_payment_confirmation,
+		# значит пользователь в переписке, но пытается подтвердить оплату
+		logger_main.info(f"🔵 on_payment_confirmed_any_state: Найдены данные о заказе, но состояние {current_state} не waiting_payment_confirmation. Восстанавливаем состояние.")
+		
+		# Восстанавливаем состояние waiting_payment_confirmation
+		await state.set_state(BuyStates.waiting_payment_confirmation)
+		await asyncio.sleep(0.1)
+		
+		# Вызываем основной обработчик
+		await on_payment_confirmed(message, state)
 	
 	@dp.message(BuyStates.waiting_payment_proof)
 	async def on_payment_proof_received(message: Message, state: FSMContext):
@@ -1553,6 +2130,16 @@ async def main() -> None:
 		amount_currency = data.get("final_amount", data.get("amount_currency", 0))
 		currency_symbol = data.get("currency_symbol", "")
 		delivery_method = data.get("delivery_method", "")
+		total_usd = data.get("total_usd", 0)
+		alert_threshold = data.get("alert_threshold", 400.0)
+		
+		# Если total_usd не сохранен, но delivery_method = "vip", считаем что это крупная сделка
+		# Или проверяем по порогу
+		if total_usd == 0 and delivery_method == "vip":
+			# Если доставка VIP, но total_usd не сохранен, считаем что это крупная сделка
+			is_large_order = True
+		else:
+			is_large_order = total_usd >= alert_threshold if total_usd > 0 else False
 		
 		# Получаем file_id для фото или документа
 		proof_photo_file_id = None
@@ -1689,13 +2276,26 @@ async def main() -> None:
 			pay_card_info = f"\n💳 Карта для оплаты: {label}"
 		else:
 			pay_card_info = ""
+		# Формируем информацию о крупной сделке и способе доставки
+		large_order_info = ""
+		delivery_info = ""
+		if is_large_order:
+			if total_usd > 0:
+				large_order_info = f"\n🚨 <b>КРУПНАЯ СДЕЛКА</b> ({total_usd:.2f} USD)"
+			else:
+				large_order_info = f"\n🚨 <b>КРУПНАЯ СДЕЛКА</b>"
+		if delivery_method == "vip":
+			delivery_info = "\n🚀 Доставка: <b>VIP</b>"
+		elif delivery_method == "normal":
+			delivery_info = "\n📦 Доставка: Обычная"
+		
 		admin_message_text = (
 			f"Номер заявки за сегодня: {order_number}\n"
 			f"Имя пользователя: {user_name or 'Не указано'}\n"
 			f"Username: @{user_username}\n"
-			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}\n\n"
+			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}{large_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}{delivery_info}\n"
 			f"Адрес кошелька: <code>{wallet_address}</code>{pay_card_info}{total_debt_info}"
 		)
 		
@@ -3043,23 +3643,396 @@ async def main() -> None:
 		# Очищаем состояние
 		await state.clear()
 
-	# Обработчик ответов пользователя на сообщения админа по обычной заявке (должен быть ПЕРЕД обработчиком для продажи)
+	# Обработчик ответов пользователя на вопросы админа (должен быть ПЕРВЫМ, чтобы перехватывать сообщения с активными вопросами)
+	# УБРАЛИ StateFilter(None) - обработчик должен работать в любом состоянии, если есть активный вопрос
 	@dp.message(
+		is_not_admin_message,
 		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
-		StateFilter(None),
 		~(F.text.startswith("/") if F.text else False)
 	)
-	async def on_user_reply_to_order(message: Message):
-		"""Обработчик ответов пользователя на сообщения админа по обычной заявке"""
+	async def on_user_reply_to_question(message: Message, state: FSMContext):
+		"""Обработчик ответов пользователя на вопросы админа"""
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🔵🔵🔵 on_user_reply_to_question: НАЧАЛО ОБРАБОТКИ")
+		logger_main.info(f"🔵🔵🔵 on_user_reply_to_question: message_id={message.message_id}, from_user={message.from_user.id if message.from_user else None}, text='{message.text or message.caption or ''}'")
+		
+		current_state = await state.get_state()
+		logger_main.info(f"🔵🔵🔵 on_user_reply_to_question: current_state={current_state}")
+		logger_main.info(f"🔵🔵🔵 on_user_reply_to_question: forward_origin={getattr(message, 'forward_origin', None)}, forward_from={getattr(message, 'forward_from', None)}")
+		
 		if not message.from_user:
+			logger_main.info(f"❌ on_user_reply_to_question: нет from_user")
+			return
+		
+		# Проверяем, не является ли отправитель админом - если да, пропускаем обработку
+		from app.admin import is_admin
+		from app.di import get_admin_ids, get_admin_usernames
+		admin_ids = get_admin_ids()
+		admin_usernames = get_admin_usernames()
+		user_id = message.from_user.id
+		username = message.from_user.username
+		if is_admin(user_id, username, admin_ids, admin_usernames):
+			logger_main.info(f"🔵🔵🔵 on_user_reply_to_question: сообщение от админа, пропускаем обработку")
 			return
 		
 		from app.di import get_db
 		db_local = get_db()
 		
-		# Проверяем, есть ли у пользователя активная заявка
+		# Проверяем, есть ли у пользователя активный вопрос
 		user_tg_id = message.from_user.id
 		
+		# Получаем последний активный вопрос пользователя
+		question_id = await db_local.get_active_question_by_user(user_tg_id)
+		logger_main.info(f"🔍 on_user_reply_to_question: question_id={question_id} для user_tg_id={user_tg_id}")
+		
+		if not question_id:
+			# Нет активного вопроса, пропускаем обработку
+			logger_main.info(f"❌ on_user_reply_to_question: нет активного вопроса для user_tg_id={user_tg_id}")
+			return
+		
+		# Получаем информацию о вопросе
+		question = await db_local.get_question_by_id(question_id)
+		if not question:
+			return
+		
+		# Проверяем, не закрыт ли вопрос
+		if question.get("completed_at"):
+			# Вопрос закрыт, не обрабатываем ответ
+			return
+		
+		# Получаем текст сообщения
+		message_text = message.text or message.caption or ""
+		if not message_text.strip():
+			return
+		
+		# Сохраняем сообщение в истории переписки
+		await db_local.add_question_message(question_id, "user", message_text)
+		
+		# Получаем всю историю переписки
+		messages = await db_local.get_question_messages(question_id)
+		
+		# Формируем сообщение для админа с историей
+		history_lines = []
+		for msg in messages:
+			if msg["sender_type"] == "admin":
+				history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
+			else:
+				history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
+		
+		admin_message = "\n\n".join(history_lines)
+		history_text = "\n\n".join(history_lines) if history_lines else ""
+		
+		# Проверяем, является ли это вопросом для крупной заявки
+		from app.main import large_order_alerts
+		logger_main.info(f"🔍 on_user_reply_to_question: user_tg_id={user_tg_id}, question_id={question_id}")
+		logger_main.info(f"🔍 on_user_reply_to_question: large_order_alerts содержит: {list(large_order_alerts.keys())}")
+		
+		# Проверяем, есть ли активная крупная заявка для этого пользователя
+		order_id = await db_local.get_active_order_by_user(user_tg_id)
+		is_large_order = False
+		if order_id:
+			order = await db_local.get_order_by_id(order_id)
+			if order:
+				# Проверяем, является ли это крупной заявкой
+				alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+				try:
+					alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+				except (ValueError, TypeError):
+					alert_threshold = 400.0
+				total_usd = order.get("total_usd", 0)
+				is_large_order = total_usd >= alert_threshold
+				logger_main.info(f"🔍 on_user_reply_to_question: order_id={order_id}, total_usd={total_usd}, alert_threshold={alert_threshold}, is_large_order={is_large_order}")
+		
+		if user_tg_id in large_order_alerts or is_large_order:
+			# Если записи нет, но есть крупная заявка, создаем запись
+			if user_tg_id not in large_order_alerts:
+				logger_main.info(f"⚠️ on_user_reply_to_question: создаем запись в large_order_alerts для user_tg_id={user_tg_id}")
+				large_order_alerts[user_tg_id] = {"message_ids": {}, "question_id": question_id}
+			
+			user_data = large_order_alerts[user_tg_id]
+			logger_main.info(f"🔍 on_user_reply_to_question: user_data={user_data}")
+			
+			# Поддерживаем обратную совместимость
+			if not isinstance(user_data, dict):
+				# Старая структура
+				old_data = user_data
+				large_order_alerts[user_tg_id] = {"message_ids": old_data, "question_id": question_id}
+				user_data = large_order_alerts[user_tg_id]
+			elif "message_ids" not in user_data:
+				# Старая структура dict, но без message_ids
+				old_data = user_data.copy()
+				large_order_alerts[user_tg_id] = {"message_ids": old_data, "question_id": question_id}
+				user_data = large_order_alerts[user_tg_id]
+			
+			stored_question_id = user_data.get("question_id")
+			logger_main.info(f"🔍 on_user_reply_to_question: stored_question_id={stored_question_id}, question_id={question_id}")
+			
+			# Если question_id не сохранен, но есть активная крупная заявка, сохраняем его
+			if stored_question_id is None and is_large_order:
+				logger_main.info(f"⚠️ on_user_reply_to_question: question_id не сохранен, но есть крупная заявка, сохраняем его")
+				large_order_alerts[user_tg_id]["question_id"] = question_id
+				stored_question_id = question_id
+			
+			# Если question_id совпадает или это крупная заявка, обновляем сообщение
+			should_update = stored_question_id == question_id or (is_large_order and (stored_question_id is None or stored_question_id == question_id))
+			logger_main.info(f"🔍 on_user_reply_to_question: should_update={should_update}, stored_question_id={stored_question_id}, question_id={question_id}, is_large_order={is_large_order}")
+			
+			if should_update:
+					# Это вопрос для крупной заявки, обновляем сообщение о крупной заявке
+					if isinstance(user_data, dict) and "message_ids" in user_data:
+						message_ids = user_data["message_ids"]
+					else:
+						message_ids = user_data
+					
+					# Получаем данные о заявке
+					order_id = await db_local.get_active_order_by_user(user_tg_id)
+					from app.main import get_user_stage_name
+					from aiogram.fsm.storage.base import StorageKey
+					
+					storage = message.bot.session.storage if hasattr(message.bot, 'session') else None
+					stage_name = "Неизвестно"
+					state_str = None
+					state_data_payload = {}
+					if storage:
+						try:
+							bot_id = message.bot.id
+							key = StorageKey(
+								bot_id=bot_id,
+								chat_id=user_tg_id,
+								user_id=user_tg_id
+							)
+							state_str = await storage.get_state(key)
+							if state_str:
+								stage_name = get_user_stage_name(str(state_str))
+							state_data_payload = await storage.get_data(key)
+						except:
+							pass
+					
+					# Формируем текст сообщения
+					user_name = question.get("user_name", "Не указано")
+					user_username = question.get("user_username", "нет")
+					pre_order_states = {
+						"BuyStates:waiting_confirmation",
+						"BuyStates:waiting_wallet_address",
+						"BuyStates:waiting_delivery_method",
+						"BuyStates:waiting_payment_confirmation",
+						"BuyStates:waiting_payment_proof",
+					}
+					state_amount_currency = state_data_payload.get("final_amount", state_data_payload.get("amount_currency"))
+					state_currency_symbol = state_data_payload.get("currency_symbol")
+
+					if order_id:
+						order = await db_local.get_order_by_id(order_id)
+						if order:
+							amount_currency = order.get("amount_currency", 0)
+							currency_symbol = order.get("currency_symbol", "₽")
+							if state_str in pre_order_states and state_amount_currency is not None:
+								amount_currency = state_amount_currency
+								if state_currency_symbol:
+									currency_symbol = state_currency_symbol
+							amount = order.get("amount", 0)
+							crypto_display = order.get("crypto_display", "")
+							amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+							alert_text = (
+								f"🚨 <b>Крупная заявка</b>\n\n"
+								f"Пользователь: {user_name} (@{user_username})\n"
+								f"Сумма: {int(amount_currency)} {currency_symbol}\n"
+								f"Крипта: {crypto_display}\n"
+								f"Кол-во: {amount_str} {crypto_display}\n\n"
+								f"📍 <b>Этап:</b> {stage_name}"
+							)
+						else:
+							alert_text = (
+								f"🚨 <b>Крупная заявка</b>\n\n"
+								f"Пользователь: {user_name} (@{user_username})\n\n"
+								f"📍 <b>Этап:</b> {stage_name}"
+							)
+					else:
+						if state_amount_currency is not None:
+							currency_symbol = state_currency_symbol or "₽"
+							amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
+							alert_text = (
+								f"🚨 <b>Крупная заявка</b>\n\n"
+								f"Пользователь: {user_name} (@{user_username})\n"
+								f"Сумма: {int(state_amount_currency)} {currency_symbol}\n"
+								f"Крипта: {crypto_display}\n"
+								f"Кол-во: {amount_str} {crypto_display}\n\n"
+								f"📍 <b>Этап:</b> {stage_name}"
+							)
+						else:
+							alert_text = (
+								f"🚨 <b>Крупная заявка</b>\n\n"
+								f"Пользователь: {user_name} (@{user_username})\n\n"
+								f"📍 <b>Этап:</b> {stage_name}"
+							)
+					
+					# Добавляем историю переписки
+					if history_text:
+						alert_text += f"\n\n💬 <b>Переписка:</b>\n\n{history_text}"
+					
+					# Обновляем сообщения для всех админов
+					from aiogram.utils.keyboard import InlineKeyboardBuilder
+					kb = InlineKeyboardBuilder()
+					kb.button(text="💬 Написать", callback_data=f"alert:message:{user_tg_id}")
+					kb.button(text="💳 Реквизиты", callback_data=f"alert:requisites:{user_tg_id}")
+					kb.button(text="💰 Сумма", callback_data=f"alert:amount:{user_tg_id}")
+					kb.button(text="🪙 Монеты", callback_data=f"alert:crypto:{user_tg_id}")
+					kb.adjust(2, 2)
+					
+					if not message_ids:
+						logger_main.warning(f"⚠️ on_user_reply_to_question: message_ids пуст, не можем обновить сообщение")
+					else:
+						for admin_id, msg_id in message_ids.items():
+							try:
+								logger_main.info(f"🔄 on_user_reply_to_question: обновляем сообщение для админа {admin_id}, message_id={msg_id}")
+								await message.bot.edit_message_text(
+									chat_id=admin_id,
+									message_id=msg_id,
+									text=alert_text,
+									parse_mode="HTML",
+									reply_markup=kb.as_markup()
+								)
+								logger_main.info(f"✅ on_user_reply_to_question: сообщение успешно обновлено для админа {admin_id}")
+							except Exception as e:
+								logger_main.error(f"❌ Не удалось обновить сообщение о крупной заявке для админа {admin_id}: {e}", exc_info=True)
+					
+					# Удаляем сообщение пользователя
+					await delete_user_message(message)
+					logger_main.info(f"✅ on_user_reply_to_question: обработка завершена, возвращаемся")
+					return
+			else:
+				logger_main.info(f"⚠️ on_user_reply_to_question: условие не выполнено, продолжаем обычную обработку")
+		
+		# Отправляем сообщение админу
+		admin_ids = get_admin_ids()
+		logger_main = logging.getLogger("app.main")
+		
+		if admin_ids and question.get("admin_message_id"):
+			try:
+				# Формируем полное сообщение для админа
+				user_name = question.get("user_name", "Не указано")
+				user_username = question.get("user_username", "Не указано")
+				question_text = question["question_text"]
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
+				initiated_by_admin = bool(question.get("initiated_by_admin"))
+				
+				# Формируем исходное сообщение о вопросе
+				if initiated_by_admin:
+					question_info = (
+						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>"
+					)
+				else:
+					question_info = (
+						f"❓ <b>Вопрос от пользователя</b>\n\n"
+						f"👤 Имя: {user_name}\n"
+						f"📱 Username: @{user_username}\n"
+						f"🆔 ID: <code>{user_tg_id}</code>\n\n"
+						f"💬 <b>Вопрос:</b>\n{question_text}"
+					)
+				
+				# Обновляем сообщение админа с историей переписки
+				from app.keyboards import question_reply_kb
+				await message.bot.edit_message_text(
+					chat_id=admin_ids[0],
+					message_id=question["admin_message_id"],
+					text=question_info + "\n\n" + admin_message,
+					parse_mode="HTML",
+					reply_markup=question_reply_kb(question_id)
+				)
+				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по вопросу {question_id} отправлен админу")
+				
+				# Отправляем временное уведомление пользователю
+				notif_msg = await message.bot.send_message(
+					chat_id=user_tg_id,
+					text="✅ Сообщение отправлено администратору"
+				)
+				await asyncio.sleep(2)
+				try:
+					await message.bot.delete_message(chat_id=user_tg_id, message_id=notif_msg.message_id)
+				except:
+					pass
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
+		
+		# Удаляем сообщение пользователя
+		await delete_user_message(message)
+		
+		# Если у пользователя было сообщение с историей, обновляем его
+		user_message_id = question.get("user_message_id")
+		if user_message_id:
+			try:
+				# Формируем полное сообщение для пользователя
+				if question.get("initiated_by_admin"):
+					question_info = "💬 <b>Сообщение администратора</b>\n\n"
+				else:
+					question_info = "❓ <b>Ваш вопрос</b>\n\n"
+				
+				# Получаем обновленную историю переписки
+				updated_messages = await db_local.get_question_messages(question_id)
+				history_lines = []
+				for msg in updated_messages:
+					if msg["sender_type"] == "admin":
+						history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
+					else:
+						history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
+				
+				history_text = "\n\n".join(history_lines)
+				user_message = question_info + history_text
+				
+				# Обновляем сообщение пользователя
+				from app.keyboards import question_user_reply_kb
+				await message.bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=user_message_id,
+					text=user_message,
+					parse_mode="HTML",
+					reply_markup=question_user_reply_kb(question_id)
+				)
+			except Exception as e:
+				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
+
+	# Обработчик ответов пользователя на сообщения админа по обычной заявке (должен быть ПЕРЕД обработчиком для продажи)
+	# УБРАЛИ StateFilter(None) - обработчик должен работать в любом состоянии, если есть активная заявка
+	@dp.message(
+		is_not_admin_message,
+		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
+		~(F.text.startswith("/") if F.text else False)
+	)
+	async def on_user_reply_to_order(message: Message, state: FSMContext):
+		"""Обработчик ответов пользователя на сообщения админа по обычной заявке"""
+		if not message.from_user:
+			return
+		
+		# Проверяем, не является ли отправитель админом - если да, пропускаем обработку
+		admin_ids = get_admin_ids()
+		admin_usernames = get_admin_usernames()
+		user_id = message.from_user.id
+		username = message.from_user.username
+		if is_admin(user_id, username, admin_ids, admin_usernames):
+			logger_main = logging.getLogger("app.main")
+			logger_main.info(f"🟡🟡🟡 on_user_reply_to_order: сообщение от админа, пропускаем обработку")
+			return
+		
+		from app.di import get_db
+		db_local = get_db()
+		
+		user_tg_id = message.from_user.id
+		
+		# СНАЧАЛА проверяем, есть ли активный вопрос - если есть, пропускаем обработку
+		# чтобы сообщение обработал on_user_reply_to_question
+		question_id = await db_local.get_active_question_by_user(user_tg_id)
+		if question_id:
+			question = await db_local.get_question_by_id(question_id)
+			if question and not question.get("completed_at"):
+				# Есть активный вопрос, пропускаем обработку
+				logger_main = logging.getLogger("app.main")
+				logger_main.info(f"🔍 on_user_reply_to_order: пропускаем обработку, есть активный вопрос question_id={question_id}")
+				return
+		
+		# Проверяем, есть ли у пользователя активная заявка
 		# Получаем последнюю активную заявку пользователя
 		order_id = await db_local.get_active_order_by_user(user_tg_id)
 		
@@ -3232,12 +4205,32 @@ async def main() -> None:
 				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
 	
 	# Обработчик ответов пользователя на сообщения админа по сделке на продажу
+	# УБРАЛИ StateFilter(None) - обработчик должен работать в любом состоянии, если есть активная заявка на продажу
 	@dp.message(
+		is_not_admin_message,
 		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
-		StateFilter(None),
 		~(F.text.startswith("/") if F.text else False)
 	)
-	async def on_user_reply_to_sell_order(message: Message):
+	async def on_user_reply_to_sell_order(message: Message, state: FSMContext):
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🟠🟠🟠 on_user_reply_to_sell_order: НАЧАЛО ОБРАБОТКИ")
+		logger_main.info(f"🟠🟠🟠 on_user_reply_to_sell_order: message_id={message.message_id}, from_user={message.from_user.id if message.from_user else None}, text='{message.text or message.caption or ''}'")
+		current_state = await state.get_state()
+		logger_main.info(f"🟠🟠🟠 on_user_reply_to_sell_order: current_state={current_state}")
+		
+		if not message.from_user:
+			return
+		
+		# Проверяем, не является ли отправитель админом - если да, пропускаем обработку
+		from app.admin import is_admin
+		from app.di import get_admin_ids, get_admin_usernames
+		admin_ids = get_admin_ids()
+		admin_usernames = get_admin_usernames()
+		user_id = message.from_user.id
+		username = message.from_user.username
+		if is_admin(user_id, username, admin_ids, admin_usernames):
+			logger_main.info(f"🟠🟠🟠 on_user_reply_to_sell_order: сообщение от админа, пропускаем обработку")
+			return
 		"""Обработчик ответов пользователя на сообщения админа по сделке"""
 		if not message.from_user:
 			return
@@ -3398,152 +4391,6 @@ async def main() -> None:
 			except Exception as e:
 				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
 	
-	# Обработчик ответов пользователя на вопросы админа
-	@dp.message(
-		~(F.forward_origin.as_(bool) | F.forward_from.as_(bool)),
-		StateFilter(None),
-		~(F.text.startswith("/") if F.text else False)
-	)
-	async def on_user_reply_to_question(message: Message):
-		"""Обработчик ответов пользователя на вопросы админа"""
-		if not message.from_user:
-			return
-		
-		from app.di import get_db
-		db_local = get_db()
-		
-		# Проверяем, есть ли у пользователя активный вопрос
-		user_tg_id = message.from_user.id
-		
-		# Получаем последний активный вопрос пользователя
-		question_id = await db_local.get_active_question_by_user(user_tg_id)
-		
-		if not question_id:
-			# Нет активного вопроса, пропускаем обработку
-			return
-		
-		# Получаем информацию о вопросе
-		question = await db_local.get_question_by_id(question_id)
-		if not question:
-			return
-		
-		# Проверяем, не закрыт ли вопрос
-		if question.get("completed_at"):
-			# Вопрос закрыт, не обрабатываем ответ
-			return
-		
-		# Получаем текст сообщения
-		message_text = message.text or message.caption or ""
-		if not message_text.strip():
-			return
-		
-		# Сохраняем сообщение в истории переписки
-		await db_local.add_question_message(question_id, "user", message_text)
-		
-		# Получаем всю историю переписки
-		messages = await db_local.get_question_messages(question_id)
-		
-		# Формируем сообщение для админа с историей
-		history_lines = []
-		for msg in messages:
-			if msg["sender_type"] == "admin":
-				history_lines.append(f"💬 <b>Вы:</b>\n{msg['message_text']}")
-			else:
-				history_lines.append(f"👤 <b>Пользователь:</b>\n{msg['message_text']}")
-		
-		admin_message = "\n\n".join(history_lines)
-		
-		# Отправляем сообщение админу
-		admin_ids = get_admin_ids()
-		logger_main = logging.getLogger("app.main")
-		
-		if admin_ids and question.get("admin_message_id"):
-			try:
-				# Формируем полное сообщение для админа
-				user_name = question.get("user_name", "Не указано")
-				user_username = question.get("user_username", "Не указано")
-				question_text = question["question_text"]
-				initiated_by_admin = bool(question.get("initiated_by_admin"))
-				initiated_by_admin = bool(question.get("initiated_by_admin"))
-				
-				# Формируем исходное сообщение о вопросе
-				if initiated_by_admin:
-					question_info = (
-						f"💬 <b>Диалог (инициировано администратором)</b>\n\n"
-						f"👤 Имя: {user_name}\n"
-						f"📱 Username: @{user_username}\n"
-						f"🆔 ID: <code>{user_tg_id}</code>"
-					)
-				else:
-					question_info = (
-						f"❓ <b>Вопрос от пользователя</b>\n\n"
-						f"👤 Имя: {user_name}\n"
-						f"📱 Username: @{user_username}\n"
-						f"🆔 ID: <code>{user_tg_id}</code>\n\n"
-						f"💬 <b>Вопрос:</b>\n{question_text}"
-					)
-				
-				# Обновляем сообщение админа с историей переписки
-				from app.keyboards import question_reply_kb
-				await message.bot.edit_message_text(
-					chat_id=admin_ids[0],
-					message_id=question["admin_message_id"],
-					text=question_info + "\n\n" + admin_message,
-					parse_mode="HTML",
-					reply_markup=question_reply_kb(question_id)
-				)
-				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по вопросу {question_id} отправлен админу")
-				
-				# Отправляем временное уведомление пользователю
-				notif_msg = await message.bot.send_message(
-					chat_id=user_tg_id,
-					text="✅ Сообщение отправлено администратору"
-				)
-				await asyncio.sleep(2)
-				try:
-					await message.bot.delete_message(chat_id=user_tg_id, message_id=notif_msg.message_id)
-				except:
-					pass
-			except Exception as e:
-				logger_main.error(f"❌ Ошибка обновления сообщения админу: {e}", exc_info=True)
-		
-		# Удаляем сообщение пользователя
-		await delete_user_message(message)
-		
-		# Если у пользователя было сообщение с историей, обновляем его
-		user_message_id = question.get("user_message_id")
-		if user_message_id:
-			try:
-				# Формируем полное сообщение для пользователя
-				if question.get("initiated_by_admin"):
-					question_info = "💬 <b>Сообщение администратора</b>\n\n"
-				else:
-					question_info = "❓ <b>Ваш вопрос</b>\n\n"
-				
-				# Получаем обновленную историю переписки
-				updated_messages = await db_local.get_question_messages(question_id)
-				history_lines = []
-				for msg in updated_messages:
-					if msg["sender_type"] == "admin":
-						history_lines.append(f"💬 <b>Администратор:</b>\n{msg['message_text']}")
-					else:
-						history_lines.append(f"👤 <b>Вы:</b>\n{msg['message_text']}")
-				
-				history_text = "\n\n".join(history_lines)
-				user_message = question_info + history_text
-				
-				# Обновляем сообщение пользователя
-				from app.keyboards import question_user_reply_kb
-				await message.bot.edit_message_text(
-					chat_id=user_tg_id,
-					message_id=user_message_id,
-					text=user_message,
-					parse_mode="HTML",
-					reply_markup=question_user_reply_kb(question_id)
-				)
-			except Exception as e:
-				logger_main.error(f"❌ Ошибка обновления сообщения пользователю: {e}", exc_info=True)
-	
 	# Обработчик кнопки "Ответить" для пользователя по вопросу
 	@dp.callback_query(F.data.startswith("question:user:reply:"))
 	async def on_question_user_reply_start(cb: CallbackQuery, state: FSMContext):
@@ -3580,16 +4427,27 @@ async def main() -> None:
 		
 		# Если пользователь в процессе покупки, не меняем состояние покупки
 		current_state = await state.get_state()
-		if current_state in (BuyStates.waiting_confirmation.state, BuyStates.waiting_wallet_address.state):
-			prompt_msg = await cb.message.answer(
-				"📝 Напишите сообщение администратору:",
-				reply_markup=ForceReply(selective=True)
-			)
-			await state.update_data(
-				pending_question_reply_id=question_id,
-				pending_question_reply_prompt_id=prompt_msg.message_id
-			)
-			await cb.answer()
+		if current_state in (
+			BuyStates.waiting_confirmation.state, 
+			BuyStates.waiting_wallet_address.state,
+			BuyStates.waiting_delivery_method.state,
+			BuyStates.waiting_payment_confirmation.state,
+			BuyStates.waiting_payment_proof.state
+		):
+			try:
+				prompt_msg = await cb.message.answer(
+					"📝 Напишите сообщение администратору:",
+					reply_markup=ForceReply(selective=True)
+				)
+				await state.update_data(
+					pending_question_reply_id=question_id,
+					pending_question_reply_prompt_id=prompt_msg.message_id
+				)
+				await cb.answer()
+			except Exception as e:
+				logger_main = logging.getLogger("app.main")
+				logger_main.error(f"❌ Ошибка при отправке запроса на ответ в on_question_user_reply_start: {e}", exc_info=True)
+				await cb.answer("❌ Произошла ошибка. Попробуйте позже.", show_alert=True)
 			return
 		
 		# Сохраняем question_id в состоянии
@@ -3665,6 +4523,19 @@ async def main() -> None:
 		
 		# Сохраняем сообщение в истории переписки
 		await db_local.add_question_message(question_id, "user", reply_text)
+
+		# Если это крупная заявка, обновляем админский алерт с перепиской
+		try:
+			await try_update_large_order_alert(
+				bot=message.bot,
+				state=state,
+				user_tg_id=question["user_tg_id"],
+				user_name=question.get("user_name", "") or "",
+				user_username=question.get("user_username", "") or ""
+			)
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.warning(f"⚠️ Не удалось обновить алерт крупной заявки: {e}")
 		
 		# Получаем всю историю переписки
 		messages = await db_local.get_question_messages(question_id)
@@ -3777,9 +4648,20 @@ async def main() -> None:
 					amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
 				else:
 					amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
+				# Проверяем, является ли это крупной заявкой
+				alert_threshold = data.get("alert_threshold", 400.0)
+				total_usd = data.get("total_usd", 0)
+				is_large_order = total_usd >= alert_threshold
+				
+				# Для крупных заявок не показываем сумму оплаты
+				if is_large_order:
+					payment_text = "ожидайте сообщение администратора"
+				else:
+					payment_text = f"{int(amount_currency)} {currency_symbol}"
+				
 				confirmation_text = (
 					f"Вам будет зачислено: {amount_str} {crypto_display}\n"
-					f"Вам необходимо оплатить: {int(amount_currency)} {currency_symbol}"
+					f"Вам необходимо оплатить: {payment_text}"
 				)
 				from app.keyboards import buy_confirmation_kb
 				await message.answer(confirmation_text, reply_markup=buy_confirmation_kb())

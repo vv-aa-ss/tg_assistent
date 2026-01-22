@@ -1186,12 +1186,31 @@ class Database:
 		
 		tg_id = row[0]
 		
-		# Удаляем заявки пользователя (таблица orders ссылается на users(tg_id) без CASCADE)
 		if tg_id:
+			# Удаляем все связанные записи из таблиц, которые ссылаются на users(tg_id) без ON DELETE CASCADE
+			# Порядок важен: сначала удаляем зависимые таблицы, потом основные
+			
+			# 1. Удаляем вопросы (questions) - автоматически удалит question_messages благодаря CASCADE
+			await self._db.execute("DELETE FROM questions WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted questions for user: id={user_id}, tg_id={tg_id}")
+			
+			# 2. Удаляем заявки на покупку (orders) - автоматически удалит buy_order_messages и debts благодаря CASCADE
 			await self._db.execute("DELETE FROM orders WHERE user_tg_id = ?", (tg_id,))
 			_logger.debug(f"Deleted orders for user: id={user_id}, tg_id={tg_id}")
+			
+			# 3. Удаляем заявки на продажу (sell_orders) - автоматически удалит order_messages благодаря CASCADE
+			await self._db.execute("DELETE FROM sell_orders WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted sell_orders for user: id={user_id}, tg_id={tg_id}")
+			
+			# 4. Удаляем долги пользователя (user_debts)
+			await self._db.execute("DELETE FROM user_debts WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted user_debts for user: id={user_id}, tg_id={tg_id}")
+			
+			# 5. Удаляем ожидающие реквизиты (pending_requisites)
+			await self._db.execute("DELETE FROM pending_requisites WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted pending_requisites for user: id={user_id}, tg_id={tg_id}")
 		
-		# Удаление пользователя автоматически удалит связанные записи из user_card
+		# Удаление пользователя автоматически удалит связанные записи из user_card и card_delivery_log
 		# благодаря ON DELETE CASCADE во внешних ключах
 		await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
 		await self._db.commit()
