@@ -468,10 +468,26 @@ def deal_alert_admin_kb(deal_id: int) -> InlineKeyboardMarkup:
 	kb.button(text="💳 Реквизиты", callback_data=f"dealalert:requisites:{deal_id}")
 	kb.button(text="💰 Сумма", callback_data=f"dealalert:amount:{deal_id}")
 	kb.button(text="🪙 Монеты", callback_data=f"dealalert:crypto:{deal_id}")
-	kb.button(text="💳 Долг", callback_data=f"dealalert:debt:{deal_id}")
+	kb.button(text="💳 Долг", callback_data=f"dealalert:debt:menu:{deal_id}")
 	kb.button(text="✅ Завершить сделку", callback_data=f"dealalert:complete:{deal_id}")
 	kb.button(text="❌ Отменить сделку", callback_data=f"dealalert:cancel:{deal_id}")
 	kb.adjust(2, 2, 1, 2)
+	return kb.as_markup()
+
+
+def deal_alert_admin_debt_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для выбора действия по долгу в алерте сделки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"dealalert:message:{deal_id}")
+	kb.button(text="💳 Реквизиты", callback_data=f"dealalert:requisites:{deal_id}")
+	kb.button(text="💰 Сумма", callback_data=f"dealalert:amount:{deal_id}")
+	kb.button(text="🪙 Монеты", callback_data=f"dealalert:crypto:{deal_id}")
+	kb.button(text="➕ Дать", callback_data=f"dealalert:debt:add:{deal_id}")
+	kb.button(text="➖ Забрать", callback_data=f"dealalert:debt:take:{deal_id}")
+	kb.button(text="⬅️ Назад", callback_data=f"dealalert:debt:back:{deal_id}")
+	kb.button(text="✅ Завершить сделку", callback_data=f"dealalert:complete:{deal_id}")
+	kb.button(text="❌ Отменить сделку", callback_data=f"dealalert:cancel:{deal_id}")
+	kb.adjust(2, 2, 3, 2)
 	return kb.as_markup()
 
 
@@ -496,10 +512,11 @@ def buy_deal_user_reply_kb(deal_id: int, show_how_pay: bool = False) -> InlineKe
 
 
 def buy_deal_completed_delete_kb(deal_id: int) -> InlineKeyboardMarkup:
-	"""Клавиатура для пользователя с кнопкой удаления завершенной сделки."""
+	"""Клавиатура для пользователя: написать + удалить завершенную сделку."""
 	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
 	kb.button(text="🗑️ Удалить", callback_data=f"deal:user:delete:{deal_id}")
-	kb.adjust(1)
+	kb.adjust(1, 1)
 	return kb.as_markup()
 
 

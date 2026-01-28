@@ -3614,6 +3614,13 @@ class Database:
 		await self._db.commit()
 		return True
 
+	async def clear_user_debts(self, user_tg_id: int) -> None:
+		"""Удаляет все долги пользователя (и по сделкам, и ручные)."""
+		assert self._db
+		await self._db.execute("DELETE FROM debts WHERE user_tg_id = ?", (user_tg_id,))
+		await self._db.execute("DELETE FROM user_debts WHERE user_tg_id = ?", (user_tg_id,))
+		await self._db.commit()
+
 	async def save_pending_requisites(
 		self,
 		user_tg_id: int,

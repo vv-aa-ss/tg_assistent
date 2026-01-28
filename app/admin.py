@@ -3854,16 +3854,54 @@ async def deal_alert_crypto_start(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
-@admin_router.callback_query(F.data.startswith("dealalert:debt:"))
+@admin_router.callback_query(F.data.startswith("dealalert:debt:menu:"))
+async def deal_alert_debt_menu(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[3])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	from app.keyboards import deal_alert_admin_debt_kb
+	await cb.message.edit_reply_markup(reply_markup=deal_alert_admin_debt_kb(deal_id))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:debt:back:"))
+async def deal_alert_debt_back(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[3])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	from app.keyboards import deal_alert_admin_kb
+	await cb.message.edit_reply_markup(reply_markup=deal_alert_admin_kb(deal_id))
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:debt:add:"))
 async def deal_alert_debt_start(cb: CallbackQuery, state: FSMContext):
 	try:
-		deal_id = int(cb.data.split(":")[2])
+		deal_id = int(cb.data.split(":")[3])
 	except (ValueError, IndexError):
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
 	await state.set_state(DealAlertDebtStates.waiting_amount)
-	await state.update_data(deal_id=deal_id)
+	await state.update_data(deal_id=deal_id, debt_action="add")
 	prompt = await cb.message.answer("Введите сумму долга в валюте сделки:")
+	await state.update_data(deal_prompt_message_id=prompt.message_id)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:debt:take:"))
+async def deal_alert_debt_take(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[3])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	await state.set_state(DealAlertDebtStates.waiting_amount)
+	await state.update_data(deal_id=deal_id, debt_action="take")
+	prompt = await cb.message.answer("Введите сумму списания долга в валюте сделки:")
 	await state.update_data(deal_prompt_message_id=prompt.message_id)
 	await cb.answer()
 
@@ -3952,6 +3990,7 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		return
 	data = await state.get_data()
 	deal_id = data.get("deal_id")
+	debt_action = data.get("debt_action", "add")
 	if not deal_id:
 		await state.clear()
 		return
@@ -3969,14 +4008,18 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		await state.clear()
 		return
 	currency_symbol = deal.get("currency_symbol", "Br")
-	base_amount_currency = float(deal.get("amount_currency", 0))
-	if debt_amount > base_amount_currency:
-		await message.answer("❌ Долг не может быть больше суммы сделки.")
-		return
-	new_amount_currency = base_amount_currency - debt_amount
-	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
-	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
-	deal["amount_currency"] = new_amount_currency
+	if debt_action == "take":
+		# Списываем долг без изменения суммы сделки
+		await db.add_user_debt(deal["user_tg_id"], -debt_amount, currency_symbol)
+	else:
+		base_amount_currency = float(deal.get("amount_currency", 0))
+		if debt_amount > base_amount_currency:
+			await message.answer("❌ Долг не может быть больше суммы сделки.")
+			return
+		new_amount_currency = base_amount_currency - debt_amount
+		await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+		await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+		deal["amount_currency"] = new_amount_currency
 	from app.main import update_buy_deal_alert
 	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:

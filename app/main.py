@@ -2359,6 +2359,8 @@ async def main() -> None:
 		is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
 		admin_amount_set = bool(deal.get("admin_amount_set"))
 		hide_requisites = is_large_order and not admin_amount_set
+		if deal.get("status") == "completed":
+			hide_requisites = True
 		prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
 		if hide_requisites:
 			user_text = _build_user_deal_with_requisites_chat_text(
@@ -2400,6 +2402,26 @@ async def main() -> None:
 					reply_markup=reply_markup
 				)
 				await db_local.update_buy_deal_user_message_id(deal_id, sent.message_id)
+		except Exception:
+			pass
+		try:
+			admin_ids = get_admin_ids()
+			if admin_ids:
+				admin_id = admin_ids[0]
+				alert_message_id = None
+				try:
+					alert_message_id = buy_deal_alerts.get(deal_id, {}).get(admin_id)
+				except Exception:
+					alert_message_id = None
+				notice_text = f"🔔 Новое сообщение пользователя по сделке:\n{reply_text}"
+				if alert_message_id:
+					await message.bot.send_message(
+						chat_id=admin_id,
+						text=notice_text,
+						reply_to_message_id=alert_message_id
+					)
+				else:
+					await message.bot.send_message(chat_id=admin_id, text=notice_text)
 		except Exception:
 			pass
 		await update_buy_deal_alert(message.bot, deal_id)
