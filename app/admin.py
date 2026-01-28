@@ -164,12 +164,13 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			requisites_text=requisites_text,
 		)
 	reply_markup = None
+	show_how_pay = bool(requisites_text) and not (is_large_order and not admin_amount_set)
 	if deal.get("status") in ("await_proof", "completed"):
-		reply_markup = buy_deal_user_reply_kb(deal_id)
+		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
 	elif deal.get("status") == "await_payment":
-		reply_markup = buy_deal_paid_reply_kb(deal_id)
+		reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 	elif messages:
-		reply_markup = buy_deal_user_reply_kb(deal_id)
+		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
 	return user_text, reply_markup
 
 
@@ -2083,13 +2084,13 @@ def _parse_float(value: str, default: float) -> float:
 
 async def _get_buy_calc_settings(db) -> dict:
 	return {
-		"buy_markup_percent_small": _parse_float(await db.get_setting("buy_markup_percent_small", "15"), 15),
-		"buy_markup_percent_101_449": _parse_float(await db.get_setting("buy_markup_percent_101_449", "11"), 11),
-		"buy_markup_percent_450_699": _parse_float(await db.get_setting("buy_markup_percent_450_699", "9"), 9),
-		"buy_markup_percent_700_999": _parse_float(await db.get_setting("buy_markup_percent_700_999", "8"), 8),
-		"buy_markup_percent_1000_1499": _parse_float(await db.get_setting("buy_markup_percent_1000_1499", "7"), 7),
-		"buy_markup_percent_1500_1999": _parse_float(await db.get_setting("buy_markup_percent_1500_1999", "6"), 6),
-		"buy_markup_percent_2000_plus": _parse_float(await db.get_setting("buy_markup_percent_2000_plus", "5"), 5),
+		"buy_markup_percent_small": _parse_float(await db.get_setting("buy_markup_percent_small", "20"), 20),
+		"buy_markup_percent_101_449": _parse_float(await db.get_setting("buy_markup_percent_101_449", "15"), 15),
+		"buy_markup_percent_450_699": _parse_float(await db.get_setting("buy_markup_percent_450_699", "14"), 14),
+		"buy_markup_percent_700_999": _parse_float(await db.get_setting("buy_markup_percent_700_999", "13"), 13),
+		"buy_markup_percent_1000_1499": _parse_float(await db.get_setting("buy_markup_percent_1000_1499", "12"), 12),
+		"buy_markup_percent_1500_1999": _parse_float(await db.get_setting("buy_markup_percent_1500_1999", "11"), 11),
+		"buy_markup_percent_2000_plus": _parse_float(await db.get_setting("buy_markup_percent_2000_plus", "10"), 10),
 		"buy_min_usd": _parse_float(await db.get_setting("buy_min_usd", "15"), 15),
 		"buy_extra_fee_usd_low": _parse_float(await db.get_setting("buy_extra_fee_usd_low", "50"), 50),
 		"buy_extra_fee_usd_mid": _parse_float(await db.get_setting("buy_extra_fee_usd_mid", "67"), 67),
@@ -2514,21 +2515,32 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 					_build_deal_chat_blocks,
 					_build_user_deal_chat_prompt_text,
 					_notify_user_new_message,
+					_get_deal_requisites_text,
 				)
 				chat_blocks = _build_deal_chat_blocks(messages, deal.get("user_name", "Пользователь"))
 				prompt = "Согласен ❔❔❔:" if deal.get("status") == "await_confirmation" else None
 				user_text = _build_user_deal_chat_prompt_text(deal, chat_blocks, prompt)
 				reply_markup = None
 				from app.keyboards import buy_deal_confirm_kb, buy_deal_paid_kb, buy_deal_user_reply_kb
+				has_requisites = False
+				try:
+					requisites_text = await _get_deal_requisites_text(
+						db,
+						deal.get("user_tg_id"),
+						deal.get("country_code")
+					)
+					has_requisites = bool(requisites_text)
+				except Exception:
+					pass
 				if deal.get("status") == "await_confirmation":
 					reply_markup = buy_deal_confirm_kb()
 				elif deal.get("status") == "await_payment":
 					from app.keyboards import buy_deal_paid_reply_kb
-					reply_markup = buy_deal_paid_reply_kb(deal_id)
+					reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=has_requisites)
 				elif deal.get("status") in ("await_requisites", "await_proof"):
 					reply_markup = None
 				else:
-					reply_markup = buy_deal_user_reply_kb(deal_id)
+					reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=has_requisites)
 				try:
 					if deal.get("user_message_id"):
 						await bot.edit_message_text(
@@ -3451,11 +3463,12 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 	await db.add_buy_deal_message(deal_id, "admin", reply_text)
 	messages = await db.get_buy_deal_messages(deal_id)
 	user_name = deal.get("user_name", "Пользователь")
-	from app.main import _build_user_deal_admin_message_text, _build_user_deal_chat_text, _build_user_deal_with_requisites_chat_text, _build_deal_chat_lines, _get_deal_requisites_text, update_buy_deal_alert, _notify_user_new_message
+	from app.main import _build_user_deal_admin_message_text, _build_user_deal_chat_text, _build_user_deal_with_requisites_chat_text, _build_deal_chat_lines, _get_deal_requisites_text, update_buy_deal_alert, _notify_user_new_message, _append_prompt
 	user_text = ""
 	has_user_reply = any(msg["sender_type"] == "user" for msg in messages)
+	prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
 	if not has_user_reply and len(messages) == 1:
-		user_text = _build_user_deal_admin_message_text(deal, reply_text)
+		user_text = _append_prompt(_build_user_deal_admin_message_text(deal, reply_text), prompt_wallet)
 	else:
 		chat_lines = _build_deal_chat_lines(messages, user_name)
 		requisites_text = await _get_deal_requisites_text(
@@ -3463,19 +3476,39 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 			deal.get("user_tg_id"),
 			deal.get("country_code")
 		)
-		if requisites_text:
+		alert_threshold = 400.0
+		try:
+			alert_threshold_str = await db.get_setting("buy_alert_usd_threshold", "400")
+			alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+		except (ValueError, TypeError):
+			alert_threshold = 400.0
+		is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
+		admin_amount_set = bool(deal.get("admin_amount_set"))
+		hide_requisites = is_large_order and not admin_amount_set
+		if hide_requisites:
 			user_text = _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
-				chat_lines=chat_lines
+				chat_lines=chat_lines,
+				prompt=prompt_wallet,
+				amount_currency_override=None,
+				show_requisites=False,
+			)
+		elif requisites_text:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+				prompt=prompt_wallet,
 			)
 		else:
-			user_text = _build_user_deal_chat_text(deal, chat_lines)
+			user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
 	try:
-		reply_markup = buy_deal_user_reply_kb(deal_id)
+		show_how_pay = bool(requisites_text) and not hide_requisites
+		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
 		if deal.get("status") == "await_payment":
 			from app.keyboards import buy_deal_paid_reply_kb
-			reply_markup = buy_deal_paid_reply_kb(deal_id)
+			reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 		if deal.get("user_message_id"):
 			await bot.edit_message_text(
 				chat_id=user_tg_id,
@@ -3494,7 +3527,19 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 			await db.update_buy_deal_user_message_id(deal_id, sent.message_id)
 	except Exception:
 		pass
-	await _notify_user_new_message(bot, user_tg_id)
+	try:
+		from app.notifications import notification_ids
+		notification_key = (user_tg_id, deal_id, "deal")
+		if notification_key in notification_ids:
+			try:
+				await bot.delete_message(chat_id=user_tg_id, message_id=notification_ids[notification_key])
+			except Exception:
+				pass
+			del notification_ids[notification_key]
+		notif_msg = await bot.send_message(chat_id=user_tg_id, text="🔔 Новое сообщение от администратора")
+		notification_ids[notification_key] = notif_msg.message_id
+	except Exception:
+		pass
 	await update_buy_deal_alert(bot, deal_id)
 	prompt_id = data.get("deal_prompt_message_id")
 	if prompt_id:

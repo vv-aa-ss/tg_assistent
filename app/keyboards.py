@@ -116,12 +116,16 @@ def buy_deal_paid_kb() -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def buy_deal_paid_reply_kb(deal_id: int) -> InlineKeyboardMarkup:
+def buy_deal_paid_reply_kb(deal_id: int, show_how_pay: bool = False) -> InlineKeyboardMarkup:
 	"""Inline-клавиатура оплаты + написать."""
 	kb = InlineKeyboardBuilder()
 	kb.button(text="ОПЛАТИЛ", callback_data="deal:paid")
 	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
-	kb.adjust(1, 1)
+	if show_how_pay:
+		kb.button(text="❓ Как платить", callback_data=f"deal:user:how_pay:{deal_id}")
+		kb.adjust(1, 1, 1)
+	else:
+		kb.adjust(1, 1)
 	return kb.as_markup()
 
 
@@ -479,11 +483,15 @@ def deal_alert_admin_completed_kb(deal_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def buy_deal_user_reply_kb(deal_id: int) -> InlineKeyboardMarkup:
+def buy_deal_user_reply_kb(deal_id: int, show_how_pay: bool = False) -> InlineKeyboardMarkup:
 	"""Клавиатура для пользователя с кнопкой 'Написать' по сделке."""
 	kb = InlineKeyboardBuilder()
 	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
-	kb.adjust(1)
+	if show_how_pay:
+		kb.button(text="❓ Как платить", callback_data=f"deal:user:how_pay:{deal_id}")
+		kb.adjust(1, 1)
+	else:
+		kb.adjust(1)
 	return kb.as_markup()
 
 

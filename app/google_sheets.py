@@ -1229,7 +1229,7 @@ def _write_all_to_google_sheet_one_row_sync(
 		client = _get_google_sheets_client(credentials_path)
 		if not client:
 			logger.error("Не удалось создать клиент Google Sheets")
-			return {"success": False, "written_cells": []}
+			return {"success": False, "written_cells": [], "written_entries": []}
 		
 		# Открываем таблицу
 		try:
@@ -1243,10 +1243,11 @@ def _write_all_to_google_sheet_one_row_sync(
 		empty_row = _find_empty_row_in_range(worksheet, delete_range, start_row=start_row, max_row=max_row)
 		if empty_row is None or empty_row > max_row:
 			logger.error(f"❌ Не найдена свободная строка в диапазоне {start_row}-{max_row} для диапазона {delete_range}")
-			return {"success": False, "written_cells": []}
+			return {"success": False, "written_cells": [], "written_entries": []}
 		logger.info(f"📍 Найдена свободная строка для объединенной записи: {empty_row} (диапазон: {start_row}-{max_row}, проверяемый диапазон: {delete_range})")
 		
 		written_cells = []  # Список записанных ячеек для отчета
+		written_entries = []  # Структурированные данные для вывода
 		batch_updates = []  # Список обновлений для batch-записи
 		
 		# Суммируем криптовалюты с одинаковой валютой
@@ -1271,6 +1272,15 @@ def _write_all_to_google_sheet_one_row_sync(
 					'values': [[usd_amount_rounded]]
 				})
 				written_cells.append(f"{cell_address} ({currency}: {usd_amount_rounded} USD)")
+				written_entries.append(
+					{
+						"type": "crypto",
+						"label": currency,
+						"cell": cell_address,
+						"amount": usd_amount_rounded,
+						"currency": "USD",
+					}
+				)
 				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} ({currency})")
 			else:
 				logger.warning(f"⚠️ Не найден столбец для криптовалюты {currency}, пропускаем запись")
@@ -1297,10 +1307,19 @@ def _write_all_to_google_sheet_one_row_sync(
 					'values': [[usd_amount_rounded]]
 				})
 				written_cells.append(f"{cell_address} (XMR-{xmr_number}: {usd_amount_rounded} USD)")
+				written_entries.append(
+					{
+						"type": "crypto",
+						"label": f"XMR-{xmr_number}",
+						"cell": cell_address,
+						"amount": usd_amount_rounded,
+						"currency": "USD",
+					}
+				)
 				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Суммируем наличные для каждой карты (по card_id для правильного суммирования)
-		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name}}
+		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name, "group_name": group_name}}
 		for pair in card_cash_pairs:
 			card_data = pair.get("card")
 			cash_data = pair.get("cash")
@@ -1314,7 +1333,8 @@ def _write_all_to_google_sheet_one_row_sync(
 						card_cash_sum[card_id] = {
 							"column": column,
 							"amount": 0,
-							"card_name": card_data.get("card_name", "")
+							"card_name": card_data.get("card_name", ""),
+							"group_name": card_data.get("group_name") or "Без группы"
 						}
 					card_cash_sum[card_id]["amount"] += cash_amount
 		
@@ -1323,6 +1343,7 @@ def _write_all_to_google_sheet_one_row_sync(
 			column = card_info["column"]
 			total_amount = card_info["amount"]
 			card_name = card_info["card_name"]
+			group_name = card_info.get("group_name") or "Без группы"
 			
 			if total_amount != 0:
 				cell_address = f"{column}{empty_row}"
@@ -1331,6 +1352,16 @@ def _write_all_to_google_sheet_one_row_sync(
 					'values': [[total_amount]]
 				})
 				written_cells.append(f"{cell_address} (Карта {card_name}: {total_amount} RUB)")
+				written_entries.append(
+					{
+						"type": "card",
+						"group": group_name,
+						"card": card_name,
+						"cell": cell_address,
+						"amount": total_amount,
+						"currency": "RUB",
+					}
+				)
 				logger.info(f"✅ Подготовлено к записи {total_amount} RUB в ячейку {cell_address} (карта: {card_name})")
 		
 		# Суммируем наличные без карты (по cash_name)
@@ -1378,7 +1409,7 @@ def _write_all_to_google_sheet_one_row_sync(
 					except Exception as e2:
 						logger.error(f"❌ Ошибка записи ячейки {update['range']}: {e2}")
 		
-		return {"success": True, "written_cells": written_cells, "row": empty_row}
+		return {"success": True, "written_cells": written_cells, "written_entries": written_entries, "row": empty_row}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
@@ -1481,7 +1512,13 @@ async def write_order_to_google_sheet(
 		if user_cards:
 			card = user_cards[0]
 			card_id = card.get("card_id")
-			card_name = card.get("name", "")
+			card_name = card.get("card_name", "")
+			group_name = "Без группы"
+			card_info = await db.get_card_by_id(card_id)
+			if card_info and card_info.get("group_id"):
+				group = await db.get_card_group_by_id(card_info["group_id"])
+				if group and group.get("name"):
+					group_name = group["name"]
 			column = await db.get_card_column(card_id)
 			
 			if column:
@@ -1489,6 +1526,7 @@ async def write_order_to_google_sheet(
 					"card": {
 						"card_id": card_id,
 						"card_name": card_name,
+						"group_name": group_name,
 						"column": column
 					},
 					"cash": {

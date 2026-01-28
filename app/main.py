@@ -9,7 +9,7 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramNetworkError
 from html import escape
-from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery, ForceReply
+from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery, ForceReply, FSInputFile, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -91,7 +91,8 @@ async def update_large_order_alert(
 	admin_ids: list[int],
 	state_amount_currency: float | None = None,
 	state_currency_symbol: str | None = None,
-	current_state: str | None = None
+	current_state: str | None = None,
+	country_code: str | None = None
 ) -> None:
 	"""Обновляет сообщение о крупной заявке с текущим этапом пользователя"""
 	global large_order_alerts
@@ -156,12 +157,14 @@ async def update_large_order_alert(
 			history_text = "\n\n".join(history_lines)
 	
 	# Формируем текст сообщения с этапом
+	country_label = _deal_country_label(country_code or "BYN")
 	if amount_currency is not None and currency_symbol:
 		# Если заявка создана, показываем сумму в валюте заявки
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.') if amount < 1 else f"{amount:.2f}".rstrip('0').rstrip('.')
 		alert_text = (
 			f"🚨 <b>Крупная заявка</b>\n\n"
 			f"Пользователь: {user_name or 'Не указано'} (@{user_username or 'нет'})\n"
+			f"Страна: {country_label}\n"
 			f"Сумма: {int(amount_currency)} {currency_symbol}\n"
 			f"Крипта: {crypto_display}\n"
 			f"Кол-во: {amount_str} {crypto_display}\n\n"
@@ -172,6 +175,7 @@ async def update_large_order_alert(
 		alert_text = (
 			f"🚨 <b>Крупная заявка</b>\n\n"
 			f"Пользователь: {user_name or 'Не указано'} (@{user_username or 'нет'})\n"
+			f"Страна: {country_label}\n"
 			f"Сумма: {total_usd:.2f}$\n"
 			f"Крипта: {crypto_display}\n"
 			f"Кол-во: {amount}\n\n"
@@ -251,6 +255,7 @@ async def try_update_large_order_alert(
 	amount = data.get("amount", 0)
 	state_amount_currency = data.get("final_amount", data.get("amount_currency"))
 	state_currency_symbol = data.get("currency_symbol")
+	country_code = data.get("selected_country", "BYN")
 	
 	logger_main.info(f"🔄 Обновление этапа для пользователя {user_tg_id}: total_usd={total_usd}, threshold={alert_threshold}")
 	
@@ -281,7 +286,8 @@ async def try_update_large_order_alert(
 		admin_ids=admin_ids,
 		state_amount_currency=state_amount_currency,
 		state_currency_symbol=state_currency_symbol,
-		current_state=str(current_state) if current_state else None
+		current_state=str(current_state) if current_state else None,
+		country_code=country_code
 	)
 
 
@@ -619,6 +625,12 @@ def _build_user_deal_chat_text(deal: dict, chat_lines: list[str]) -> str:
 	return "\n".join(lines)
 
 
+def _append_prompt(text: str, prompt: str | None) -> str:
+	if not prompt:
+		return text
+	return f"{text}\n➖➖➖➖➖➖➖➖➖➖➖\n{prompt}"
+
+
 async def _notify_user_new_message(bot: Bot, chat_id: int) -> None:
 	try:
 		notification = await bot.send_message(chat_id=chat_id, text="🔔 Новое сообщение от администратора")
@@ -805,6 +817,7 @@ def _build_admin_open_deal_text(
 		"⬇️Открыта Сделка⬇️",
 		"〰️〰️〰️〰️〰️",
 		f"👤 {user_name} (@{user_username})",
+		f"🌍 Страна: {_deal_country_label(deal.get('country_code', 'BYN'))}",
 		*(financial_lines or []),
 		f"🆔 ID: {deal.get('user_tg_id')}",
 		f"🪙Крипта: {crypto_label}",
@@ -842,6 +855,7 @@ def _build_admin_deal_alert_text(
 		"⚠️ У пользователя нет привязанной карты для оплаты.",
 		"",
 		f"👤 {user_name} (@{user_username})",
+		f"🌍 Страна: {_deal_country_label(deal.get('country_code', 'BYN'))}",
 		*(financial_lines or []),
 		f"🆔 ID: {deal.get('user_tg_id')}",
 		f"Крипта: {crypto_label}",
@@ -1944,7 +1958,64 @@ async def main() -> None:
 		if not deal:
 			await cb.answer("Сделка не найдена", show_alert=True)
 			return
+		try:
+			from app.notifications import notification_ids
+			notification_key = (cb.from_user.id, deal_id, "deal")
+			if notification_key in notification_ids:
+				try:
+					await cb.bot.delete_message(chat_id=cb.from_user.id, message_id=notification_ids[notification_key])
+				except Exception:
+					pass
+				del notification_ids[notification_key]
+		except Exception:
+			pass
 		await state.set_state(DealUserReplyStates.waiting_reply)
+		try:
+			messages = await db_local.get_buy_deal_messages(deal_id)
+			chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+			requisites_text = await _get_deal_requisites_text(
+				db_local,
+				deal.get("user_tg_id"),
+				deal.get("country_code")
+			)
+			alert_threshold = 400.0
+			try:
+				alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+				alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+			except (ValueError, TypeError):
+				alert_threshold = 400.0
+			is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
+			admin_amount_set = bool(deal.get("admin_amount_set"))
+			hide_requisites = is_large_order and not admin_amount_set
+			prompt_text = "➡️Введи сообщение администратору:"
+			if hide_requisites:
+				user_text = _build_user_deal_with_requisites_chat_text(
+					deal=deal,
+					requisites_text=requisites_text,
+					chat_lines=chat_lines,
+					prompt=prompt_text,
+					amount_currency_override=None,
+					show_requisites=False,
+				)
+			elif requisites_text:
+				user_text = _build_user_deal_with_requisites_chat_text(
+					deal=deal,
+					requisites_text=requisites_text,
+					chat_lines=chat_lines,
+					prompt=prompt_text,
+				)
+			else:
+				user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_text)
+			if deal.get("user_message_id"):
+				await cb.bot.edit_message_text(
+					chat_id=cb.from_user.id,
+					message_id=deal["user_message_id"],
+					text=user_text,
+					parse_mode="HTML",
+					reply_markup=cb.message.reply_markup
+				)
+		except Exception:
+			pass
 		try:
 			prompt = await cb.bot.send_message(
 				chat_id=cb.from_user.id,
@@ -1959,6 +2030,112 @@ async def main() -> None:
 			await state.clear()
 			return
 		await state.update_data(deal_id=deal_id, deal_reply_prompt_id=prompt.message_id)
+
+	@dp.callback_query(F.data.startswith("deal:user:how_pay:") & ~F.data.startswith("deal:user:how_pay:delete:"))
+	async def on_deal_user_how_pay(cb: CallbackQuery):
+		if not cb.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			return
+		try:
+			deal_id = int(cb.data.split(":")[3])
+		except (ValueError, IndexError):
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		deal = await db_local.get_buy_deal_by_id(deal_id)
+		if not deal or deal.get("user_tg_id") != cb.from_user.id:
+			await cb.answer("Сделка не найдена", show_alert=True)
+			return
+		instruction_text = (
+			"Инстукция пополнения ЕРИП через аппарат Беларусбанка НАЛИЧНЫМИ!!:\n\n"
+			"1. Выбираем «Платежи наличными»\n\n"
+			"2. Нажимаем «Зарегестрироваться» (регестрируемся один раз, потом при следующих операциях "
+			"нажимаем уже «ВОЙТИ»)\n\n"
+			"3. Вводим номер телефона, на который придет смс с паролем (пароль сохраняем, так как он "
+			"будет всегда тот же при последующих пополнениях)\n\n"
+			"4. Вводим пароль из смс\n\n"
+			"5. Нажимаем «Добавить платеж» после чего открывается дерево ЕРИП и дальше уже все просто!"
+		)
+		support_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "IMG", "support"))
+		try:
+			image_files = sorted(
+				f for f in os.listdir(support_dir)
+				if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+			)
+		except Exception:
+			image_files = []
+		kb = InlineKeyboardBuilder()
+		kb.button(text="🗑️ Удалить", callback_data=f"deal:user:how_pay:delete:{deal_id}")
+		media_ids = []
+		if not image_files:
+			try:
+				instruction_msg = await cb.bot.send_message(
+					chat_id=cb.from_user.id,
+					text=instruction_text,
+					reply_markup=kb.as_markup()
+				)
+				media_ids.append(instruction_msg.message_id)
+			except Exception:
+				await cb.answer("Не удалось отправить инструкцию", show_alert=True)
+				return
+			await cb.answer()
+			return
+		media = []
+		for idx, filename in enumerate(image_files[:6]):
+			path = os.path.join(support_dir, filename)
+			caption = instruction_text if idx == 0 else None
+			media.append(InputMediaPhoto(media=FSInputFile(path), caption=caption))
+		try:
+			sent_media = await cb.bot.send_media_group(chat_id=cb.from_user.id, media=media)
+			media_ids.extend([m.message_id for m in sent_media])
+		except Exception:
+			await cb.answer("Не удалось отправить инструкцию", show_alert=True)
+			return
+		try:
+			delete_msg = await cb.bot.send_message(
+				chat_id=cb.from_user.id,
+				text="Нажмите кнопку, чтобы удалить инструкцию:",
+				reply_markup=kb.as_markup()
+			)
+			media_ids.append(delete_msg.message_id)
+		except Exception:
+			pass
+		try:
+			from app.notifications import notification_ids
+			notification_ids[(cb.from_user.id, deal_id, "how_pay")] = media_ids
+		except Exception:
+			pass
+		await cb.answer()
+
+	@dp.callback_query(F.data.startswith("deal:user:how_pay:delete:"))
+	async def on_deal_user_how_pay_delete(cb: CallbackQuery):
+		if not cb.from_user:
+			return
+		parts = cb.data.split(":")
+		if len(parts) < 5:
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		try:
+			deal_id = int(parts[-1])
+		except (ValueError, IndexError):
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		try:
+			from app.notifications import notification_ids
+			key = (cb.from_user.id, deal_id, "how_pay")
+			message_ids = notification_ids.get(key, [])
+			for message_id in message_ids:
+				try:
+					await cb.bot.delete_message(chat_id=cb.from_user.id, message_id=message_id)
+				except Exception:
+					pass
+			if key in notification_ids:
+				del notification_ids[key]
+		except Exception:
+			pass
+		await cb.answer("Удалено")
 
 	@dp.message(DealStates.waiting_wallet_address)
 	async def on_deal_wallet_address_entered(message: Message, state: FSMContext):
@@ -2047,7 +2224,7 @@ async def main() -> None:
 				chat_id=message.chat.id,
 				state=state,
 				text=message_text,
-				reply_markup=buy_deal_paid_reply_kb(deal_id)
+				reply_markup=buy_deal_paid_reply_kb(deal_id, show_how_pay=True)
 			)
 		else:
 			await state.set_state(DealStates.waiting_payment)
@@ -2155,6 +2332,17 @@ async def main() -> None:
 		if not deal:
 			await state.clear()
 			return
+		try:
+			from app.notifications import notification_ids
+			notification_key = (message.from_user.id, deal_id, "deal")
+			if notification_key in notification_ids:
+				try:
+					await message.bot.delete_message(chat_id=message.from_user.id, message_id=notification_ids[notification_key])
+				except Exception:
+					pass
+				del notification_ids[notification_key]
+		except Exception:
+			pass
 		messages = await db_local.get_buy_deal_messages(deal_id)
 		chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
 		requisites_text = await _get_deal_requisites_text(
@@ -2171,6 +2359,7 @@ async def main() -> None:
 		is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
 		admin_amount_set = bool(deal.get("admin_amount_set"))
 		hide_requisites = is_large_order and not admin_amount_set
+		prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
 		if hide_requisites:
 			user_text = _build_user_deal_with_requisites_chat_text(
 				deal=deal,
@@ -2178,19 +2367,22 @@ async def main() -> None:
 				chat_lines=chat_lines,
 				amount_currency_override=None,
 				show_requisites=False,
+				prompt=prompt_wallet,
 			)
 		elif requisites_text:
 			user_text = _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
-				chat_lines=chat_lines
+				chat_lines=chat_lines,
+				prompt=prompt_wallet,
 			)
 		else:
-			user_text = _build_user_deal_chat_text(deal, chat_lines)
+			user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
 		from app.keyboards import buy_deal_user_reply_kb, buy_deal_paid_reply_kb
-		reply_markup = buy_deal_user_reply_kb(deal_id)
+		show_how_pay = bool(requisites_text) and not hide_requisites
+		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
 		if deal.get("status") == "await_payment":
-			reply_markup = buy_deal_paid_reply_kb(deal_id)
+			reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 		try:
 			if deal.get("user_message_id"):
 				await message.bot.edit_message_text(
@@ -2217,7 +2409,10 @@ async def main() -> None:
 				await message.bot.delete_message(chat_id=message.from_user.id, message_id=prompt_id)
 			except Exception:
 				pass
-		await state.clear()
+		if deal.get("status") == "await_wallet":
+			await state.set_state(DealStates.waiting_wallet_address)
+		else:
+			await state.clear()
 
 	@dp.message(DealStates.waiting_payment_proof)
 	async def on_deal_payment_proof_received(message: Message, state: FSMContext):
@@ -2304,6 +2499,7 @@ async def main() -> None:
 					prompt="🖼 Скриншот получен. ⏳Обработка..."
 				)
 				from app.keyboards import buy_deal_user_reply_kb
+				show_how_pay = bool(requisites_text)
 				try:
 					if deal.get("user_message_id"):
 						await message.bot.edit_message_text(
@@ -2311,7 +2507,7 @@ async def main() -> None:
 							message_id=deal["user_message_id"],
 							text=user_text,
 							parse_mode="HTML",
-							reply_markup=buy_deal_user_reply_kb(deal_id)
+							reply_markup=buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
 						)
 				except Exception:
 					pass
@@ -2713,25 +2909,25 @@ async def main() -> None:
 		# Определяем процент наценки в зависимости от суммы заказа
 		if amount_usd <= 100:
 			markup_percent_key = "buy_markup_percent_small"
-			default_markup = 15
+			default_markup = 20
 		elif amount_usd <= 449:
 			markup_percent_key = "buy_markup_percent_101_449"
-			default_markup = 11
+			default_markup = 15
 		elif amount_usd <= 699:
 			markup_percent_key = "buy_markup_percent_450_699"
-			default_markup = 9
+			default_markup = 14
 		elif amount_usd <= 999:
 			markup_percent_key = "buy_markup_percent_700_999"
-			default_markup = 8
+			default_markup = 13
 		elif amount_usd <= 1499:
 			markup_percent_key = "buy_markup_percent_1000_1499"
-			default_markup = 7
+			default_markup = 12
 		elif amount_usd <= 1999:
 			markup_percent_key = "buy_markup_percent_1500_1999"
-			default_markup = 6
+			default_markup = 11
 		else:
 			markup_percent_key = "buy_markup_percent_2000_plus"
-			default_markup = 5
+			default_markup = 10
 		
 		# Получаем процент наценки из БД
 		markup_percent_str = await db_local.get_setting(markup_percent_key, str(default_markup))
@@ -2770,6 +2966,7 @@ async def main() -> None:
 			alert_text = (
 				f"🚨 <b>Крупная заявка</b>\n\n"
 				f"Пользователь: {message.from_user.full_name or 'Не указано'} (@{message.from_user.username or 'нет'})\n"
+				f"Страна: {_deal_country_label(selected_country)}\n"
 				f"Сумма: {total_usd:.2f}$\n"
 				f"Крипта: {crypto_display}\n"
 				f"Кол-во: {amount}\n\n"
@@ -2859,10 +3056,15 @@ async def main() -> None:
 				fee_mid = 5.0
 		
 		extra_fee_currency = 0.0
-		if total_usd < extra_fee_usd_low:
-			extra_fee_currency = fee_low
-		elif total_usd < extra_fee_usd_mid:
-			extra_fee_currency = fee_mid
+		if selected_country == "RUB":
+			# Для РФ: +300₽ к любому результату до 200$
+			if total_usd < 200:
+				extra_fee_currency = 300
+		else:
+			if total_usd < extra_fee_usd_low:
+				extra_fee_currency = fee_low
+			elif total_usd < extra_fee_usd_mid:
+				extra_fee_currency = fee_mid
 		
 		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты + доп. комиссия
 		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
@@ -4464,7 +4666,8 @@ async def main() -> None:
 		# Формируем дополнительную информацию для сообщения
 		additional_info = "\n\n✅ Выполнено"
 		
-		if written_cells_info or profit_value is not None:
+		written_entries_info = result.get("written_entries", [])
+		if written_cells_info or profit_value is not None or written_entries_info:
 			additional_info += "\n\n📊 Записано в Google Sheets:"
 			
 			# Добавляем информацию о записанных ячейках
@@ -4482,6 +4685,23 @@ async def main() -> None:
 				except (ValueError, AttributeError):
 					# Если не число, используем как есть
 					additional_info += f"\n\n📈 Профит: {profit_value} USD"
+			if written_entries_info:
+				additional_info += "\n\n➖➖➖➖➖➖➖➖➖➖➖"
+				additional_info += "\nЗаписано в таблицу:"
+				for entry in written_entries_info:
+					entry_type = entry.get("type")
+					cell = entry.get("cell", "")
+					amount = entry.get("amount")
+					currency = entry.get("currency", "")
+					if entry_type == "card":
+						group_name = entry.get("group", "Без группы")
+						card_name = entry.get("card", "")
+						label = f"{group_name}:{card_name}"
+					elif entry_type == "crypto":
+						label = entry.get("label", "")
+					else:
+						continue
+					additional_info += f"\n{label}({cell}) = {amount} {currency}".rstrip()
 			
 			# Сохраняем информацию о последней сделке и профите пользователя
 			try:
