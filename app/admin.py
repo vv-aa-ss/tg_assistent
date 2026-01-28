@@ -84,6 +84,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 		alert_threshold = 400.0
 	total_usd = deal.get("total_usd") or 0
 	is_large_order = total_usd >= alert_threshold
+	admin_amount_set = bool(deal.get("admin_amount_set"))
 	prompt = None
 	if deal.get("status") == "await_proof":
 		prompt = "🖼 Скриншот получен. ⏳Обработка..."
@@ -95,14 +96,26 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 	elif deal.get("status") == "await_wallet":
 		prompt = "Введи адрес кошелька⬇️⬇️⬇️ :"
 	if deal.get("status") in ("await_proof", "completed"):
-		user_text = _build_user_deal_with_requisites_chat_text(
-			deal=deal,
-			requisites_text=requisites_text,
-			chat_lines=chat_lines,
-			prompt=prompt,
-		)
+		hide_requisites = is_large_order and not admin_amount_set
+		if hide_requisites:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+				prompt=prompt,
+				amount_currency_override=None,
+				show_requisites=False,
+			)
+		else:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+				prompt=prompt,
+			)
 	elif deal.get("status") == "await_admin":
-		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
+		show_requisites = (not is_large_order) or admin_amount_set
+		amount_currency_for_user = deal.get("amount_currency") if show_requisites else None
 		user_text = _build_deal_message(
 			country_code=deal.get("country_code", "BYN"),
 			crypto_code=deal.get("crypto_type", ""),
@@ -110,9 +123,9 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			amount_currency=amount_currency_for_user,
 			currency_symbol=deal.get("currency_symbol", "Br"),
 			prompt=prompt,
-			requisites_text=requisites_text if deal.get("amount_currency") is not None else None,
+			requisites_text=requisites_text if show_requisites else None,
 			wallet_address=deal.get("wallet_address"),
-			show_empty_amount=is_large_order,
+			show_empty_amount=is_large_order and not admin_amount_set,
 		)
 	elif deal.get("status") == "await_wallet":
 		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
@@ -3685,8 +3698,18 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 	if not deal:
 		await state.clear()
 		return
-	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount)
+	updated_status = deal.get("status")
+	if updated_status == "await_admin":
+		updated_status = "await_payment"
+	await db.update_buy_deal_fields(
+		deal_id,
+		amount_currency=new_amount,
+		admin_amount_set=1,
+		status=updated_status
+	)
 	deal["amount_currency"] = new_amount
+	deal["admin_amount_set"] = 1
+	deal["status"] = updated_status
 	order_id = deal.get("order_id")
 	if order_id:
 		try:

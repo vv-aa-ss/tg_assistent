@@ -2577,6 +2577,7 @@ class Database:
 					currency_symbol TEXT,
 					total_usd REAL,
 					wallet_address TEXT,
+					admin_amount_set INTEGER NOT NULL DEFAULT 0,
 					status TEXT NOT NULL,
 					user_message_id INTEGER,
 					admin_message_id INTEGER,
@@ -2610,6 +2611,11 @@ class Database:
 					"ALTER TABLE buy_deals ADD COLUMN wallet_address TEXT"
 				)
 				_logger.debug("Added column wallet_address to buy_deals table")
+			if "admin_amount_set" not in columns:
+				await self._db.execute(
+					"ALTER TABLE buy_deals ADD COLUMN admin_amount_set INTEGER NOT NULL DEFAULT 0"
+				)
+				_logger.debug("Added column admin_amount_set to buy_deals table")
 
 	async def _ensure_buy_deal_messages_table(self) -> None:
 		"""Создает таблицу для хранения сообщений по сделке (покупка)"""
@@ -2722,7 +2728,7 @@ class Database:
 			"""
 			SELECT id, user_tg_id, user_name, user_username, country_code,
 			       crypto_type, crypto_display, amount, amount_currency,
-			       currency_symbol, total_usd, wallet_address, status, user_message_id,
+			       currency_symbol, total_usd, wallet_address, admin_amount_set, status, user_message_id,
 			       admin_message_id, order_id, proof_photo_file_id,
 			       proof_document_file_id, requisites_notice_message_id, created_at, updated_at
 			FROM buy_deals WHERE id = ?
@@ -2745,15 +2751,16 @@ class Database:
 			"currency_symbol": row[9],
 			"total_usd": row[10],
 			"wallet_address": row[11],
-			"status": row[12],
-			"user_message_id": row[13],
-			"admin_message_id": row[14],
-			"order_id": row[15],
-			"proof_photo_file_id": row[16],
-			"proof_document_file_id": row[17],
-			"requisites_notice_message_id": row[18],
-			"created_at": row[19],
-			"updated_at": row[20],
+			"admin_amount_set": row[12],
+			"status": row[13],
+			"user_message_id": row[14],
+			"admin_message_id": row[15],
+			"order_id": row[16],
+			"proof_photo_file_id": row[17],
+			"proof_document_file_id": row[18],
+			"requisites_notice_message_id": row[19],
+			"created_at": row[20],
+			"updated_at": row[21],
 		}
 
 	async def get_active_buy_deal_by_user(self, user_tg_id: int) -> Optional[int]:

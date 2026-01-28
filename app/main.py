@@ -580,6 +580,8 @@ def _build_deal_base_lines(
 	]
 	if amount_currency is not None:
 		lines.append(f"💵{int(amount_currency)} {currency_symbol}")
+	else:
+		lines.append(f"💵согласовывается {currency_symbol}")
 	if wallet_address:
 		lines.append(f"👛<code>{escape(wallet_address)}</code>")
 	lines.append("➖➖➖➖➖➖➖➖➖➖➖")
@@ -681,21 +683,34 @@ def _build_user_deal_chat_prompt_text(deal: dict, chat_blocks: list[str], prompt
 	return "\n".join(lines)
 
 
+_NO_AMOUNT_OVERRIDE = object()
+
+
 def _build_user_deal_with_requisites_chat_text(
 	deal: dict,
 	requisites_text: str,
 	chat_lines: list[str],
 	prompt: str | None = None,
+	amount_currency_override=_NO_AMOUNT_OVERRIDE,
+	show_requisites: bool = True,
 ) -> str:
+	amount_currency = (
+		deal.get("amount_currency", 0)
+		if amount_currency_override is _NO_AMOUNT_OVERRIDE
+		else amount_currency_override
+	)
 	lines = _build_deal_base_lines(
 		deal.get("country_code", "BYN"),
 		deal.get("crypto_type", ""),
 		deal.get("amount", 0),
-		deal.get("amount_currency", 0),
+		amount_currency,
 		deal.get("currency_symbol", "Br"),
 		deal.get("wallet_address"),
 	)
-	lines.append(requisites_text if requisites_text.strip() else "Реквизитов нет, ожидайте сообщение администратора")
+	if show_requisites:
+		lines.append(requisites_text if requisites_text.strip() else "Реквизитов нет, ожидайте сообщение администратора")
+	else:
+		lines.append("Реквизиты будут после согласования суммы.")
 	if chat_lines:
 		lines.append("➖➖➖➖➖➖➖➖➖➖➖")
 		lines.append("💬Чат:")
@@ -2147,7 +2162,24 @@ async def main() -> None:
 			deal.get("user_tg_id"),
 			deal.get("country_code")
 		)
-		if requisites_text:
+		alert_threshold = 400.0
+		try:
+			alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
+			alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+		except (ValueError, TypeError):
+			alert_threshold = 400.0
+		is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
+		admin_amount_set = bool(deal.get("admin_amount_set"))
+		hide_requisites = is_large_order and not admin_amount_set
+		if hide_requisites:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+				amount_currency_override=None,
+				show_requisites=False,
+			)
+		elif requisites_text:
 			user_text = _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
@@ -3105,6 +3137,8 @@ async def main() -> None:
 		total_usd = data.get("total_usd", 0)
 		alert_threshold = data.get("alert_threshold", 400.0)
 		is_large_order = total_usd >= alert_threshold
+		admin_amount_set = data.get("admin_amount_set", False)
+		admin_amount_value = data.get("admin_amount_value")
 		
 		# Обновляем сообщение о крупной заявке на этапе "Ввод кошелька" (состояние уже waiting_wallet_address)
 		if is_large_order:
@@ -3190,10 +3224,14 @@ async def main() -> None:
 			alert_threshold = data.get("alert_threshold", 400.0)
 			total_usd = data.get("total_usd", 0)
 			is_large_order = total_usd >= alert_threshold
+			should_show_requisites = (not is_large_order) or admin_amount_set
 			
 			# Для крупных заявок не показываем сумму оплаты
 			if is_large_order:
-				payment_text = "ожидайте сообщение администратора"
+				if admin_amount_set and admin_amount_value is not None:
+					payment_text = f"{int(admin_amount_value)} {currency_symbol}"
+				else:
+					payment_text = "ожидайте сообщение администратора"
 			else:
 				payment_text = f"{int(final_amount)} {currency_symbol}"
 			
@@ -3202,13 +3240,16 @@ async def main() -> None:
 				f"Вы получаете: {amount_str} {crypto_short}\n"
 				f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
 				f"💳Сумма к оплате: {payment_text}\n"
-				f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
 			)
 			
-			if requisites_text:
-				order_message += requisites_text + "\n\n"
+			if should_show_requisites:
+				order_message += f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
+				if requisites_text:
+					order_message += requisites_text + "\n\n"
+				else:
+					order_message += "Реквизиты не найдены. Идет загрузка, ожидайте.\n\n"
 			else:
-				order_message += "Реквизиты не найдены. Идет загрузка, ожидайте.\n\n"
+				order_message += "Реквизиты будут после согласования суммы с администратором.\n\n"
 			
 			# Сохраняем время создания заявки (15 минут)
 			order_created_at = int(time.time())
@@ -3248,7 +3289,7 @@ async def main() -> None:
 			await state.update_data(order_message_id=final_message.message_id)
 			
 			# Если реквизитов нет, сохраняем ожидание и уведомляем админов
-			if not requisites_text:
+			if should_show_requisites and not requisites_text:
 				await db_local.save_pending_requisites(
 					user_tg_id=message.from_user.id,
 					message_id=final_message.message_id,
