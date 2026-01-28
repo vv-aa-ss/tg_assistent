@@ -95,9 +95,11 @@ class Database:
 		await self._ensure_item_usage_log()
 		await self._ensure_card_replenishments()
 		await self._ensure_orders_table()
+		await self._ensure_buy_deals_table()
 		await self._ensure_sell_orders_table()
 		await self._ensure_order_messages_table()
 		await self._ensure_buy_order_messages_table()
+		await self._ensure_buy_deal_messages_table()
 		await self._ensure_questions_table()
 		await self._ensure_question_messages_table()
 		await self._ensure_debts_table()
@@ -597,6 +599,11 @@ class Database:
 
 	async def bind_user_to_card(self, user_id: int, card_id: int) -> None:
 		assert self._db
+		# У пользователя может быть только одна карта — удаляем предыдущие привязки
+		await self._db.execute(
+			"DELETE FROM user_card WHERE user_id = ?",
+			(user_id,)
+		)
 		await self._db.execute(
 			"INSERT OR IGNORE INTO user_card(user_id, card_id) VALUES(?, ?)",
 			(user_id, card_id),
@@ -1189,6 +1196,10 @@ class Database:
 		if tg_id:
 			# Удаляем все связанные записи из таблиц, которые ссылаются на users(tg_id) без ON DELETE CASCADE
 			# Порядок важен: сначала удаляем зависимые таблицы, потом основные
+			
+			# 0. Удаляем сделки на покупку (buy_deals)
+			await self._db.execute("DELETE FROM buy_deals WHERE user_tg_id = ?", (tg_id,))
+			_logger.debug(f"Deleted buy_deals for user: id={user_id}, tg_id={tg_id}")
 			
 			# 1. Удаляем вопросы (questions) - автоматически удалит question_messages благодаря CASCADE
 			await self._db.execute("DELETE FROM questions WHERE user_tg_id = ?", (tg_id,))
@@ -2543,6 +2554,86 @@ class Database:
 			if 'user_message_id' not in columns:
 				await self._db.execute("ALTER TABLE orders ADD COLUMN user_message_id INTEGER")
 				_logger.debug("Added column user_message_id to orders table")
+
+	async def _ensure_buy_deals_table(self) -> None:
+		"""Создает таблицу для хранения сделок на покупку (черновик/процесс)"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='buy_deals'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE buy_deals (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					user_tg_id INTEGER NOT NULL,
+					user_name TEXT,
+					user_username TEXT,
+					country_code TEXT,
+					crypto_type TEXT,
+					crypto_display TEXT,
+					amount REAL,
+					amount_currency REAL,
+					currency_symbol TEXT,
+					total_usd REAL,
+					wallet_address TEXT,
+					status TEXT NOT NULL,
+					user_message_id INTEGER,
+					admin_message_id INTEGER,
+					order_id INTEGER,
+					proof_photo_file_id TEXT,
+					proof_document_file_id TEXT,
+					requisites_notice_message_id INTEGER,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					updated_at INTEGER,
+					FOREIGN KEY (user_tg_id) REFERENCES users(tg_id)
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_buy_deals_user_tg_id ON buy_deals(user_tg_id)"
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_buy_deals_status ON buy_deals(status)"
+			)
+			_logger.debug("Created table buy_deals")
+		else:
+			cur = await self._db.execute("PRAGMA table_info(buy_deals)")
+			columns = [row[1] for row in await cur.fetchall()]
+			if "requisites_notice_message_id" not in columns:
+				await self._db.execute(
+					"ALTER TABLE buy_deals ADD COLUMN requisites_notice_message_id INTEGER"
+				)
+				_logger.debug("Added column requisites_notice_message_id to buy_deals table")
+			if "wallet_address" not in columns:
+				await self._db.execute(
+					"ALTER TABLE buy_deals ADD COLUMN wallet_address TEXT"
+				)
+				_logger.debug("Added column wallet_address to buy_deals table")
+
+	async def _ensure_buy_deal_messages_table(self) -> None:
+		"""Создает таблицу для хранения сообщений по сделке (покупка)"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='buy_deal_messages'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE buy_deal_messages (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					deal_id INTEGER NOT NULL,
+					sender_type TEXT NOT NULL,
+					message_text TEXT NOT NULL,
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					FOREIGN KEY (deal_id) REFERENCES buy_deals(id) ON DELETE CASCADE
+				)
+				"""
+			)
+			await self._db.execute(
+				"CREATE INDEX IF NOT EXISTS idx_buy_deal_messages_deal_id ON buy_deal_messages(deal_id)"
+			)
+			_logger.debug("Created table buy_deal_messages")
 	
 	async def create_order(
 		self,
@@ -2600,6 +2691,148 @@ class Database:
 		order_id = cur.lastrowid
 		_logger.debug(f"Created order: id={order_id}, order_number={order_number}, user_tg_id={user_tg_id}")
 		return order_id
+
+	async def create_buy_deal(
+		self,
+		user_tg_id: int,
+		user_name: str,
+		user_username: str,
+		status: str = "draft",
+		user_message_id: int = None,
+	) -> int:
+		"""Создает новую сделку на покупку (черновик) и возвращает её ID."""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			INSERT INTO buy_deals (
+				user_tg_id, user_name, user_username, status, user_message_id
+			) VALUES (?, ?, ?, ?, ?)
+			""",
+			(user_tg_id, user_name, user_username, status, user_message_id)
+		)
+		await self._db.commit()
+		deal_id = cur.lastrowid
+		_logger.debug(f"Created buy_deal: id={deal_id}, user_tg_id={user_tg_id}, status={status}")
+		return deal_id
+
+	async def get_buy_deal_by_id(self, deal_id: int) -> Optional[Dict[str, Any]]:
+		"""Получает сделку на покупку по ID."""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id, user_tg_id, user_name, user_username, country_code,
+			       crypto_type, crypto_display, amount, amount_currency,
+			       currency_symbol, total_usd, wallet_address, status, user_message_id,
+			       admin_message_id, order_id, proof_photo_file_id,
+			       proof_document_file_id, requisites_notice_message_id, created_at, updated_at
+			FROM buy_deals WHERE id = ?
+			""",
+			(deal_id,)
+		)
+		row = await cur.fetchone()
+		if not row:
+			return None
+		return {
+			"id": row[0],
+			"user_tg_id": row[1],
+			"user_name": row[2],
+			"user_username": row[3],
+			"country_code": row[4],
+			"crypto_type": row[5],
+			"crypto_display": row[6],
+			"amount": row[7],
+			"amount_currency": row[8],
+			"currency_symbol": row[9],
+			"total_usd": row[10],
+			"wallet_address": row[11],
+			"status": row[12],
+			"user_message_id": row[13],
+			"admin_message_id": row[14],
+			"order_id": row[15],
+			"proof_photo_file_id": row[16],
+			"proof_document_file_id": row[17],
+			"requisites_notice_message_id": row[18],
+			"created_at": row[19],
+			"updated_at": row[20],
+		}
+
+	async def get_active_buy_deal_by_user(self, user_tg_id: int) -> Optional[int]:
+		"""Возвращает активную сделку пользователя (не завершена/не отменена)."""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id FROM buy_deals
+			WHERE user_tg_id = ?
+			AND status NOT IN ('completed', 'cancelled')
+			ORDER BY created_at DESC
+			LIMIT 1
+			""",
+			(user_tg_id,)
+		)
+		row = await cur.fetchone()
+		return int(row[0]) if row else None
+
+	async def update_buy_deal_fields(self, deal_id: int, **fields) -> None:
+		"""Обновляет поля сделки на покупку."""
+		assert self._db
+		if not fields:
+			return
+		fields["updated_at"] = int(time.time())
+		columns = ", ".join([f"{key} = ?" for key in fields.keys()])
+		values = list(fields.values())
+		values.append(deal_id)
+		await self._db.execute(
+			f"UPDATE buy_deals SET {columns} WHERE id = ?",
+			values
+		)
+		await self._db.commit()
+
+	async def update_buy_deal_user_message_id(self, deal_id: int, user_message_id: int) -> None:
+		"""Обновляет user_message_id для сделки на покупку."""
+		await self.update_buy_deal_fields(deal_id, user_message_id=user_message_id)
+
+	async def add_buy_deal_message(
+		self,
+		deal_id: int,
+		sender_type: str,
+		message_text: str,
+	) -> int:
+		"""Добавляет сообщение в переписку по сделке (покупка)."""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			INSERT INTO buy_deal_messages (deal_id, sender_type, message_text)
+			VALUES (?, ?, ?)
+			""",
+			(deal_id, sender_type, message_text)
+		)
+		await self._db.commit()
+		message_id = cur.lastrowid
+		_logger.debug(f"Added buy_deal_message: id={message_id}, deal_id={deal_id}, sender_type={sender_type}")
+		return message_id
+
+	async def get_buy_deal_messages(self, deal_id: int) -> List[Dict[str, Any]]:
+		"""Получает все сообщения по сделке (покупка)."""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id, sender_type, message_text, created_at
+			FROM buy_deal_messages
+			WHERE deal_id = ?
+			ORDER BY created_at ASC
+			""",
+			(deal_id,)
+		)
+		rows = await cur.fetchall()
+		return [
+			{
+				"id": row[0],
+				"sender_type": row[1],
+				"message_text": row[2],
+				"created_at": row[3],
+			}
+			for row in rows
+		]
 	
 	async def get_order_by_id(self, order_id: int) -> Optional[Dict[str, Any]]:
 		"""Получает заявку по ID"""

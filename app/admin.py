@@ -1,5 +1,6 @@
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, TelegramObject, FSInputFile
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import Message, CallbackQuery, TelegramObject, FSInputFile, InlineKeyboardMarkup
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter, Command
@@ -47,11 +48,116 @@ from app.keyboards import (
 	markup_percents_settings_kb,
 	buy_calc_settings_kb,
 	buy_payment_confirmed_kb,
+	buy_deal_paid_kb,
+	buy_deal_user_reply_kb,
+	buy_deal_confirm_kb,
+	buy_deal_paid_reply_kb,
 )
 from app.di import get_db, get_admin_ids, get_admin_usernames
 
 admin_router = Router(name="admin")
 logger = logging.getLogger("app.admin")
+
+
+async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, object]:
+	from app.main import (
+		_build_user_deal_chat_text,
+		_build_user_deal_admin_message_text,
+		_build_user_deal_with_requisites_chat_text,
+		_build_deal_chat_lines,
+		_get_deal_requisites_text,
+		_build_deal_message,
+	)
+	deal_id = deal["id"]
+	messages = await db.get_buy_deal_messages(deal_id)
+	requisites_text = await _get_deal_requisites_text(
+		db,
+		deal["user_tg_id"],
+		deal.get("country_code")
+	)
+	chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+	alert_threshold = 400.0
+	try:
+		alert_threshold_str = await db.get_setting("buy_alert_usd_threshold", "400")
+		alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+	except (ValueError, TypeError):
+		alert_threshold = 400.0
+	total_usd = deal.get("total_usd") or 0
+	is_large_order = total_usd >= alert_threshold
+	prompt = None
+	if deal.get("status") == "await_proof":
+		prompt = "🖼 Скриншот получен. ⏳Обработка..."
+	elif deal.get("status") == "completed":
+		prompt = "🖼 Скриншот получен. ⏳Обработка..."
+	elif deal.get("status") == "await_admin":
+		if deal.get("amount_currency") is None:
+			prompt = "❗️Ожидай сообщение от администратора"
+	elif deal.get("status") == "await_wallet":
+		prompt = "Введи адрес кошелька⬇️⬇️⬇️ :"
+	if deal.get("status") in ("await_proof", "completed"):
+		user_text = _build_user_deal_with_requisites_chat_text(
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+			prompt=prompt,
+		)
+	elif deal.get("status") == "await_admin":
+		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
+		user_text = _build_deal_message(
+			country_code=deal.get("country_code", "BYN"),
+			crypto_code=deal.get("crypto_type", ""),
+			amount=deal.get("amount", 0),
+			amount_currency=amount_currency_for_user,
+			currency_symbol=deal.get("currency_symbol", "Br"),
+			prompt=prompt,
+			requisites_text=requisites_text if deal.get("amount_currency") is not None else None,
+			wallet_address=deal.get("wallet_address"),
+			show_empty_amount=is_large_order,
+		)
+	elif deal.get("status") == "await_wallet":
+		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
+		user_text = _build_deal_message(
+			country_code=deal.get("country_code", "BYN"),
+			crypto_code=deal.get("crypto_type", ""),
+			amount=deal.get("amount", 0),
+			amount_currency=amount_currency_for_user,
+			currency_symbol=deal.get("currency_symbol", "Br"),
+			prompt=prompt,
+			requisites_text=None,
+			wallet_address=deal.get("wallet_address"),
+			show_empty_amount=is_large_order,
+		)
+	elif messages:
+		if requisites_text:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+			)
+		else:
+			has_user_reply = any(msg["sender_type"] == "user" for msg in messages)
+			if has_user_reply or len(messages) > 1:
+				user_text = _build_user_deal_chat_text(deal, chat_lines)
+			else:
+				user_text = _build_user_deal_admin_message_text(deal, messages[-1]["message_text"])
+	else:
+		user_text = _build_deal_message(
+			country_code=deal.get("country_code", "BYN"),
+			crypto_code=deal.get("crypto_type", ""),
+			amount=deal.get("amount", 0),
+			amount_currency=deal.get("amount_currency", 0),
+			currency_symbol=deal.get("currency_symbol", "Br"),
+			prompt=None,
+			requisites_text=requisites_text,
+		)
+	reply_markup = None
+	if deal.get("status") in ("await_proof", "completed"):
+		reply_markup = buy_deal_user_reply_kb(deal_id)
+	elif deal.get("status") == "await_payment":
+		reply_markup = buy_deal_paid_reply_kb(deal_id)
+	elif messages:
+		reply_markup = buy_deal_user_reply_kb(deal_id)
+	return user_text, reply_markup
 
 
 async def send_temporary_notification(bot: Bot, chat_id: int, text: str, duration: float = 2.0):
@@ -79,6 +185,19 @@ async def send_temporary_notification(bot: Bot, chat_id: int, text: str, duratio
 		asyncio.create_task(delayed_delete())
 	except Exception:
 		pass  # Игнорируем ошибки отправки
+
+
+async def delete_message_after_delay(bot: Bot, chat_id: int, message_id: int, delay: float = 15.0):
+	"""
+	Удаляет сообщение через указанную задержку, игнорируя ошибки.
+	"""
+	async def delayed_delete():
+		await asyncio.sleep(delay)
+		try:
+			await bot.delete_message(chat_id=chat_id, message_id=message_id)
+		except Exception:
+			pass
+	asyncio.create_task(delayed_delete())
 
 
 async def get_add_data_type_kb_with_recent(admin_id: int, mode: str, data: Optional[Dict[str, Any]] = None, back_to: str = "admin:back"):
@@ -484,6 +603,31 @@ class AlertCryptoStates(StatesGroup):
 	waiting_crypto = State()
 
 
+class DealAlertMessageStates(StatesGroup):
+	"""Состояние для отправки сообщения пользователю по сделке"""
+	waiting_message = State()
+
+
+class DealAlertRequisitesStates(StatesGroup):
+	"""Состояние для выбора реквизитов в алерте сделки"""
+	waiting_card = State()
+
+
+class DealAlertAmountStates(StatesGroup):
+	"""Состояние для изменения суммы сделки"""
+	waiting_amount = State()
+
+
+class DealAlertCryptoStates(StatesGroup):
+	"""Состояние для изменения количества монет сделки"""
+	waiting_crypto = State()
+
+
+class DealAlertDebtStates(StatesGroup):
+	"""Состояние для добавления долга по сделке"""
+	waiting_amount = State()
+
+
 class CardGroupStates(StatesGroup):
 	waiting_group_name = State()
 
@@ -508,6 +652,95 @@ class DeleteMoveStates(StatesGroup):
 	second_confirmation = State()
 
 
+def _one_card_country_kb() -> InlineKeyboardMarkup:
+	kb = InlineKeyboardBuilder()
+	kb.button(text="🇧🇾 Беларусь", callback_data="settings:one_card_for_all:country:BYN")
+	kb.button(text="🇷🇺 Россия", callback_data="settings:one_card_for_all:country:RUB")
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def _one_card_groups_kb(
+	groups: List[Dict[str, Any]],
+	country_code: str,
+	include_ungrouped: bool = True,
+	selected_group_id: Optional[int] = None,
+) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	for group in groups:
+		group_name = group.get("name", "")
+		group_id = group.get("id")
+		is_selected = selected_group_id is not None and group_id == selected_group_id
+		prefix = "🔜 " if is_selected else ""
+		kb.button(
+			text=f"{prefix}📁 {group_name}",
+			callback_data=f"settings:one_card_for_all:group:{country_code}:{group_id}"
+		)
+	if include_ungrouped:
+		is_selected_ungrouped = selected_group_id == 0
+		prefix = "🔜 " if is_selected_ungrouped else ""
+		kb.button(
+			text=f"{prefix}📋 Вне групп",
+			callback_data=f"settings:one_card_for_all:group:{country_code}:0"
+		)
+	kb.button(
+		text="⛔ Отключить функцию",
+		callback_data=f"settings:one_card_for_all:disable:{country_code}"
+	)
+	kb.button(text="⬅️ Назад", callback_data="settings:one_card_for_all")
+	kb.adjust(1)
+	return kb
+
+
+def _one_card_cards_kb(cards: List[Tuple[int, str]], country_code: str, back_to_group: int) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	for card_id, card_name in cards:
+		kb.button(
+			text=f"💳 {card_name}",
+			callback_data=f"settings:one_card_for_all:card:{country_code}:{card_id}"
+		)
+	kb.button(
+		text="⬅️ Назад",
+		callback_data=f"settings:one_card_for_all:country:{country_code}"
+	)
+	kb.adjust(1)
+	return kb
+
+
+async def _one_card_for_all_enabled(db) -> bool:
+	byn = await db.get_setting("one_card_for_all_BYN")
+	rub = await db.get_setting("one_card_for_all_RUB")
+	return bool(byn) or bool(rub)
+
+
+async def _one_card_for_all_status_text(db) -> str:
+	entries = []
+	for country_code, label in (("BYN", "🇧🇾 BYN"), ("RUB", "🇷🇺 RUB")):
+		card_id_raw = await db.get_setting(f"one_card_for_all_{country_code}")
+		if not card_id_raw:
+			entries.append(f"❌ {label}: не настроено")
+			continue
+		try:
+			card_id = int(card_id_raw)
+		except (TypeError, ValueError):
+			entries.append(f"❌ {label}: неверный ID карты")
+			continue
+		card = await db.get_card_by_id(card_id)
+		if not card:
+			entries.append(f"✅ {label}: карта id {card_id} не найдена")
+			continue
+		group_id = card.get("group_id")
+		if group_id:
+			group = await db.get_card_group(group_id)
+			group_name = group.get("name", "Группа") if group else "Группа"
+		else:
+			group_name = "Без группы"
+		card_name = card.get("name") or f"id {card_id}"
+		entries.append(f"✅ {label}: {card_name} ({group_name})")
+	return "Одна карта для всех:\n" + "\n".join(entries)
+
+
 async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None):
 	"""
 	Безопасно редактирует текст сообщения, игнорируя ошибку "message is not modified".
@@ -521,6 +754,9 @@ async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None)
 	"""
 	try:
 		await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+	except TelegramNetworkError as e:
+		logger.warning(f"⚠️ Сеть недоступна при редактировании сообщения: {e}. Повторить позже.")
+		return
 	except Exception as e:
 		error_str = str(e).lower()
 		# Игнорируем ошибку "message is not modified", если содержимое не изменилось
@@ -529,6 +765,28 @@ async def safe_edit_text(message, text: str, reply_markup=None, parse_mode=None)
 		# Если сообщение не содержит текста, отправляем новое сообщение
 		if "there is no text in the message to edit" in error_str or "no text" in error_str:
 			await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+		else:
+			raise
+
+
+async def safe_edit_text_or_caption(message, text: str, reply_markup=None, parse_mode=None):
+	"""
+	Редактирует текст, а если это медиа-сообщение — редактирует caption.
+	"""
+	try:
+		await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+	except TelegramNetworkError as e:
+		logger.warning(f"⚠️ Сеть недоступна при редактировании сообщения: {e}. Повторить позже.")
+		return
+	except Exception as e:
+		error_str = str(e).lower()
+		if "message is not modified" in error_str:
+			return
+		if "there is no text in the message to edit" in error_str or "no text" in error_str:
+			try:
+				await message.edit_caption(caption=text, reply_markup=reply_markup, parse_mode=parse_mode)
+			except Exception:
+				await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
 		else:
 			raise
 
@@ -1441,7 +1699,9 @@ async def admin_back(cb: CallbackQuery, state: FSMContext):
 @admin_router.callback_query(F.data == "admin:settings")
 async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
-	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb())
+	db = get_db()
+	enabled = await _one_card_for_all_enabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled))
 	await cb.answer()
 
 
@@ -1450,6 +1710,120 @@ async def settings_debtors(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
 	text, kb = await _get_debtors_list_text_kb()
 	await safe_edit_text(cb.message, text, reply_markup=kb)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "settings:one_card_for_all")
+async def settings_one_card_for_all(cb: CallbackQuery, state: FSMContext):
+	await state.clear()
+	db = get_db()
+	status_text = await _one_card_for_all_status_text(db)
+	await safe_edit_text(
+		cb.message,
+		f"{status_text}\n\nВыберите страну для установки одной карты для всех:",
+		reply_markup=_one_card_country_kb()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:one_card_for_all:country:"))
+async def settings_one_card_for_all_country(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	try:
+		country_code = cb.data.split(":")[3]
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	groups = await db.list_card_groups()
+	selected_group_id = None
+	selected_card_id = await db.get_setting(f"one_card_for_all_{country_code}")
+	if selected_card_id:
+		try:
+			card = await db.get_card_by_id(int(selected_card_id))
+		except (TypeError, ValueError):
+			card = None
+		if card:
+			group_id = card.get("group_id")
+			selected_group_id = group_id if group_id else 0
+	await safe_edit_text(
+		cb.message,
+		"📁 Выберите группу карт:",
+		reply_markup=_one_card_groups_kb(groups, country_code, selected_group_id=selected_group_id).as_markup()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:one_card_for_all:disable:"))
+async def settings_one_card_for_all_disable(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	country_code = parts[3]
+	await db.set_setting(f"one_card_for_all_{country_code}", "")
+	groups = await db.list_card_groups()
+	country_label = "Беларусь" if country_code == "BYN" else "Россия" if country_code == "RUB" else country_code
+	await safe_edit_text(
+		cb.message,
+		f"✅ Одна карта для всех отключена для страны: {country_label}.\n\n📁 Выберите группу карт:",
+		reply_markup=_one_card_groups_kb(groups, country_code, selected_group_id=None).as_markup()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:one_card_for_all:group:"))
+async def settings_one_card_for_all_group(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) < 5:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	country_code = parts[3]
+	try:
+		group_id = int(parts[4])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	if group_id == 0:
+		cards = await db.get_cards_without_group()
+		group_name = "Без группы"
+	else:
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+	cards_list = [(c[0], c[1]) for c in cards]
+	if not cards_list:
+		await cb.answer("Нет карт в группе", show_alert=True)
+		return
+	await safe_edit_text(
+		cb.message,
+		f"Карты группы '{group_name}':",
+		reply_markup=_one_card_cards_kb(cards_list, country_code, group_id).as_markup()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:one_card_for_all:card:"))
+async def settings_one_card_for_all_card(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) < 5:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	country_code = parts[3]
+	try:
+		card_id = int(parts[4])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	await db.set_setting(f"one_card_for_all_{country_code}", str(card_id))
+	enabled = await _one_card_for_all_enabled(db)
+	await safe_edit_text(
+		cb.message,
+		"✅ Карта установлена для всех пользователей выбранной страны.",
+		reply_markup=admin_settings_kb(enabled)
+	)
 	await cb.answer()
 
 
@@ -1610,31 +1984,53 @@ def _build_payment_order_message(
 		amount_str = f"{amount:.8f}".rstrip('0').rstrip('.')
 	else:
 		amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
-	
-	crypto_short = ""
-	if "BTC" in crypto_type or "Bitcoin" in crypto_display:
-		crypto_short = "btc"
-	elif "LTC" in crypto_type or "Litecoin" in crypto_display:
-		crypto_short = "ltc"
-	elif "USDT" in crypto_type:
-		crypto_short = "usdt"
-	elif "XMR" in crypto_type or "Monero" in crypto_display:
-		crypto_short = "xmr"
-	else:
-		crypto_short = crypto_type.lower()
-	
+	country_label = "🇧🇾Беларусь" if currency_symbol == "Br" else "🇷🇺Россия"
+	requisites_block = requisites_text.strip() if requisites_text else ""
+	if not requisites_block:
+		requisites_block = "Реквизитов нет, ожидайте сообщение администратора"
 	order_message = (
-		f"☑️Заявка успешно создана.\n"
-		f"Вы получаете: {amount_str} {crypto_short}\n"
-		f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
-		f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
-		f"Реквизиты для оплаты:\n\n"
+		"Я помогу😊....\n"
+		"⬇️Сделка⬇️\n"
+		"➖➖➖➖➖➖\n"
+		f"{country_label}\n"
+		f"🤑{crypto_type}\n"
+		f"💴{amount_str}\n"
+		f"💵{int(final_amount)} {currency_symbol}\n"
+		"➖➖➖➖➖➖➖➖➖➖➖\n"
+		f"{requisites_block}"
 	)
-	if requisites_text:
-		order_message += requisites_text + "\n\n"
-	order_message += f"⏰Заявка действительна: 15 минут\n"
-	order_message += f"✅После оплаты необходимо нажать на кнопку 'ОПЛАТА СОВЕРШЕНА'"
 	return order_message
+
+
+def _deal_requisites_kb(cards: List[Tuple[int, str]], deal_id: int) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	for card_id, card_name in cards:
+		kb.button(text=f"💳 {card_name}", callback_data=f"dealalert:requisites:select:{deal_id}:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data=f"dealalert:requisites:back:{deal_id}")
+	kb.adjust(1)
+	return kb
+
+
+def _deal_groups_kb(groups: List[Dict[str, Any]], deal_id: int, include_ungrouped: bool = True) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	for group in groups:
+		group_name = group.get("name", "")
+		group_id = group.get("id")
+		kb.button(text=f"📁 {group_name}", callback_data=f"dealalert:group:{deal_id}:{group_id}")
+	if include_ungrouped:
+		kb.button(text="📋 Без группы", callback_data=f"dealalert:group:{deal_id}:0")
+	kb.button(text="⬅️ Назад", callback_data=f"dealalert:requisites:back:{deal_id}")
+	kb.adjust(1)
+	return kb
+
+
+def _deal_cards_kb(cards: List[Tuple[int, str]], deal_id: int, back_to_group: int) -> InlineKeyboardBuilder:
+	kb = InlineKeyboardBuilder()
+	for card_id, card_name in cards:
+		kb.button(text=f"💳 {card_name}", callback_data=f"dealalert:card:{deal_id}:{card_id}")
+	kb.button(text="⬅️ Назад", callback_data=f"dealalert:group:{deal_id}:{back_to_group}")
+	kb.adjust(1)
+	return kb
 
 
 async def _get_debtors_list_text_kb():
@@ -2095,6 +2491,58 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 	
 	db = get_db()
 	try:
+		deal_id = await db.get_active_buy_deal_by_user(user_tg_id)
+		if deal_id:
+			deal = await db.get_buy_deal_by_id(deal_id)
+			if deal:
+				await db.add_buy_deal_message(deal_id, "admin", text.strip())
+				messages = await db.get_buy_deal_messages(deal_id)
+				from app.main import (
+					_build_deal_chat_blocks,
+					_build_user_deal_chat_prompt_text,
+					_notify_user_new_message,
+				)
+				chat_blocks = _build_deal_chat_blocks(messages, deal.get("user_name", "Пользователь"))
+				prompt = "Согласен ❔❔❔:" if deal.get("status") == "await_confirmation" else None
+				user_text = _build_user_deal_chat_prompt_text(deal, chat_blocks, prompt)
+				reply_markup = None
+				from app.keyboards import buy_deal_confirm_kb, buy_deal_paid_kb, buy_deal_user_reply_kb
+				if deal.get("status") == "await_confirmation":
+					reply_markup = buy_deal_confirm_kb()
+				elif deal.get("status") == "await_payment":
+					from app.keyboards import buy_deal_paid_reply_kb
+					reply_markup = buy_deal_paid_reply_kb(deal_id)
+				elif deal.get("status") in ("await_requisites", "await_proof"):
+					reply_markup = None
+				else:
+					reply_markup = buy_deal_user_reply_kb(deal_id)
+				try:
+					if deal.get("user_message_id"):
+						await bot.edit_message_text(
+							chat_id=user_tg_id,
+							message_id=deal["user_message_id"],
+							text=user_text,
+							parse_mode="HTML",
+							reply_markup=reply_markup
+						)
+					else:
+						sent = await bot.send_message(
+							chat_id=user_tg_id,
+							text=user_text,
+							parse_mode="HTML",
+							reply_markup=reply_markup
+						)
+						await db.update_buy_deal_user_message_id(deal_id, sent.message_id)
+				except Exception as e:
+					logger.warning(f"⚠️ Не удалось обновить сообщение сделки пользователю: {e}")
+				await _notify_user_new_message(bot, user_tg_id)
+				from app.main import update_buy_deal_alert
+				await update_buy_deal_alert(bot, deal_id)
+				await state.clear()
+				from app.main import delete_user_message
+				await delete_user_message(message)
+				return
+
 		# Получаем информацию о пользователе
 		user_id = await db.get_user_id_by_tg(user_tg_id)
 		user = await db.get_user_by_id(user_id) if user_id else None
@@ -2939,6 +3387,760 @@ async def alert_crypto_save(message: Message, state: FSMContext, bot: Bot):
 	await delete_user_message(message)
 	
 	await message.answer(f"✅ Количество обновлено: {new_str} {crypto_display}")
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:message:"))
+async def deal_alert_message_start(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	await state.set_state(DealAlertMessageStates.waiting_message)
+	await state.update_data(deal_id=deal_id, user_tg_id=deal["user_tg_id"])
+	try:
+		prompt = await cb.message.answer("✍️ Введите сообщение для пользователя:")
+		await state.update_data(deal_prompt_message_id=prompt.message_id)
+	except TelegramNetworkError as e:
+		logger.warning(f"⚠️ Сеть недоступна при запросе сообщения админа: {e}. Повторить позже.")
+		await state.clear()
+		return
+	await cb.answer()
+
+
+@admin_router.message(DealAlertMessageStates.waiting_message)
+async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot):
+	# Проверяем админа
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	data = await state.get_data()
+	deal_id = data.get("deal_id")
+	user_tg_id = data.get("user_tg_id")
+	if not deal_id or not user_tg_id:
+		await state.clear()
+		return
+	reply_text = message.text or message.caption or ""
+	if not reply_text.strip():
+		await message.answer("❌ Пожалуйста, введите текст сообщения.")
+		return
+	db = get_db()
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await state.clear()
+		return
+	await db.add_buy_deal_message(deal_id, "admin", reply_text)
+	messages = await db.get_buy_deal_messages(deal_id)
+	user_name = deal.get("user_name", "Пользователь")
+	from app.main import _build_user_deal_admin_message_text, _build_user_deal_chat_text, _build_user_deal_with_requisites_chat_text, _build_deal_chat_lines, _get_deal_requisites_text, update_buy_deal_alert, _notify_user_new_message
+	user_text = ""
+	has_user_reply = any(msg["sender_type"] == "user" for msg in messages)
+	if not has_user_reply and len(messages) == 1:
+		user_text = _build_user_deal_admin_message_text(deal, reply_text)
+	else:
+		chat_lines = _build_deal_chat_lines(messages, user_name)
+		requisites_text = await _get_deal_requisites_text(
+			db,
+			deal.get("user_tg_id"),
+			deal.get("country_code")
+		)
+		if requisites_text:
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines
+			)
+		else:
+			user_text = _build_user_deal_chat_text(deal, chat_lines)
+	try:
+		reply_markup = buy_deal_user_reply_kb(deal_id)
+		if deal.get("status") == "await_payment":
+			from app.keyboards import buy_deal_paid_reply_kb
+			reply_markup = buy_deal_paid_reply_kb(deal_id)
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=user_tg_id,
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+		else:
+			sent = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+			await db.update_buy_deal_user_message_id(deal_id, sent.message_id)
+	except Exception:
+		pass
+	await _notify_user_new_message(bot, user_tg_id)
+	await update_buy_deal_alert(bot, deal_id)
+	prompt_id = data.get("deal_prompt_message_id")
+	if prompt_id:
+		try:
+			await bot.delete_message(chat_id=message.chat.id, message_id=prompt_id)
+		except Exception:
+			pass
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	await state.clear()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:requisites:back:"))
+async def deal_alert_requisites_back(cb: CallbackQuery):
+	try:
+		deal_id = int(cb.data.split(":")[3])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	from app.main import update_buy_deal_alert
+	await update_buy_deal_alert(cb.bot, deal_id)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:requisites:"))
+async def deal_alert_requisites_start(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) != 3:
+		return
+	try:
+		deal_id = int(parts[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	groups = await db.list_card_groups()
+	await state.set_state(DealAlertRequisitesStates.waiting_card)
+	await state.update_data(deal_id=deal_id, user_tg_id=deal["user_tg_id"])
+	await safe_edit_text_or_caption(
+		cb.message,
+		"📁 Выберите группу карт:",
+		reply_markup=_deal_groups_kb(groups, deal_id).as_markup()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:group:"))
+async def deal_alert_group_select(cb: CallbackQuery):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) != 4:
+		return
+	try:
+		deal_id = int(parts[2])
+		group_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	if group_id == 0:
+		cards = await db.get_cards_without_group()
+		group_name = "Без группы"
+	else:
+		cards = await db.get_cards_by_group(group_id)
+		group = await db.get_card_group(group_id)
+		group_name = group.get("name", "Группа") if group else "Группа"
+	cards_list = [(c[0], c[1]) for c in cards]
+	if not cards_list:
+		await cb.answer("Нет карт в группе", show_alert=True)
+		return
+	await safe_edit_text_or_caption(
+		cb.message,
+		f"Карты группы '{group_name}':",
+		reply_markup=_deal_cards_kb(cards_list, deal_id, group_id).as_markup()
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:card:"))
+async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		deal_id = int(parts[2])
+		card_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	user_tg_id = deal["user_tg_id"]
+	user_id = await db.get_user_id_by_tg(user_tg_id)
+	if not user_id:
+		user_id = await db.get_or_create_user(user_tg_id, deal.get("user_username"), deal.get("user_name"))
+	await db.bind_user_to_card(user_id, card_id)
+	await db.delete_pending_requisites(user_tg_id)
+	requisites = await db.list_card_requisites(card_id)
+	requisites_list = [req["requisite_text"] for req in requisites]
+	user_msg = await db.get_card_user_message(card_id)
+	if user_msg and user_msg.strip():
+		requisites_list.append(user_msg)
+	requisites_text = "\n".join(requisites_list)
+	messages = await db.get_buy_deal_messages(deal_id)
+	from app.main import _build_deal_chat_lines, _build_user_deal_with_requisites_chat_text
+	chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+	user_text = _build_user_deal_with_requisites_chat_text(
+		deal=deal,
+		requisites_text=requisites_text,
+		chat_lines=chat_lines,
+		prompt=None
+	)
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=user_tg_id,
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=buy_deal_paid_reply_kb(deal_id)
+			)
+		else:
+			sent = await bot.send_message(
+				chat_id=user_tg_id,
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=buy_deal_paid_reply_kb(deal_id)
+			)
+			await db.update_buy_deal_user_message_id(deal_id, sent.message_id)
+	except Exception:
+		pass
+	await db.update_buy_deal_fields(deal_id, status="await_payment")
+	from app.main import update_buy_deal_alert
+	try:
+		# Удаляем старое уведомление о реквизитах, если было
+		if deal.get("requisites_notice_message_id"):
+			try:
+				await bot.delete_message(
+					chat_id=user_tg_id,
+					message_id=deal["requisites_notice_message_id"]
+				)
+			except Exception:
+				pass
+		notice = await bot.send_message(
+			chat_id=user_tg_id,
+			text="✅ Реквизиты получены"
+		)
+		await delete_message_after_delay(bot, user_tg_id, notice.message_id, 15.0)
+		await db.update_buy_deal_fields(
+			deal_id,
+			requisites_notice_message_id=notice.message_id
+		)
+	except Exception:
+		pass
+	await update_buy_deal_alert(bot, deal_id)
+	await cb.answer("Реквизиты отправлены пользователю ✅")
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:amount:"))
+async def deal_alert_amount_start(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	await state.set_state(DealAlertAmountStates.waiting_amount)
+	await state.update_data(deal_id=deal_id)
+	prompt = await cb.message.answer("Введите новую сумму в валюте сделки:")
+	await state.update_data(deal_prompt_message_id=prompt.message_id)
+	await cb.answer()
+
+
+@admin_router.message(DealAlertAmountStates.waiting_amount)
+async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	data = await state.get_data()
+	deal_id = data.get("deal_id")
+	if not deal_id:
+		await state.clear()
+		return
+	text = (message.text or "").replace(",", ".").strip()
+	try:
+		new_amount = float(text)
+		if new_amount <= 0:
+			raise ValueError
+	except ValueError:
+		await message.answer("❌ Введите корректную сумму.")
+		return
+	db = get_db()
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await state.clear()
+		return
+	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount)
+	deal["amount_currency"] = new_amount
+	order_id = deal.get("order_id")
+	if order_id:
+		try:
+			await db._db.execute(
+				"UPDATE orders SET amount_currency = ? WHERE id = ?",
+				(new_amount, order_id)
+			)
+			await db._db.commit()
+		except Exception as e:
+			logger.warning(
+				f"⚠️ Не удалось синхронизировать сумму по order_id={order_id} для deal_id={deal_id}: {e}"
+			)
+	else:
+		logger.warning(f"⚠️ Синхронизация суммы пропущена: отсутствует order_id для deal_id={deal_id}")
+	try:
+		from aiogram.fsm.storage.base import StorageKey
+		storage = bot.session.storage if hasattr(bot, "session") else None
+		if storage:
+			key = StorageKey(bot_id=bot.id, chat_id=deal["user_tg_id"], user_id=deal["user_tg_id"])
+			current_data = await storage.get_data(key)
+			current_data = current_data or {}
+			current_data["amount_currency"] = new_amount
+			await storage.set_data(key, current_data)
+	except Exception:
+		pass
+	if deal.get("status") == "await_admin" and not deal.get("wallet_address"):
+		await db.update_buy_deal_fields(deal_id, status="await_wallet")
+		deal["status"] = "await_wallet"
+		try:
+			from aiogram.fsm.storage.base import StorageKey
+			from app.main import DealStates
+			storage = bot.session.storage if hasattr(bot, "session") else None
+			if storage:
+				key = StorageKey(bot_id=bot.id, chat_id=deal["user_tg_id"], user_id=deal["user_tg_id"])
+				await storage.set_state(key, DealStates.waiting_wallet_address.state)
+				await storage.set_data(
+					key,
+					{
+						"deal_id": deal_id,
+						"selected_country": deal.get("country_code", "BYN"),
+						"crypto_type": deal.get("crypto_type", ""),
+						"crypto_display": deal.get("crypto_display", ""),
+						"amount": deal.get("amount", 0),
+						"amount_currency": new_amount,
+						"currency_symbol": deal.get("currency_symbol", "Br"),
+						"deal_message_id": deal.get("user_message_id"),
+						"order_message_id": deal.get("user_message_id"),
+					}
+				)
+		except Exception:
+			pass
+	from app.main import _get_deal_requisites_text
+	requisites_text = await _get_deal_requisites_text(
+		db,
+		deal.get("user_tg_id"),
+		deal.get("country_code")
+	)
+	if deal.get("status") == "await_admin" and deal.get("wallet_address") and requisites_text:
+		await db.update_buy_deal_fields(deal_id, status="await_payment")
+		deal["status"] = "await_payment"
+	from app.main import update_buy_deal_alert
+	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+	except Exception:
+		pass
+	await update_buy_deal_alert(bot, deal_id)
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	prompt_id = data.get("deal_prompt_message_id")
+	if prompt_id:
+		try:
+			await bot.delete_message(chat_id=message.chat.id, message_id=prompt_id)
+		except Exception:
+			pass
+	await state.clear()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:crypto:"))
+async def deal_alert_crypto_start(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	await state.set_state(DealAlertCryptoStates.waiting_crypto)
+	await state.update_data(deal_id=deal_id)
+	prompt = await cb.message.answer("Введите новое количество монет:")
+	await state.update_data(deal_prompt_message_id=prompt.message_id)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:debt:"))
+async def deal_alert_debt_start(cb: CallbackQuery, state: FSMContext):
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	await state.set_state(DealAlertDebtStates.waiting_amount)
+	await state.update_data(deal_id=deal_id)
+	prompt = await cb.message.answer("Введите сумму долга в валюте сделки:")
+	await state.update_data(deal_prompt_message_id=prompt.message_id)
+	await cb.answer()
+
+
+@admin_router.message(DealAlertCryptoStates.waiting_crypto)
+async def deal_alert_crypto_save(message: Message, state: FSMContext, bot: Bot):
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	data = await state.get_data()
+	deal_id = data.get("deal_id")
+	if not deal_id:
+		await state.clear()
+		return
+	text = (message.text or "").replace(",", ".").strip()
+	try:
+		new_amount = float(text)
+		if new_amount <= 0:
+			raise ValueError
+	except ValueError:
+		await message.answer("❌ Введите корректное количество.")
+		return
+	db = get_db()
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await state.clear()
+		return
+	await db.update_buy_deal_fields(deal_id, amount=new_amount)
+	deal["amount"] = new_amount
+	order_id = deal.get("order_id")
+	if order_id:
+		try:
+			await db._db.execute(
+				"UPDATE orders SET amount = ? WHERE id = ?",
+				(new_amount, order_id)
+			)
+			await db._db.commit()
+		except Exception as e:
+			logger.warning(
+				f"⚠️ Не удалось синхронизировать количество по order_id={order_id} для deal_id={deal_id}: {e}"
+			)
+	else:
+		logger.warning(f"⚠️ Синхронизация количества пропущена: отсутствует order_id для deal_id={deal_id}")
+	try:
+		from aiogram.fsm.storage.base import StorageKey
+		storage = bot.session.storage if hasattr(bot, "session") else None
+		if storage:
+			key = StorageKey(bot_id=bot.id, chat_id=deal["user_tg_id"], user_id=deal["user_tg_id"])
+			current_data = await storage.get_data(key)
+			current_data = current_data or {}
+			current_data["amount"] = new_amount
+			await storage.set_data(key, current_data)
+	except Exception:
+		pass
+	from app.main import update_buy_deal_alert
+	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+	except Exception:
+		pass
+	await update_buy_deal_alert(bot, deal_id)
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	prompt_id = data.get("deal_prompt_message_id")
+	if prompt_id:
+		try:
+			await bot.delete_message(chat_id=message.chat.id, message_id=prompt_id)
+		except Exception:
+			pass
+	await state.clear()
+
+
+@admin_router.message(DealAlertDebtStates.waiting_amount)
+async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	data = await state.get_data()
+	deal_id = data.get("deal_id")
+	if not deal_id:
+		await state.clear()
+		return
+	text = (message.text or "").replace(",", ".").strip()
+	try:
+		debt_amount = float(text)
+		if debt_amount <= 0:
+			raise ValueError
+	except ValueError:
+		await message.answer("❌ Введите корректную сумму долга.")
+		return
+	db = get_db()
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await state.clear()
+		return
+	currency_symbol = deal.get("currency_symbol", "Br")
+	base_amount_currency = float(deal.get("amount_currency", 0))
+	if debt_amount > base_amount_currency:
+		await message.answer("❌ Долг не может быть больше суммы сделки.")
+		return
+	new_amount_currency = base_amount_currency - debt_amount
+	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+	deal["amount_currency"] = new_amount_currency
+	from app.main import update_buy_deal_alert
+	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+	except Exception:
+		pass
+	await update_buy_deal_alert(bot, deal_id)
+	from app.main import delete_user_message
+	await delete_user_message(message)
+	prompt_id = data.get("deal_prompt_message_id")
+	if prompt_id:
+		try:
+			await bot.delete_message(chat_id=message.chat.id, message_id=prompt_id)
+		except Exception:
+			pass
+	await state.clear()
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:cancel:"))
+async def deal_alert_cancel(cb: CallbackQuery, bot: Bot):
+	db = get_db()
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	await db.update_buy_deal_fields(deal_id, status="cancelled")
+	# Обновляем сообщение пользователя
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text="❌ Сделка отменена администратором."
+			)
+	except Exception:
+		pass
+	# Обновляем алерт админа
+	from app.main import buy_deal_alerts
+	message_ids = buy_deal_alerts.get(deal_id, {})
+	for admin_id, message_id in message_ids.items():
+		try:
+			try:
+				await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text="❌ Сделка отменена администратором.",
+					reply_markup=None
+				)
+			except Exception:
+				await bot.delete_message(chat_id=admin_id, message_id=message_id)
+				await bot.send_message(
+					chat_id=admin_id,
+					text="❌ Сделка отменена администратором."
+				)
+		except Exception:
+			pass
+	buy_deal_alerts.pop(deal_id, None)
+	await cb.answer("Сделка отменена")
+
+
+@admin_router.callback_query(F.data.startswith("dealalert:complete:"))
+async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
+	db = get_db()
+	try:
+		deal_id = int(cb.data.split(":")[2])
+	except (ValueError, IndexError):
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if not deal:
+		await cb.answer("Сделка не найдена", show_alert=True)
+		return
+	await db.update_buy_deal_fields(deal_id, status="completed")
+	deal["status"] = "completed"
+	from app.main import _build_user_deal_completed_text, _build_order_completion_message
+	from app.keyboards import buy_deal_completed_delete_kb
+	user_text = _build_user_deal_completed_text(deal)
+	reply_markup = buy_deal_completed_delete_kb(deal_id)
+	try:
+		if deal.get("user_message_id"):
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
+	except Exception:
+		pass
+	from app.main import update_buy_deal_alert
+	await update_buy_deal_alert(bot, deal_id)
+	profit_line = ""
+	try:
+		from app.config import get_settings
+		from app.google_sheets import write_order_to_google_sheet, read_profit
+		settings = get_settings()
+		order = None
+		order_id = deal.get("order_id")
+		if order_id:
+			order = await db.get_order_by_id(order_id)
+		if not order:
+			active_order_id = await db.get_active_order_by_user(deal["user_tg_id"])
+			if active_order_id:
+				order = await db.get_order_by_id(active_order_id)
+				order_id = active_order_id
+		if not order:
+			user_row = await db.get_user_by_tg(deal["user_tg_id"])
+			last_order_id = user_row.get("last_order_id") if user_row else None
+			if last_order_id:
+				order = await db.get_order_by_id(last_order_id)
+				order_id = last_order_id
+		profit_value = None
+		if order and settings.google_sheet_id and settings.google_credentials_path:
+			result = await write_order_to_google_sheet(
+				sheet_id=settings.google_sheet_id,
+				credentials_path=settings.google_credentials_path,
+				order=order,
+				db=db,
+				sheet_name=settings.google_sheet_name,
+				xmr_number=None
+			)
+			if result.get("success"):
+				row_number = result.get("row")
+				if row_number:
+					profit_column = await db.get_google_sheets_setting("profit_column", "BC")
+					profit_value = await read_profit(
+						sheet_id=settings.google_sheet_id,
+						credentials_path=settings.google_credentials_path,
+						row=row_number,
+						profit_column=profit_column,
+						sheet_name=settings.google_sheet_name
+					)
+		profit_num = None
+		if profit_value is not None:
+			try:
+				profit_num = float(str(profit_value).replace(",", ".").replace(" ", ""))
+			except (ValueError, AttributeError):
+				profit_num = None
+		if order_id:
+			if profit_num is not None:
+				await db.complete_order(order_id, profit_num)
+			else:
+				await db.complete_order(order_id)
+			await db.update_user_last_order(order["user_tg_id"], order_id, profit_num)
+		if profit_value is not None:
+			try:
+				profit_formatted = f"{int(round(float(str(profit_value).replace(',', '.').replace(' ', '')))):,}".replace(",", " ")
+				profit_line = f"📈 Профит: {profit_formatted} USD"
+			except (ValueError, AttributeError):
+				profit_line = f"📈 Профит: {profit_value} USD"
+	except Exception:
+		profit_line = ""
+	# Отправляем сообщение со ссылкой на блокчейн и стикером (как раньше)
+	try:
+		order = None
+		order_id = deal.get("order_id")
+		if order_id:
+			order = await db.get_order_by_id(order_id)
+		if not order:
+			active_order_id = await db.get_active_order_by_user(deal["user_tg_id"])
+			if active_order_id:
+				order = await db.get_order_by_id(active_order_id)
+		if not order:
+			user_row = await db.get_user_by_tg(deal["user_tg_id"])
+			last_order_id = user_row.get("last_order_id") if user_row else None
+			if last_order_id:
+				order = await db.get_order_by_id(last_order_id)
+		if order:
+			await bot.send_message(
+				chat_id=deal["user_tg_id"],
+				text=_build_order_completion_message(order)
+			)
+			await bot.send_sticker(
+				chat_id=deal["user_tg_id"],
+				sticker="CAACAgIAAxkBAAEVPMRpZ3yqu0lezCX6Gr6tMGiJnBBj7QACYAYAAvoLtgg_BZcxRs21uzgE"
+			)
+			try:
+				from app.keyboards import client_menu_kb
+				await bot.send_message(
+					chat_id=deal["user_tg_id"],
+					text="Выберите действие:",
+					reply_markup=client_menu_kb()
+				)
+			except Exception:
+				pass
+		else:
+			logger.warning(f"⚠️ Не найден order для завершенной сделки deal_id={deal_id}, user_tg_id={deal['user_tg_id']}")
+	except Exception:
+		pass
+	# Убираем кнопки у админа после завершения
+	try:
+		from app.main import buy_deal_alerts, build_admin_open_deal_text_with_chat
+		from app.keyboards import deal_alert_admin_completed_kb
+		message_ids = buy_deal_alerts.get(deal_id, {})
+		alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
+		if profit_line:
+			alert_text = f"{alert_text}\n{profit_line}"
+		for admin_id, message_id in message_ids.items():
+			try:
+				await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text=alert_text,
+					parse_mode="HTML",
+					reply_markup=deal_alert_admin_completed_kb(deal_id)
+				)
+			except Exception:
+				try:
+					await bot.edit_message_caption(
+						chat_id=admin_id,
+						message_id=message_id,
+						caption=alert_text,
+						parse_mode="HTML",
+						reply_markup=deal_alert_admin_completed_kb(deal_id)
+					)
+				except Exception:
+					pass
+	except Exception:
+		pass
+	await cb.answer("Сделка завершена")
 
 
 @admin_router.callback_query(F.data == "settings:users")
@@ -7582,6 +8784,32 @@ async def user_view(cb: CallbackQuery, bot: Bot):
 			text,
 			reply_markup=user_action_kb(user_id, back_to, has_access=has_access)
 		)
+
+
+@admin_router.callback_query(F.data.startswith("user:deal:message:"))
+async def user_deal_message_start(cb: CallbackQuery, state: FSMContext):
+	db = get_db()
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	try:
+		user_id = int(parts[3])
+	except ValueError:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	user = await db.get_user_by_id(user_id)
+	if not user or not user.get("tg_id"):
+		await cb.answer("Пользователь не найден", show_alert=True)
+		return
+	deal_id = await db.get_active_buy_deal_by_user(user["tg_id"])
+	if not deal_id:
+		await cb.answer("У пользователя нет активной сделки", show_alert=True)
+		return
+	await state.set_state(DealAlertMessageStates.waiting_message)
+	await state.update_data(deal_id=deal_id, user_tg_id=user["tg_id"])
+	await cb.message.answer("✍️ Введите сообщение для пользователя:")
+	await cb.answer()
 	await cb.answer()
 
 
@@ -7947,7 +9175,7 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 						chat_id=user["tg_id"],
 						message_id=pending["message_id"],
 						text=order_message,
-						reply_markup=buy_payment_confirmed_kb()
+						reply_markup=buy_deal_paid_kb()
 					)
 				except Exception as e:
 					logger.warning(f"⚠️ Не удалось обновить сообщение с реквизитами: {e}")
@@ -7955,7 +9183,7 @@ async def user_bind_card(cb: CallbackQuery, bot: Bot, state: FSMContext):
 						sent_msg = await bot.send_message(
 							chat_id=user["tg_id"],
 							text=order_message,
-							reply_markup=buy_payment_confirmed_kb()
+							reply_markup=buy_deal_paid_kb()
 						)
 						await db.update_pending_requisites_message_id(user["tg_id"], sent_msg.message_id)
 						try:

@@ -34,6 +34,7 @@ def client_menu_kb() -> ReplyKeyboardMarkup:
 			]
 		],
 		resize_keyboard=True,
+		is_persistent=True,
 	)
 
 
@@ -51,6 +52,15 @@ def buy_country_kb() -> ReplyKeyboardMarkup:
 		],
 		resize_keyboard=True,
 	)
+
+
+def buy_country_inline_kb() -> InlineKeyboardMarkup:
+	"""Inline-клавиатура выбора страны для сделки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="🇷🇺 Россия", callback_data="deal:country:RUB")
+	kb.button(text="🇧🇾 Беларусь", callback_data="deal:country:BYN")
+	kb.adjust(2)
+	return kb.as_markup()
 
 
 def buy_crypto_kb() -> ReplyKeyboardMarkup:
@@ -76,6 +86,43 @@ def buy_crypto_kb() -> ReplyKeyboardMarkup:
 		resize_keyboard=True,
 		one_time_keyboard=False,
 	)
+
+
+def buy_crypto_inline_kb() -> InlineKeyboardMarkup:
+	"""Inline-клавиатура выбора криптовалюты для сделки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="BTC", callback_data="deal:crypto:BTC")
+	kb.button(text="LTC", callback_data="deal:crypto:LTC")
+	kb.button(text="USDT", callback_data="deal:crypto:USDT")
+	kb.button(text="XMR", callback_data="deal:crypto:XMR")
+	kb.adjust(2, 2)
+	return kb.as_markup()
+
+
+def buy_deal_confirm_kb() -> InlineKeyboardMarkup:
+	"""Inline-клавиатура подтверждения сделки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="✅ Согласен", callback_data="deal:confirm:yes")
+	kb.button(text="❌ Не согласен", callback_data="deal:confirm:no")
+	kb.adjust(2)
+	return kb.as_markup()
+
+
+def buy_deal_paid_kb() -> InlineKeyboardMarkup:
+	"""Inline-клавиатура подтверждения оплаты."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="ОПЛАТИЛ", callback_data="deal:paid")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def buy_deal_paid_reply_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Inline-клавиатура оплаты + написать."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="ОПЛАТИЛ", callback_data="deal:paid")
+	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
+	kb.adjust(1, 1)
+	return kb.as_markup()
 
 
 def sell_crypto_kb() -> ReplyKeyboardMarkup:
@@ -136,11 +183,13 @@ def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def admin_settings_kb() -> InlineKeyboardMarkup:
+def admin_settings_kb(one_card_for_all_enabled: bool = False) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="👥 Пользователи", callback_data="settings:users")
 	kb.button(text="🧮 Расчет покупки", callback_data="settings:buy_calc")
 	kb.button(text="💳 Должники", callback_data="settings:debtors")
+	one_card_text = "✅ Одна карта для всех" if one_card_for_all_enabled else "❌ Одна карта для всех"
+	kb.button(text=one_card_text, callback_data="settings:one_card_for_all")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
 	kb.adjust(1)
 	return kb.as_markup()
@@ -394,6 +443,7 @@ def user_card_select_kb(
 def user_action_kb(user_id: int, back_to: str = "admin:users", has_access: Optional[bool] = None) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="Карты", callback_data=f"user:bind:{user_id}")
+	kb.button(text="💬 Написать", callback_data=f"user:deal:message:{user_id}")
 	if has_access is None:
 		kb.button(text="🔑 Доступ", callback_data=f"user:access:toggle:{user_id}")
 	else:
@@ -403,6 +453,44 @@ def user_action_kb(user_id: int, back_to: str = "admin:users", has_access: Optio
 		)
 	kb.button(text="🗑️ Удалить пользователя", callback_data=f"user:delete:{user_id}")
 	kb.button(text="⬅️ Назад", callback_data=back_to)
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def deal_alert_admin_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для админа в алерте сделки без реквизитов."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"dealalert:message:{deal_id}")
+	kb.button(text="💳 Реквизиты", callback_data=f"dealalert:requisites:{deal_id}")
+	kb.button(text="💰 Сумма", callback_data=f"dealalert:amount:{deal_id}")
+	kb.button(text="🪙 Монеты", callback_data=f"dealalert:crypto:{deal_id}")
+	kb.button(text="💳 Долг", callback_data=f"dealalert:debt:{deal_id}")
+	kb.button(text="✅ Завершить сделку", callback_data=f"dealalert:complete:{deal_id}")
+	kb.button(text="❌ Отменить сделку", callback_data=f"dealalert:cancel:{deal_id}")
+	kb.adjust(2, 2, 1, 2)
+	return kb.as_markup()
+
+
+def deal_alert_admin_completed_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для админа после завершения сделки (только 'Написать')."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"dealalert:message:{deal_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def buy_deal_user_reply_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для пользователя с кнопкой 'Написать' по сделке."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def buy_deal_completed_delete_kb(deal_id: int) -> InlineKeyboardMarkup:
+	"""Клавиатура для пользователя с кнопкой удаления завершенной сделки."""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="🗑️ Удалить", callback_data=f"deal:user:delete:{deal_id}")
 	kb.adjust(1)
 	return kb.as_markup()
 
