@@ -98,7 +98,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 	if deal.get("status") in ("await_proof", "completed"):
 		hide_requisites = is_large_order and not admin_amount_set
 		if hide_requisites:
-			user_text = _build_user_deal_with_requisites_chat_text(
+			user_text = await _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
@@ -107,7 +107,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 				show_requisites=False,
 			)
 		else:
-			user_text = _build_user_deal_with_requisites_chat_text(
+			user_text = await _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
@@ -116,7 +116,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 	elif deal.get("status") == "await_admin":
 		show_requisites = (not is_large_order) or admin_amount_set
 		amount_currency_for_user = deal.get("amount_currency") if show_requisites else None
-		user_text = _build_deal_message(
+		user_text = await _build_deal_message(
 			country_code=deal.get("country_code", "BYN"),
 			crypto_code=deal.get("crypto_type", ""),
 			amount=deal.get("amount", 0),
@@ -129,7 +129,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 		)
 	elif deal.get("status") == "await_wallet":
 		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
-		user_text = _build_deal_message(
+		user_text = await _build_deal_message(
 			country_code=deal.get("country_code", "BYN"),
 			crypto_code=deal.get("crypto_type", ""),
 			amount=deal.get("amount", 0),
@@ -142,7 +142,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 		)
 	elif messages:
 		if requisites_text:
-			user_text = _build_user_deal_with_requisites_chat_text(
+			user_text = await _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
@@ -150,11 +150,11 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 		else:
 			has_user_reply = any(msg["sender_type"] == "user" for msg in messages)
 			if has_user_reply or len(messages) > 1:
-				user_text = _build_user_deal_chat_text(deal, chat_lines)
+				user_text = await _build_user_deal_chat_text(deal, chat_lines)
 			else:
-				user_text = _build_user_deal_admin_message_text(deal, messages[-1]["message_text"])
+				user_text = await _build_user_deal_admin_message_text(deal, messages[-1]["message_text"])
 	else:
-		user_text = _build_deal_message(
+		user_text = await _build_deal_message(
 			country_code=deal.get("country_code", "BYN"),
 			crypto_code=deal.get("crypto_type", ""),
 			amount=deal.get("amount", 0),
@@ -2251,6 +2251,80 @@ async def settings_buy_calc_save(message: Message, state: FSMContext):
 	)
 
 
+@admin_router.callback_query(F.data == "settings:currency_rates")
+async def settings_currency_rates(cb: CallbackQuery, bot: Bot):
+	"""Показывает актуальные курсы валют из интернета"""
+	db = get_db()
+	
+	# Получаем курсы из интернета
+	from app.currency_rates import get_rate_with_fallback
+	from app.main import _get_btc_rate_text
+	
+	rates_text = "💱 Актуальные курсы валют:\n\n"
+	
+	# BTC курс
+	try:
+		btc_rate_text = await _get_btc_rate_text()
+		rates_text += f"{btc_rate_text}\n"
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка получения BTC курса: {e}")
+		rates_text += "₿ BTC: —\n"
+	
+	# USD→BYN курс
+	try:
+		usd_to_byn = await get_rate_with_fallback("BYN", db, bot)
+		if usd_to_byn:
+			rates_text += f"💱 USD→BYN: {usd_to_byn:.4f}\n"
+		else:
+			# Fallback на значение из БД
+			byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+			try:
+				byn_rate = float(byn_rate_str) if byn_rate_str else 3.3
+				rates_text += f"💱 USD→BYN: {byn_rate:.4f} (из БД)\n"
+			except (ValueError, TypeError):
+				rates_text += "💱 USD→BYN: —\n"
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка получения USD→BYN курса: {e}")
+		byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+		try:
+			byn_rate = float(byn_rate_str) if byn_rate_str else 3.3
+			rates_text += f"💱 USD→BYN: {byn_rate:.4f} (из БД)\n"
+		except (ValueError, TypeError):
+			rates_text += "💱 USD→BYN: —\n"
+	
+	# USD→RUB курс
+	try:
+		usd_to_rub = await get_rate_with_fallback("RUB", db, bot)
+		if usd_to_rub:
+			rates_text += f"💱 USD→RUB: {usd_to_rub:.4f}\n"
+		else:
+			# Fallback на значение из БД
+			rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+			try:
+				rub_rate = float(rub_rate_str) if rub_rate_str else 95
+				rates_text += f"💱 USD→RUB: {rub_rate:.4f} (из БД)\n"
+			except (ValueError, TypeError):
+				rates_text += "💱 USD→RUB: —\n"
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка получения USD→RUB курса: {e}")
+		rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+		try:
+			rub_rate = float(rub_rate_str) if rub_rate_str else 95
+			rates_text += f"💱 USD→RUB: {rub_rate:.4f} (из БД)\n"
+		except (ValueError, TypeError):
+			rates_text += "💱 USD→RUB: —\n"
+	
+	rates_text += "\n💡 Курсы обновляются автоматически из интернета"
+	
+	from app.keyboards import simple_back_kb
+	await safe_edit_text(
+		cb.message,
+		rates_text,
+		reply_markup=simple_back_kb("admin:settings")
+	)
+	await cb.answer()
+
+
 @admin_router.callback_query(F.data == "settings:multipliers")
 async def settings_multipliers(cb: CallbackQuery):
 	"""Показывает настройки коэффициентов"""
@@ -3723,7 +3797,12 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 	user_text = ""
 	has_user_reply = any(msg["sender_type"] == "user" for msg in messages)
 	prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
-	requisites_text = ""
+	# Всегда получаем реквизиты для отображения
+	requisites_text = await _get_deal_requisites_text(
+		db,
+		deal.get("user_tg_id"),
+		deal.get("country_code")
+	)
 	alert_threshold = 400.0
 	try:
 		alert_threshold_str = await db.get_setting("buy_alert_usd_threshold", "400")
@@ -3733,44 +3812,32 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 	is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
 	admin_amount_set = bool(deal.get("admin_amount_set"))
 	hide_requisites = is_large_order and not admin_amount_set
-	if not has_user_reply and len(messages) == 1:
-		if hide_requisites:
-			chat_lines = _build_deal_chat_lines(messages, user_name)
-			user_text = _build_user_deal_with_requisites_chat_text(
-				deal=deal,
-				requisites_text=requisites_text,
-				chat_lines=chat_lines,
-				prompt=prompt_wallet,
-				amount_currency_override=None,
-				show_requisites=False,
-			)
-		else:
-			user_text = _append_prompt(_build_user_deal_admin_message_text(deal, reply_text), prompt_wallet)
-	else:
-		chat_lines = _build_deal_chat_lines(messages, user_name)
-		requisites_text = await _get_deal_requisites_text(
-			db,
-			deal.get("user_tg_id"),
-			deal.get("country_code")
+	chat_lines = _build_deal_chat_lines(messages, user_name)
+	
+	# Если реквизиты есть и их нужно показать, используем _build_user_deal_with_requisites_chat_text
+	if requisites_text and not hide_requisites:
+		user_text = await _build_user_deal_with_requisites_chat_text(
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+			prompt=prompt_wallet,
 		)
-		if hide_requisites:
-			user_text = _build_user_deal_with_requisites_chat_text(
-				deal=deal,
-				requisites_text=requisites_text,
-				chat_lines=chat_lines,
-				prompt=prompt_wallet,
-				amount_currency_override=None,
-				show_requisites=False,
-			)
-		elif requisites_text:
-			user_text = _build_user_deal_with_requisites_chat_text(
-				deal=deal,
-				requisites_text=requisites_text,
-				chat_lines=chat_lines,
-				prompt=prompt_wallet,
-			)
-		else:
-			user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
+	elif hide_requisites:
+		# Для крупных сделок без установленной суммы скрываем реквизиты
+		user_text = await _build_user_deal_with_requisites_chat_text(
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+			prompt=prompt_wallet,
+			amount_currency_override=None,
+			show_requisites=False,
+		)
+	elif not has_user_reply and len(messages) == 1:
+		# Первое сообщение админа без реквизитов
+		user_text = _append_prompt(await _build_user_deal_admin_message_text(deal, reply_text), prompt_wallet)
+	else:
+		# Сообщение без реквизитов, но с чатом
+		user_text = _append_prompt(await _build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
 	try:
 		show_how_pay = bool(requisites_text) and not hide_requisites
 		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
@@ -4012,7 +4079,7 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 	messages = await db.get_buy_deal_messages(deal_id)
 	from app.main import _build_deal_chat_lines, _build_user_deal_with_requisites_chat_text
 	chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
-	user_text = _build_user_deal_with_requisites_chat_text(
+	user_text = await _build_user_deal_with_requisites_chat_text(
 		deal=deal,
 		requisites_text=requisites_text,
 		chat_lines=chat_lines,
@@ -4243,7 +4310,7 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 			deal.get("user_tg_id"),
 			deal.get("country_code")
 		)
-		user_text = _build_user_deal_with_requisites_chat_text(
+		user_text = await _build_user_deal_with_requisites_chat_text(
 			deal=deal,
 			requisites_text=requisites_text,
 			chat_lines=chat_lines,
@@ -4253,17 +4320,18 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 			reply_markup = buy_deal_paid_reply_kb(deal_id)
 	except Exception:
 		pass
+	
 	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
 		if deal.get("user_message_id"):
 			try:
 				await bot.edit_message_text(
-				chat_id=deal["user_tg_id"],
-				message_id=deal["user_message_id"],
-				text=user_text,
-				parse_mode="HTML",
-				reply_markup=reply_markup
-			)
+					chat_id=deal["user_tg_id"],
+					message_id=deal["user_message_id"],
+					text=user_text,
+					parse_mode="HTML",
+					reply_markup=reply_markup
+				)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=deal["user_tg_id"],
@@ -4275,6 +4343,32 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 	except Exception:
 		pass
 	await update_buy_deal_alert(bot, deal_id)
+	
+	# Проверяем, была ли это крупная сделка без установленной суммы
+	# Если да, отправляем уведомление пользователю о появлении реквизитов
+	alert_threshold = 400.0
+	try:
+		alert_threshold_str = await db.get_setting("buy_alert_usd_threshold", "400")
+		alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
+	except (ValueError, TypeError):
+		alert_threshold = 400.0
+	total_usd = deal.get("total_usd") or 0
+	is_large_order = total_usd >= alert_threshold
+	was_admin_amount_set = bool(deal.get("admin_amount_set", 0))
+	
+	# Если это крупная сделка и сумма была установлена админом впервые (было False, стало True)
+	# и есть реквизиты, отправляем уведомление
+	if is_large_order and not was_admin_amount_set and requisites_text:
+		try:
+			notice = await bot.send_message(
+				chat_id=deal["user_tg_id"],
+				text="✅ Реквизиты и сумма для оплаты готовы!"
+			)
+			await delete_message_after_delay(bot, deal["user_tg_id"], notice.message_id, 15.0)
+			logger.info(f"✅ Уведомление о реквизитах отправлено пользователю {deal['user_tg_id']} для deal_id={deal_id}")
+		except Exception as e:
+			logger.warning(f"⚠️ Ошибка отправки уведомления о реквизитах пользователю {deal['user_tg_id']}: {e}")
+	
 	from app.main import delete_user_message
 	await delete_user_message(message)
 	prompt_id = data.get("deal_prompt_message_id")
@@ -4573,7 +4667,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	await cleanup_deal_alerts(deal_id)
 	from app.main import _build_user_deal_completed_text, _build_order_completion_message
 	from app.keyboards import buy_deal_completed_delete_kb
-	user_text = _build_user_deal_completed_text(deal)
+	user_text = await _build_user_deal_completed_text(deal)
 	reply_markup = buy_deal_completed_delete_kb(deal_id)
 	try:
 		if deal.get("user_message_id"):
@@ -4589,6 +4683,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	from app.main import update_buy_deal_alert
 	await update_buy_deal_alert(bot, deal_id)
 	profit_line = ""
+	google_sheet_report = ""  # Отчет о записи в Google Sheets
 	try:
 		from app.config import get_settings
 		from app.google_sheets import write_order_to_google_sheet, read_profit
@@ -4620,6 +4715,62 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 			)
 			if result.get("success"):
 				row_number = result.get("row")
+				written_entries = result.get("written_entries", [])
+				written_cells = result.get("written_cells", [])
+				
+				# Формируем отчет о записи в Google Sheets
+				if written_entries or written_cells:
+					report_lines = ["📊 Запись в Google Sheets:"]
+					if row_number:
+						report_lines.append(f"📍 Строка: {row_number}")
+					
+					# Группируем записи по типам
+					crypto_entries = [e for e in written_entries if e.get("type") == "crypto"]
+					card_entries = [e for e in written_entries if e.get("type") == "card"]
+					cash_entries = [e for e in written_entries if e.get("type") == "cash"]
+					
+					if crypto_entries:
+						report_lines.append("🪙 Криптовалюты:")
+						for entry in crypto_entries:
+							label = entry.get("label", "")
+							cell = entry.get("cell", "")
+							amount = entry.get("amount", 0)
+							currency = entry.get("currency", "USD")
+							report_lines.append(f"  • {label}: {amount:,} {currency} → {cell}")
+					
+					if card_entries:
+						report_lines.append("💳 Карты:")
+						for entry in card_entries:
+							card_name = entry.get("card", "")
+							group_name = entry.get("group", "")
+							cell = entry.get("cell", "")
+							amount = entry.get("amount", 0)
+							currency = entry.get("currency", "RUB")
+							group_info = f" ({group_name})" if group_name and group_name != "Без группы" else ""
+							report_lines.append(f"  • {card_name}{group_info}: {amount:,} {currency} → {cell}")
+					
+					if cash_entries:
+						report_lines.append("💵 Наличные:")
+						for entry in cash_entries:
+							cash_name = entry.get("cash_name", "")
+							cell = entry.get("cell", "")
+							amount = entry.get("amount", 0)
+							currency = entry.get("currency", "RUB")
+							report_lines.append(f"  • {cash_name}: {amount:,} {currency} → {cell}")
+					
+					google_sheet_report = "\n".join(report_lines)
+					logger.info(f"📊 Отчет о записи в Google Sheets для deal_id={deal_id}:\n{google_sheet_report}")
+				else:
+					# Если нет структурированных данных, используем written_cells
+					if written_cells:
+						report_lines = ["📊 Запись в Google Sheets:"]
+						if row_number:
+							report_lines.append(f"📍 Строка: {row_number}")
+						report_lines.append("📝 Записанные ячейки:")
+						for cell_info in written_cells:
+							report_lines.append(f"  • {cell_info}")
+						google_sheet_report = "\n".join(report_lines)
+				
 				if row_number:
 					profit_column = await db.get_google_sheets_setting("profit_column", "BC")
 					profit_value = await read_profit(
@@ -4629,6 +4780,11 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 						profit_column=profit_column,
 						sheet_name=settings.google_sheet_name
 					)
+			else:
+				# Если запись не удалась, добавляем информацию об ошибке
+				error_msg = result.get("error", "Неизвестная ошибка")
+				google_sheet_report = f"❌ Ошибка записи в Google Sheets: {error_msg}"
+				logger.warning(f"⚠️ Не удалось записать данные в Google Sheets для deal_id={deal_id}: {error_msg}")
 		profit_num = None
 		if profit_value is not None:
 			try:
@@ -4694,6 +4850,9 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 		alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
 		if profit_line:
 			alert_text = f"{alert_text}\n{profit_line}"
+		# Добавляем отчет о записи в Google Sheets
+		if google_sheet_report:
+			alert_text = f"{alert_text}\n\n{google_sheet_report}"
 		for admin_id, message_id in message_ids.items():
 			try:
 				await bot.edit_message_text(

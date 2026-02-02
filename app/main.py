@@ -653,7 +653,7 @@ def _format_crypto_amount(amount: float) -> str:
 	return f"{amount:.2f}".rstrip('0').rstrip('.')
 
 
-def _build_deal_message(
+async def _build_deal_message(
 	country_code: str | None,
 	crypto_code: str | None,
 	amount: float | None,
@@ -678,11 +678,17 @@ def _build_deal_message(
 	if amount is not None:
 		lines.append(f"💴{_format_crypto_amount(amount)}")
 	if amount_currency is not None and currency_symbol:
-		lines.append(f"💵{int(amount_currency)} {currency_symbol}")
+		lines.append(f"❗️💵{int(amount_currency)} {currency_symbol}")
 	elif show_empty_amount and currency_symbol:
 		lines.append(f"💵согласовывается {currency_symbol}")
 	if wallet_address:
 		lines.append(f"👛<code>{escape(wallet_address)}</code>")
+	# Добавляем разделитель перед курсом BTC, если есть сумма
+	if amount_currency is not None:
+		lines.append("➖➖➖➖➖➖➖➖➖➖➖")
+	# Добавляем курс BTC
+	btc_rate = await _get_btc_rate_text()
+	lines.append(btc_rate)
 	if requisites_text is not None:
 		lines.append("➖➖➖➖➖➖➖➖➖➖➖")
 		lines.append(
@@ -693,7 +699,7 @@ def _build_deal_message(
 	return "\n".join(lines)
 
 
-def _build_deal_base_lines(
+async def _build_deal_base_lines(
 	country_code: str,
 	crypto_code: str,
 	amount: float,
@@ -714,29 +720,31 @@ def _build_deal_base_lines(
 		lines.append(f"💵согласовывается {currency_symbol}")
 	if wallet_address:
 		lines.append(f"👛<code>{escape(wallet_address)}</code>")
+	# Добавляем курс BTC
+	btc_rate = await _get_btc_rate_text()
+	lines.append(btc_rate)
 	lines.append("➖➖➖➖➖➖➖➖➖➖➖")
 	return lines
 
 
-def _build_user_deal_admin_message_text(deal: dict, admin_text: str) -> str:
+async def _build_user_deal_admin_message_text(deal: dict, admin_text: str) -> str:
 	lines = ["Я помогу😊...."]
-	lines.extend(
-		_build_deal_base_lines(
-			deal.get("country_code", "BYN"),
-			deal.get("crypto_type", ""),
-			deal.get("amount", 0),
-			deal.get("amount_currency", 0),
-			deal.get("currency_symbol", "Br"),
-			deal.get("wallet_address"),
-		)
+	base_lines = await _build_deal_base_lines(
+		deal.get("country_code", "BYN"),
+		deal.get("crypto_type", ""),
+		deal.get("amount", 0),
+		deal.get("amount_currency", 0),
+		deal.get("currency_symbol", "Br"),
+		deal.get("wallet_address"),
 	)
+	lines.extend(base_lines)
 	lines.append("💬Чат:")
 	lines.append(f"<b>Администратор:</b> {escape(admin_text)}")
 	return "\n".join(lines)
 
 
-def _build_user_deal_chat_text(deal: dict, chat_lines: list[str]) -> str:
-	lines = _build_deal_base_lines(
+async def _build_user_deal_chat_text(deal: dict, chat_lines: list[str]) -> str:
+	lines = await _build_deal_base_lines(
 		deal.get("country_code", "BYN"),
 		deal.get("crypto_type", ""),
 		deal.get("amount", 0),
@@ -822,7 +830,7 @@ def _build_user_deal_chat_prompt_text(deal: dict, chat_blocks: list[str], prompt
 _NO_AMOUNT_OVERRIDE = object()
 
 
-def _build_user_deal_with_requisites_chat_text(
+async def _build_user_deal_with_requisites_chat_text(
 	deal: dict,
 	requisites_text: str,
 	chat_lines: list[str],
@@ -835,7 +843,7 @@ def _build_user_deal_with_requisites_chat_text(
 		if amount_currency_override is _NO_AMOUNT_OVERRIDE
 		else amount_currency_override
 	)
-	lines = _build_deal_base_lines(
+	lines = await _build_deal_base_lines(
 		deal.get("country_code", "BYN"),
 		deal.get("crypto_type", ""),
 		deal.get("amount", 0),
@@ -857,8 +865,8 @@ def _build_user_deal_with_requisites_chat_text(
 	return "\n".join(lines)
 
 
-def _build_user_deal_completed_text(deal: dict) -> str:
-	lines = _build_deal_base_lines(
+async def _build_user_deal_completed_text(deal: dict) -> str:
+	lines = await _build_deal_base_lines(
 		deal.get("country_code", "BYN"),
 		deal.get("crypto_type", ""),
 		deal.get("amount", 0),
@@ -921,6 +929,24 @@ def _deal_status_label(status: str | None) -> str:
 	if status == "completed":
 		return "💹💹💹Статус: Завершено💹💹💹"
 	return ""
+
+
+async def _get_btc_rate_text() -> str:
+	"""Получает текст с курсом BTC для отображения пользователю"""
+	try:
+		from app.google_sheets import get_btc_price_usd
+		
+		# Получаем курс BTC
+		btc_price = await get_btc_price_usd()
+		
+		# Форматируем курс BTC
+		btc_text = f"₿ BTC: ${btc_price:,.2f}" if btc_price else "₿ BTC: —"
+		
+		return btc_text
+	except Exception as e:
+		logger_main = logging.getLogger("app.main")
+		logger_main.warning(f"⚠️ Ошибка при получении курса BTC: {e}")
+		return "₿ BTC: —"
 
 
 async def _get_rates_text(db) -> str:
@@ -1719,7 +1745,7 @@ async def main() -> None:
 				status="draft"
 			)
 			await state.set_state(DealStates.selecting_country)
-			message_text = _build_deal_message(
+			message_text = await _build_deal_message(
 				country_code=None,
 				crypto_code=None,
 				amount=None,
@@ -1771,7 +1797,7 @@ async def main() -> None:
 		if deal_id:
 			await db_local.update_buy_deal_fields(deal_id, country_code=country_code)
 		await state.set_state(DealStates.selecting_crypto)
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=country_code,
 			crypto_code=None,
 			amount=None,
@@ -1815,7 +1841,7 @@ async def main() -> None:
 			)
 		await state.set_state(DealStates.waiting_amount)
 		data = await state.get_data()
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=data.get("selected_country"),
 			crypto_code=crypto_type,
 			amount=None,
@@ -2001,7 +2027,7 @@ async def main() -> None:
 				)
 			await state.update_data(is_large_deal=True)
 			await state.set_state(DealStates.waiting_wallet_address)
-			message_text = _build_deal_message(
+			message_text = await _build_deal_message(
 				country_code=selected_country,
 				crypto_code=crypto_type,
 				amount=amount,
@@ -2063,7 +2089,7 @@ async def main() -> None:
 				status="await_confirmation"
 			)
 		await state.set_state(DealStates.waiting_confirmation)
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=selected_country,
 			crypto_code=crypto_type,
 			amount=amount,
@@ -2096,19 +2122,39 @@ async def main() -> None:
 			return
 		await cb.answer()
 		data = await state.get_data()
+		# Сохраняем данные о выбранной стране и криптовалюте
+		selected_country = data.get("selected_country", "BYN")
+		crypto_type = data.get("crypto_type", "")
+		crypto_display = data.get("crypto_display", "")
 		deal_id = data.get("deal_id")
+		
+		# Не отменяем сделку, а возвращаем к вводу количества монет
+		# Обновляем статус сделки, если она существует
 		if deal_id:
-			await db_local.update_buy_deal_fields(deal_id, status="cancelled")
-		await state.clear()
-		await cb.bot.edit_message_text(
-			chat_id=cb.message.chat.id,
-			message_id=cb.message.message_id,
-			text="❌ Отменено."
+			deal = await db_local.get_buy_deal_by_id(deal_id)
+			if deal and deal.get("status") == "await_confirmation":
+				await db_local.update_buy_deal_fields(deal_id, status="await_amount")
+		
+		# Возвращаем пользователя к вводу количества монет
+		await state.set_state(DealStates.waiting_amount)
+		# Очищаем amount и amount_currency из состояния, чтобы пользователь мог ввести новое значение
+		await state.update_data(amount=None, amount_currency=None)
+		
+		# Показываем сообщение с запросом количества монет
+		message_text = await _build_deal_message(
+			country_code=selected_country,
+			crypto_code=crypto_type,
+			amount=None,
+			amount_currency=None,
+			currency_symbol=None,
+			prompt="Введи количество монет⬇️⬇️⬇️ :"
 		)
-		await cb.bot.send_message(
+		await _send_or_edit_deal_message(
+			bot=cb.bot,
 			chat_id=cb.message.chat.id,
-			text="Выберите действие:",
-			reply_markup=client_menu_kb()
+			state=state,
+			text=message_text,
+			reply_markup=None
 		)
 
 	@dp.callback_query(F.data == "deal:confirm:yes")
@@ -2130,7 +2176,7 @@ async def main() -> None:
 		deal_id = data.get("deal_id")
 		# После согласия спрашиваем адрес кошелька
 		await state.set_state(DealStates.waiting_wallet_address)
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=selected_country,
 			crypto_code=crypto_type,
 			amount=amount,
@@ -2201,7 +2247,7 @@ async def main() -> None:
 		)
 		messages = await db_local.get_buy_deal_messages(deal_id) if deal_id else []
 		chat_lines = _build_deal_chat_lines(messages, cb.from_user.full_name or "Пользователь")
-		message_text = _build_user_deal_with_requisites_chat_text(
+		message_text = await _build_user_deal_with_requisites_chat_text(
 			deal=deal or {
 				"country_code": selected_country,
 				"crypto_type": crypto_type,
@@ -2289,7 +2335,7 @@ async def main() -> None:
 			hide_requisites = is_large_order and not admin_amount_set
 			prompt_text = "➡️Введи сообщение администратору:"
 			if hide_requisites:
-				user_text = _build_user_deal_with_requisites_chat_text(
+				user_text = await _build_user_deal_with_requisites_chat_text(
 					deal=deal,
 					requisites_text=requisites_text,
 					chat_lines=chat_lines,
@@ -2298,14 +2344,14 @@ async def main() -> None:
 					show_requisites=False,
 				)
 			elif requisites_text:
-				user_text = _build_user_deal_with_requisites_chat_text(
+				user_text = await _build_user_deal_with_requisites_chat_text(
 					deal=deal,
 					requisites_text=requisites_text,
 					chat_lines=chat_lines,
 					prompt=prompt_text,
 				)
 			else:
-				user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_text)
+				user_text = _append_prompt(await _build_user_deal_chat_text(deal, chat_lines), prompt_text)
 			if deal.get("user_message_id"):
 				await cb.bot.edit_message_text(
 					chat_id=cb.from_user.id,
@@ -2474,7 +2520,7 @@ async def main() -> None:
 					wallet_address=wallet_address,
 					status="await_admin",
 				)
-			message_text = _build_deal_message(
+			message_text = await _build_deal_message(
 				country_code=selected_country,
 				crypto_code=crypto_type,
 				amount=amount,
@@ -2509,7 +2555,7 @@ async def main() -> None:
 				amount_currency=amount_currency,
 				currency_symbol=currency_symbol
 			)
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=selected_country,
 			crypto_code=crypto_type,
 			amount=amount,
@@ -2755,7 +2801,7 @@ async def main() -> None:
 			hide_requisites = True
 		prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
 		if hide_requisites:
-			user_text = _build_user_deal_with_requisites_chat_text(
+			user_text = await _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
@@ -2764,14 +2810,14 @@ async def main() -> None:
 				prompt=prompt_wallet,
 			)
 		elif requisites_text:
-			user_text = _build_user_deal_with_requisites_chat_text(
+			user_text = await _build_user_deal_with_requisites_chat_text(
 				deal=deal,
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
 				prompt=prompt_wallet,
 			)
 		else:
-			user_text = _append_prompt(_build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
+			user_text = _append_prompt(await _build_user_deal_chat_text(deal, chat_lines), prompt_wallet)
 		from app.keyboards import buy_deal_user_reply_kb, buy_deal_paid_reply_kb
 		show_how_pay = bool(requisites_text) and not hide_requisites
 		reply_markup = buy_deal_user_reply_kb(deal_id, show_how_pay=show_how_pay)
@@ -2893,7 +2939,7 @@ async def main() -> None:
 				)
 				messages = await db_local.get_buy_deal_messages(deal_id)
 				chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
-				user_text = _build_user_deal_with_requisites_chat_text(
+				user_text = await _build_user_deal_with_requisites_chat_text(
 					deal=deal,
 					requisites_text=requisites_text,
 					chat_lines=chat_lines,
@@ -5274,7 +5320,7 @@ async def main() -> None:
 			status="draft"
 		)
 		await state.set_state(DealStates.selecting_country)
-		message_text = _build_deal_message(
+		message_text = await _build_deal_message(
 			country_code=None,
 			crypto_code=None,
 			amount=None,

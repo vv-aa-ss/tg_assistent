@@ -195,6 +195,7 @@ def admin_settings_kb(one_card_for_all_enabled: bool = False) -> InlineKeyboardM
 	one_card_text = "✅ Одна карта для всех" if one_card_for_all_enabled else "❌ Одна карта для всех"
 	kb.button(text=one_card_text, callback_data="settings:one_card_for_all")
 	kb.button(text="🔔 Оповещения", callback_data="settings:notifications")
+	kb.button(text="💱 Курсы валют", callback_data="settings:currency_rates")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
 	kb.adjust(1)
 	return kb.as_markup()
