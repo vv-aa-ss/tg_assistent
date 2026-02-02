@@ -2608,13 +2608,13 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 				try:
 					if deal.get("user_message_id"):
 						try:
-						await bot.edit_message_text(
-							chat_id=user_tg_id,
-							message_id=deal["user_message_id"],
-							text=user_text,
-							parse_mode="HTML",
-							reply_markup=reply_markup
-						)
+							await bot.edit_message_text(
+								chat_id=user_tg_id,
+								message_id=deal["user_message_id"],
+								text=user_text,
+								parse_mode="HTML",
+								reply_markup=reply_markup
+							)
 							logger.info("🧪 alert_message_send: user message edited")
 						except Exception as edit_error:
 							logger.warning(f"🧪 alert_message_send: edit failed: {edit_error}")
@@ -3724,13 +3724,13 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 			reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 		if deal.get("user_message_id"):
 			try:
-			await bot.edit_message_text(
-				chat_id=user_tg_id,
-				message_id=deal["user_message_id"],
-				text=user_text,
-				parse_mode="HTML",
-				reply_markup=reply_markup
-			)
+				await bot.edit_message_text(
+					chat_id=user_tg_id,
+					message_id=deal["user_message_id"],
+					text=user_text,
+					parse_mode="HTML",
+					reply_markup=reply_markup
+				)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=user_tg_id,
@@ -4139,17 +4139,17 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 		if deal.get("status") == "await_payment":
 			reply_markup = buy_deal_paid_reply_kb(deal_id)
 	except Exception:
-	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+		user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
 		if deal.get("user_message_id"):
 			try:
-			await bot.edit_message_text(
-				chat_id=deal["user_tg_id"],
-				message_id=deal["user_message_id"],
-				text=user_text,
-				parse_mode="HTML",
-				reply_markup=reply_markup
-			)
+				await bot.edit_message_text(
+					chat_id=deal["user_tg_id"],
+					message_id=deal["user_message_id"],
+					text=user_text,
+					parse_mode="HTML",
+					reply_markup=reply_markup
+				)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=deal["user_tg_id"],
@@ -4344,14 +4344,14 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		# Списываем долг без изменения суммы сделки
 		await db.add_user_debt(deal["user_tg_id"], -debt_amount, currency_symbol)
 	else:
-	base_amount_currency = float(deal.get("amount_currency", 0))
-	if debt_amount > base_amount_currency:
-		await message.answer("❌ Долг не может быть больше суммы сделки.")
-		return
-	new_amount_currency = base_amount_currency - debt_amount
-	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
-	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
-	deal["amount_currency"] = new_amount_currency
+		base_amount_currency = float(deal.get("amount_currency", 0))
+		if debt_amount > base_amount_currency:
+			await message.answer("❌ Долг не может быть больше суммы сделки.")
+			return
+		new_amount_currency = base_amount_currency - debt_amount
+		await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+		await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+		deal["amount_currency"] = new_amount_currency
 	from app.main import update_buy_deal_alert
 	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
