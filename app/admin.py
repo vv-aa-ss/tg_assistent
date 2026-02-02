@@ -112,7 +112,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 				requisites_text=requisites_text,
 				chat_lines=chat_lines,
 				prompt=prompt,
-			)
+		)
 	elif deal.get("status") == "await_admin":
 		show_requisites = (not is_large_order) or admin_amount_set
 		amount_currency_for_user = deal.get("amount_currency") if show_requisites else None
@@ -1719,6 +1719,55 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await cb.answer()
 
 
+@admin_router.callback_query(F.data == "settings:notifications")
+async def settings_notifications(cb: CallbackQuery, state: FSMContext):
+	"""Показывает настройки оповещений"""
+	await state.clear()
+	db = get_db()
+	# Получаем текущий тип оповещений из БД
+	current_type = await db.get_setting("deal_notification_type", "after_proof")
+	if current_type not in ["after_requisites", "after_proof"]:
+		current_type = "after_proof"
+	
+	from app.keyboards import notifications_settings_kb
+	await safe_edit_text(
+		cb.message,
+		"🔔 Настройки оповещений о сделках:\n\n"
+		"Выберите, когда админы будут получать оповещения о новых сделках:",
+		reply_markup=notifications_settings_kb(current_type)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:notifications:set:"))
+async def settings_notifications_set(cb: CallbackQuery):
+	"""Устанавливает тип оповещений"""
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	
+	notification_type = parts[3]
+	if notification_type not in ["after_requisites", "after_proof"]:
+		await cb.answer("Неверный тип оповещений", show_alert=True)
+		return
+	
+	db = get_db()
+	await db.set_setting("deal_notification_type", notification_type)
+	
+	# Обновляем интерфейс с галочкой
+	from app.keyboards import notifications_settings_kb
+	await safe_edit_text(
+		cb.message,
+		"🔔 Настройки оповещений о сделках:\n\n"
+		"Выберите, когда админы будут получать оповещения о новых сделках:",
+		reply_markup=notifications_settings_kb(notification_type)
+	)
+	
+	type_label = "После выдачи реквизитов" if notification_type == "after_requisites" else "После отправки скриншота"
+	await cb.answer(f"✅ Оповещения установлены: {type_label}")
+
+
 @admin_router.callback_query(F.data == "settings:debtors")
 async def settings_debtors(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
@@ -2125,8 +2174,8 @@ async def settings_buy_calc(cb: CallbackQuery):
 		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
 		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
 		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
-		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}\n"
-		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}\n\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (обновляется автоматически)\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (обновляется автоматически)\n\n"
 		"Выберите параметр для редактирования:",
 		reply_markup=buy_calc_settings_kb(settings),
 	)
@@ -2195,8 +2244,8 @@ async def settings_buy_calc_save(message: Message, state: FSMContext):
 		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
 		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
 		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
-		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}\n"
-		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}\n\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (обновляется автоматически)\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (обновляется автоматически)\n\n"
 		"Выберите параметр для редактирования:",
 		reply_markup=buy_calc_settings_kb(settings),
 	)
@@ -2612,12 +2661,12 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 					if deal.get("user_message_id"):
 						try:
 							await bot.edit_message_text(
-								chat_id=user_tg_id,
-								message_id=deal["user_message_id"],
-								text=user_text,
-								parse_mode="HTML",
-								reply_markup=reply_markup
-							)
+							chat_id=user_tg_id,
+							message_id=deal["user_message_id"],
+							text=user_text,
+							parse_mode="HTML",
+							reply_markup=reply_markup
+						)
 							logger.info("🧪 alert_message_send: user message edited")
 						except Exception as edit_error:
 							logger.warning(f"🧪 alert_message_send: edit failed: {edit_error}")
@@ -2690,7 +2739,7 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 											logger.info(f"🧪 alert_message_send: updated chat_lines from question_messages")
 									except Exception as e:
 										logger.warning(f"⚠️ alert_message_send: error getting question_messages: {e}")
-						alert_text = _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines)
+						alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db)
 						logger.info(f"🧪 alert_message_send: alert_text length={len(alert_text)}")
 						reply_markup = deal_alert_admin_kb(deal_id)
 						logger.info(f"🧪 alert_message_send: calling edit_message_text, chat_id={admin_id}, message_id={alert_message_id}")
@@ -3830,7 +3879,7 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 									logger.info(f"🧪 deal_alert_message_send: using question_messages, count={len(q_messages)}")
 							except Exception as e:
 								logger.warning(f"⚠️ deal_alert_message_send: error getting question_messages: {e}")
-				alert_text = _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines)
+				alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db)
 				reply_markup = deal_alert_admin_kb(deal_id)
 				logger.info(f"🧪 deal_alert_message_send: updating alert, chat_id={use_admin_id}, message_id={alert_message_id}")
 				await bot.edit_message_text(
@@ -4011,7 +4060,65 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 		)
 	except Exception:
 		pass
-	await update_buy_deal_alert(bot, deal_id)
+	
+	# Проверяем настройку оповещений и отправляем оповещение, если нужно
+	notification_type = await db.get_setting("deal_notification_type", "after_proof")
+	logger.info(f"🔔 deal_alert_requisites_select: notification_type={notification_type}, deal_id={deal_id}")
+	
+	if notification_type == "after_requisites":
+		# Отправляем полное оповещение админам после выдачи реквизитов
+		from app.main import buy_deal_alerts, _build_admin_open_deal_text, _get_admin_user_financial_lines, _get_deal_requisites_label, _build_deal_chat_lines
+		from app.keyboards import deal_alert_admin_kb
+		from app.di import get_admin_ids
+		
+		# Проверяем, есть ли уже оповещение
+		message_ids = buy_deal_alerts.get(deal_id, {})
+		logger.info(f"🔔 deal_alert_requisites_select: buy_deal_alerts[{deal_id}]={message_ids}")
+		
+		if not message_ids:
+			# Если оповещения еще нет, создаем его
+			admin_ids = get_admin_ids()
+			logger.info(f"🔔 deal_alert_requisites_select: создаем новое оповещение для deal_id={deal_id}, admin_ids={admin_ids}")
+			if admin_ids:
+				financial_lines = await _get_admin_user_financial_lines(db, user_tg_id)
+				requisites_label = await _get_deal_requisites_label(
+					db,
+					user_tg_id,
+					deal.get("country_code")
+				)
+				chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+				alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db)
+				reply_markup = deal_alert_admin_kb(deal_id)
+				
+				# Защита от переполнения памяти
+				from app.main import limit_dict_size, MAX_BUY_DEAL_ALERTS
+				limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
+				buy_deal_alerts[deal_id] = {}
+				
+				for admin_id in admin_ids:
+					try:
+						sent = await bot.send_message(
+							chat_id=admin_id,
+							text=alert_text,
+							parse_mode="HTML",
+							reply_markup=reply_markup
+						)
+						buy_deal_alerts[deal_id][admin_id] = sent.message_id
+						# Сохраняем в БД для восстановления после перезапуска
+						from app.main import save_deal_alert_to_db
+						await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
+						logger.info(f"✅ deal_alert_requisites_select: оповещение отправлено админу {admin_id}, message_id={sent.message_id}")
+					except Exception as e:
+						logger.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
+		else:
+			# Обновляем существующее оповещение
+			logger.info(f"🔔 deal_alert_requisites_select: обновляем существующее оповещение для deal_id={deal_id}")
+			await update_buy_deal_alert(bot, deal_id)
+	else:
+		# Обновляем существующее оповещение (если есть)
+		logger.info(f"🔔 deal_alert_requisites_select: настройка не 'after_requisites', просто обновляем оповещение")
+		await update_buy_deal_alert(bot, deal_id)
+	
 	await cb.answer("Реквизиты отправлены пользователю ✅")
 
 
@@ -4145,17 +4252,18 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 		if deal.get("status") == "await_payment":
 			reply_markup = buy_deal_paid_reply_kb(deal_id)
 	except Exception:
-		user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+		pass
+	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
 		if deal.get("user_message_id"):
 			try:
 				await bot.edit_message_text(
-					chat_id=deal["user_tg_id"],
-					message_id=deal["user_message_id"],
-					text=user_text,
-					parse_mode="HTML",
-					reply_markup=reply_markup
-				)
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=deal["user_tg_id"],
@@ -4351,13 +4459,13 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		await db.add_user_debt(deal["user_tg_id"], -debt_amount, currency_symbol)
 	else:
 		base_amount_currency = float(deal.get("amount_currency", 0))
-		if debt_amount > base_amount_currency:
-			await message.answer("❌ Долг не может быть больше суммы сделки.")
-			return
-		new_amount_currency = base_amount_currency - debt_amount
-		await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
-		await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
-		deal["amount_currency"] = new_amount_currency
+	if debt_amount > base_amount_currency:
+		await message.answer("❌ Долг не может быть больше суммы сделки.")
+		return
+	new_amount_currency = base_amount_currency - debt_amount
+	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+	deal["amount_currency"] = new_amount_currency
 	from app.main import update_buy_deal_alert
 	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:

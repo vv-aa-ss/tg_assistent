@@ -194,7 +194,30 @@ def admin_settings_kb(one_card_for_all_enabled: bool = False) -> InlineKeyboardM
 	kb.button(text="💳 Должники", callback_data="settings:debtors")
 	one_card_text = "✅ Одна карта для всех" if one_card_for_all_enabled else "❌ Одна карта для всех"
 	kb.button(text=one_card_text, callback_data="settings:one_card_for_all")
+	kb.button(text="🔔 Оповещения", callback_data="settings:notifications")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def notifications_settings_kb(current_type: str = "after_proof") -> InlineKeyboardMarkup:
+	"""
+	Создает клавиатуру для выбора типа оповещений
+	
+	Args:
+		current_type: Текущий выбранный тип ("after_requisites" или "after_proof")
+	"""
+	kb = InlineKeyboardBuilder()
+	
+	# После выдачи реквизитов
+	after_requisites_text = "✅ После выдачи реквизитов" if current_type == "after_requisites" else "После выдачи реквизитов"
+	kb.button(text=after_requisites_text, callback_data="settings:notifications:set:after_requisites")
+	
+	# После отправки скриншота
+	after_proof_text = "✅ После отправки скриншота" if current_type == "after_proof" else "После отправки скриншота"
+	kb.button(text=after_proof_text, callback_data="settings:notifications:set:after_proof")
+	
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
 	kb.adjust(1)
 	return kb.as_markup()
 
@@ -1291,8 +1314,9 @@ def buy_calc_settings_kb(settings: dict) -> InlineKeyboardMarkup:
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +RUB {settings['buy_extra_fee_low_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_rub")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +RUB {settings['buy_extra_fee_mid_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_rub")
 	kb.button(text=f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}", callback_data="settings:buy_calc:edit:buy_alert_usd_threshold")
-	kb.button(text=f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_byn_rate")
-	kb.button(text=f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_rub_rate")
+	# Курсы валют обновляются автоматически, поэтому не показываем кнопки редактирования
+	# kb.button(text=f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_byn_rate")
+	# kb.button(text=f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_rub_rate")
 	kb.button(text="⬅️ Назад", callback_data="admin:settings")
 	kb.adjust(1)
 	return kb.as_markup()
