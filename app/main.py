@@ -967,73 +967,62 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 	logger_main.info(f"🧪 update_buy_deal_alert: total_usd={total_usd}, alert_threshold={alert_threshold}")
 	if total_usd >= alert_threshold:
 		user_tg_id = deal.get("user_tg_id")
-		logger_main.info(f"🧪 update_buy_deal_alert: large deal, user_tg_id={user_tg_id}, large_order_alerts_keys={list(large_order_alerts.keys())}")
-		# Восстанавливаем large_order_alerts из buy_deal_alerts, если его нет
-		if user_tg_id not in large_order_alerts:
-			from app.di import get_admin_ids
-			admin_ids = get_admin_ids()
-			if deal_id in buy_deal_alerts and admin_ids:
-				message_ids = {}
-				for admin_id in admin_ids:
-					if admin_id in buy_deal_alerts[deal_id]:
-						message_ids[admin_id] = buy_deal_alerts[deal_id][admin_id]
-				if message_ids:
-					large_order_alerts[user_tg_id] = {"message_ids": message_ids, "question_id": None}
-					logger_main.info(f"🧪 update_buy_deal_alert: restored from buy_deal_alerts, message_ids={message_ids}")
-		if user_tg_id in large_order_alerts:
-			user_data = large_order_alerts.get(user_tg_id)
-			logger_main.info(f"🧪 update_buy_deal_alert: user_data={user_data}")
-			message_ids = {}
-			if isinstance(user_data, dict) and "message_ids" in user_data:
-				message_ids = user_data.get("message_ids") or {}
-			elif isinstance(user_data, dict):
-				message_ids = user_data
-			logger_main.info(f"🧪 update_buy_deal_alert: message_ids={message_ids}")
-			if not message_ids:
-				logger_main.warning(f"⚠️ update_buy_deal_alert: message_ids пустые для user_tg_id={user_tg_id}")
-				return
+		logger_main.info(f"🧪 update_buy_deal_alert: large deal, deal_id={deal_id}, user_tg_id={user_tg_id}, large_order_alerts_keys={list(large_order_alerts.keys())}")
+		# Всегда берем актуальные message_ids из buy_deal_alerts для текущей сделки
+		from app.di import get_admin_ids
+		admin_ids = get_admin_ids()
+		message_ids = {}
+		if deal_id in buy_deal_alerts and admin_ids:
+			for admin_id in admin_ids:
+				if admin_id in buy_deal_alerts[deal_id]:
+					message_ids[admin_id] = buy_deal_alerts[deal_id][admin_id]
+		logger_main.info(f"🧪 update_buy_deal_alert: message_ids from buy_deal_alerts[{deal_id}]={message_ids}")
+		if not message_ids:
+			logger_main.warning(f"⚠️ update_buy_deal_alert: message_ids пустые для deal_id={deal_id}")
+			return
+		# Получаем question_id из large_order_alerts, если есть
+		user_data = large_order_alerts.get(user_tg_id)
+		question_id = None
+		if isinstance(user_data, dict):
+			question_id = user_data.get("question_id")
 			financial_lines = await _get_admin_user_financial_lines(db_local, user_tg_id)
 			requisites_label = await _get_deal_requisites_label(
 				db_local,
 				user_tg_id,
 				deal.get("country_code")
 			)
-			messages = await db_local.get_buy_deal_messages(deal_id)
-			chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
-			# Для крупных сделок проверяем question_messages, если есть question_id
-			if isinstance(user_data, dict):
-				question_id = user_data.get("question_id")
-				if question_id:
-					try:
-						q_messages = await db_local.get_question_messages(question_id)
-						if q_messages:
-							chat_lines = _build_deal_chat_lines(q_messages, deal.get("user_name", "Пользователь"))
-							logger_main.info(f"🧪 update_buy_deal_alert: using question_messages, count={len(q_messages)}")
-					except Exception as e:
-						logger_main.warning(f"⚠️ update_buy_deal_alert: error getting question_messages: {e}")
-			alert_text = _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines)
-			logger_main.info(f"🧪 update_buy_deal_alert: alert_text_len={len(alert_text)}")
-			from app.keyboards import deal_alert_admin_kb, deal_alert_admin_completed_kb
-			reply_markup = (
-				deal_alert_admin_completed_kb(deal_id)
-				if deal.get("status") == "completed"
-				else deal_alert_admin_kb(deal_id)
-			)
-			for admin_id, message_id in message_ids.items():
-				try:
-					logger_main.info(f"🧪 update_buy_deal_alert: editing message admin_id={admin_id}, message_id={message_id}")
-					await bot.edit_message_text(
-						chat_id=admin_id,
-						message_id=message_id,
-						text=alert_text,
-						parse_mode=ParseMode.HTML,
-						reply_markup=reply_markup
-					)
-					logger_main.info(f"✅ update_buy_deal_alert: message updated successfully")
-				except Exception as e:
-					logger_main.warning(f"⚠️ update_buy_deal_alert: error editing message: {e}")
-		else:
-			logger_main.warning(f"⚠️ update_buy_deal_alert: user_tg_id={user_tg_id} not in large_order_alerts")
+		messages = await db_local.get_buy_deal_messages(deal_id)
+		chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+		# Для крупных сделок проверяем question_messages, если есть question_id
+		if question_id:
+			try:
+				q_messages = await db_local.get_question_messages(question_id)
+				if q_messages:
+					chat_lines = _build_deal_chat_lines(q_messages, deal.get("user_name", "Пользователь"))
+					logger_main.info(f"🧪 update_buy_deal_alert: using question_messages, count={len(q_messages)}")
+			except Exception as e:
+				logger_main.warning(f"⚠️ update_buy_deal_alert: error getting question_messages: {e}")
+		alert_text = _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines)
+		logger_main.info(f"🧪 update_buy_deal_alert: alert_text_len={len(alert_text)}")
+		from app.keyboards import deal_alert_admin_kb, deal_alert_admin_completed_kb
+		reply_markup = (
+			deal_alert_admin_completed_kb(deal_id)
+			if deal.get("status") == "completed"
+			else deal_alert_admin_kb(deal_id)
+		)
+		for admin_id, message_id in message_ids.items():
+			try:
+				logger_main.info(f"🧪 update_buy_deal_alert: editing message admin_id={admin_id}, message_id={message_id}")
+				await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text=alert_text,
+					parse_mode=ParseMode.HTML,
+					reply_markup=reply_markup
+				)
+				logger_main.info(f"✅ update_buy_deal_alert: message updated successfully")
+			except Exception as e:
+				logger_main.warning(f"⚠️ update_buy_deal_alert: error editing message: {e}")
 		return
 	financial_lines = await _get_admin_user_financial_lines(db_local, deal.get("user_tg_id"))
 	requisites_label = await _get_deal_requisites_label(
@@ -2515,33 +2504,8 @@ async def main() -> None:
 				await db_local.update_buy_deal_user_message_id(deal_id, sent.message_id)
 		except Exception:
 			pass
-		# Не отправляем отдельное уведомление админу — обновляем алерт сделки ниже.
-		try:
-			total_usd = deal.get("total_usd") or 0
-			alert_threshold = 400.0
-			try:
-				alert_threshold_str = await db_local.get_setting("buy_alert_usd_threshold", "400")
-				alert_threshold = float(alert_threshold_str) if alert_threshold_str else 400.0
-			except (ValueError, TypeError):
-				alert_threshold = 400.0
-			if total_usd >= alert_threshold and message.from_user.id in large_order_alerts:
-				await update_large_order_alert(
-					bot=message.bot,
-					user_tg_id=message.from_user.id,
-					user_name=deal.get("user_name") or "",
-					user_username=deal.get("user_username") or "",
-					total_usd=total_usd,
-					crypto_display=deal.get("crypto_display") or deal.get("crypto_type") or "",
-					amount=deal.get("amount", 0),
-					stage_name="Переписка",
-					admin_ids=get_admin_ids(),
-					state_amount_currency=deal.get("amount_currency"),
-					state_currency_symbol=deal.get("currency_symbol"),
-					current_state="deal_chat",
-					country_code=deal.get("country_code")
-				)
-		except Exception:
-			pass
+		# Обновляем алерт сделки для админа
+		# Для крупных сделок используем update_buy_deal_alert, которая берет актуальные message_ids из buy_deal_alerts[deal_id]
 		await update_buy_deal_alert(message.bot, deal_id)
 		prompt_id = data.get("deal_reply_prompt_id")
 		if prompt_id:
