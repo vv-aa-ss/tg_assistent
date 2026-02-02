@@ -2451,6 +2451,9 @@ async def alert_message_start(cb: CallbackQuery, state: FSMContext):
 					buy_deal_alerts[deal_id] = {}
 				buy_deal_alerts[deal_id][admin_id] = message_id
 				logger.info(f"🧪 alert_message_start: saved to buy_deal_alerts, deal_id={deal_id}, message_id={message_id}")
+				# Сохраняем в БД для восстановления после перезапуска
+				from app.main import save_deal_alert_to_db
+				await save_deal_alert_to_db(deal_id, admin_id, message_id)
 			# Восстанавливаем large_order_alerts
 			if user_tg_id not in large_order_alerts or not isinstance(large_order_alerts.get(user_tg_id), dict):
 				large_order_alerts[user_tg_id] = {"message_ids": {}, "question_id": None}
@@ -3622,6 +3625,9 @@ async def deal_alert_message_start(cb: CallbackQuery, state: FSMContext):
 			buy_deal_alerts[deal_id] = {}
 		buy_deal_alerts[deal_id][admin_id] = alert_message_id
 		logger.info(f"🧪 deal_alert_message_start: saved to buy_deal_alerts, deal_id={deal_id}, message_id={alert_message_id}")
+		# Сохраняем в БД для восстановления после перезапуска
+		from app.main import save_deal_alert_to_db
+		await save_deal_alert_to_db(deal_id, admin_id, alert_message_id)
 	try:
 		prompt = await cb.message.answer("✍️ Введите сообщение для пользователя:")
 		await state.update_data(deal_prompt_message_id=prompt.message_id)
@@ -4432,12 +4438,31 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	except (ValueError, IndexError):
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
+	
+	# Валидация deal_id
+	from app.validators import validate_deal_id
+	is_valid, error_msg = validate_deal_id(deal_id)
+	if not is_valid:
+		await cb.answer(error_msg, show_alert=True)
+		return
+	
 	deal = await db.get_buy_deal_by_id(deal_id)
 	if not deal:
 		await cb.answer("Сделка не найдена", show_alert=True)
 		return
+	
+	# Проверка прав доступа (только админы могут завершать сделки)
+	# Для админов проверка уже есть через middleware, но добавим для надежности
+	admin_ids = get_admin_ids()
+	if cb.from_user and cb.from_user.id not in admin_ids:
+		await cb.answer("❌ Нет доступа", show_alert=True)
+		return
 	await db.update_buy_deal_fields(deal_id, status="completed")
 	deal["status"] = "completed"
+	
+	# Удаляем записи о сделке из глобальных словарей и БД
+	from app.main import cleanup_deal_alerts
+	await cleanup_deal_alerts(deal_id)
 	from app.main import _build_user_deal_completed_text, _build_order_completion_message
 	from app.keyboards import buy_deal_completed_delete_kb
 	user_text = _build_user_deal_completed_text(deal)

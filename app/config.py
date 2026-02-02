@@ -15,6 +15,16 @@ class Settings(BaseModel):
 	google_credentials_path: str = ""
 	google_sheet_name: str = ""  # Название листа в таблице (если пусто, используется первый лист)
 	log_level: str = "INFO"  # DEBUG/INFO/WARNING/ERROR
+	
+	# Rate limiting параметры
+	rate_limit_messages_max: int = 10  # Максимум сообщений
+	rate_limit_messages_period: int = 60  # Период в секундах
+	rate_limit_spam_max: int = 3  # Максимум сообщений для защиты от быстрого спама
+	rate_limit_spam_period: int = 10  # Период в секундах для защиты от спама
+	rate_limit_callbacks_max: int = 20  # Максимум callback запросов
+	rate_limit_callbacks_period: int = 60  # Период в секундах для callback
+	rate_limit_deals_max: int = 5  # Максимум созданий сделок
+	rate_limit_deals_period: int = 60  # Период в секундах для создания сделок
 
 	@field_validator("admin_ids", mode="before")
 	@classmethod
@@ -61,4 +71,12 @@ def get_settings() -> Settings:
 		google_credentials_path=os.getenv("GOOGLE_CREDENTIALS_PATH", ""),
 		google_sheet_name=os.getenv("GOOGLE_SHEET_NAME", ""),
 		log_level=os.getenv("LOG_LEVEL", "INFO"),
+		rate_limit_messages_max=int(os.getenv("RATE_LIMIT_MESSAGES_MAX", "10")),
+		rate_limit_messages_period=int(os.getenv("RATE_LIMIT_MESSAGES_PERIOD", "60")),
+		rate_limit_spam_max=int(os.getenv("RATE_LIMIT_SPAM_MAX", "3")),
+		rate_limit_spam_period=int(os.getenv("RATE_LIMIT_SPAM_PERIOD", "10")),
+		rate_limit_callbacks_max=int(os.getenv("RATE_LIMIT_CALLBACKS_MAX", "20")),
+		rate_limit_callbacks_period=int(os.getenv("RATE_LIMIT_CALLBACKS_PERIOD", "60")),
+		rate_limit_deals_max=int(os.getenv("RATE_LIMIT_DEALS_MAX", "5")),
+		rate_limit_deals_period=int(os.getenv("RATE_LIMIT_DEALS_PERIOD", "60")),
 	)

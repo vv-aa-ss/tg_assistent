@@ -105,6 +105,7 @@ class Database:
 		await self._ensure_debts_table()
 		await self._ensure_user_debts_table()
 		await self._ensure_pending_requisites_table()
+		await self._ensure_deal_alerts_table()
 		await self._db.commit()
 
 	async def _ensure_menu_user(self) -> None:
@@ -3690,6 +3691,90 @@ class Database:
 		)
 		await self._db.commit()
 
+	async def _ensure_deal_alerts_table(self) -> None:
+		"""Создает таблицу для хранения deal alerts (для восстановления после перезапуска)"""
+		assert self._db
+		cur = await self._db.execute(
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='deal_alerts'"
+		)
+		if not await cur.fetchone():
+			await self._db.execute(
+				"""
+				CREATE TABLE deal_alerts (
+					id INTEGER PRIMARY KEY AUTOINCREMENT,
+					deal_id INTEGER NOT NULL,
+					admin_id INTEGER NOT NULL,
+					message_id INTEGER NOT NULL,
+					alert_type TEXT NOT NULL DEFAULT 'buy_deal',
+					created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+					UNIQUE(deal_id, admin_id, alert_type)
+				)
+				"""
+			)
+			_logger.debug("Created deal_alerts table")
+	
+	async def save_deal_alert(self, deal_id: int, admin_id: int, message_id: int, alert_type: str = "buy_deal") -> None:
+		"""Сохраняет deal alert в БД"""
+		assert self._db
+		await self._db.execute(
+			"""
+			INSERT OR REPLACE INTO deal_alerts(deal_id, admin_id, message_id, alert_type, updated_at)
+			VALUES(?, ?, ?, ?, ?)
+			""",
+			(deal_id, admin_id, message_id, alert_type, int(time.time()))
+		)
+		await self._db.commit()
+		_logger.debug(f"Saved deal alert: deal_id={deal_id}, admin_id={admin_id}, message_id={message_id}")
+	
+	async def delete_deal_alert(self, deal_id: int, admin_id: int = None, alert_type: str = "buy_deal") -> None:
+		"""Удаляет deal alert из БД"""
+		assert self._db
+		if admin_id is not None:
+			await self._db.execute(
+				"DELETE FROM deal_alerts WHERE deal_id = ? AND admin_id = ? AND alert_type = ?",
+				(deal_id, admin_id, alert_type)
+			)
+		else:
+			await self._db.execute(
+				"DELETE FROM deal_alerts WHERE deal_id = ? AND alert_type = ?",
+				(deal_id, alert_type)
+			)
+		await self._db.commit()
+		_logger.debug(f"Deleted deal alert: deal_id={deal_id}, admin_id={admin_id}")
+	
+	async def get_deal_alerts(self, deal_id: int = None, alert_type: str = "buy_deal") -> List[Dict[str, Any]]:
+		"""Получает deal alerts из БД"""
+		assert self._db
+		if deal_id is not None:
+			cur = await self._db.execute(
+				"SELECT deal_id, admin_id, message_id, alert_type FROM deal_alerts WHERE deal_id = ? AND alert_type = ?",
+				(deal_id, alert_type)
+			)
+		else:
+			cur = await self._db.execute(
+				"SELECT deal_id, admin_id, message_id, alert_type FROM deal_alerts WHERE alert_type = ?",
+				(alert_type,)
+			)
+		rows = await cur.fetchall()
+		return [
+			{"deal_id": row[0], "admin_id": row[1], "message_id": row[2], "alert_type": row[3]}
+			for row in rows
+		]
+	
+	async def get_active_buy_deals(self) -> List[Dict[str, Any]]:
+		"""Возвращает список активных buy deals (не завершены и не отменены)"""
+		assert self._db
+		cur = await self._db.execute(
+			"""
+			SELECT id, user_tg_id, status FROM buy_deals
+			WHERE status NOT IN ('completed', 'cancelled')
+			ORDER BY created_at DESC
+			"""
+		)
+		rows = await cur.fetchall()
+		return [{"id": row[0], "user_tg_id": row[1], "status": row[2]} for row in rows]
+	
 	async def get_debtors_totals(self) -> List[Dict[str, Any]]:
 		"""Возвращает список должников с суммами по валютам"""
 		assert self._db

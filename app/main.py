@@ -37,6 +37,119 @@ large_order_alerts: dict[int, dict] = {}
 # Формат: {deal_id: {admin_id: message_id}}
 buy_deal_alerts: dict[int, dict[int, int]] = {}
 
+# Лимиты для глобальных словарей (защита от переполнения памяти)
+MAX_LARGE_ORDER_ALERTS = 1000  # Максимум 1000 активных крупных заявок
+MAX_BUY_DEAL_ALERTS = 5000  # Максимум 5000 активных сделок
+
+
+def limit_dict_size(dictionary: dict, max_size: int, dict_name: str) -> None:
+	"""Ограничивает размер словаря, удаляя старые записи"""
+	if len(dictionary) > max_size:
+		logger_main = logging.getLogger("app.main")
+		logger_main.warning(f"⚠️ {dict_name} превысил лимит {max_size}, очищаем старые записи")
+		# Удаляем 20% самых старых записей
+		to_remove = int(max_size * 0.2)
+		keys_to_remove = list(dictionary.keys())[:to_remove]
+		for key in keys_to_remove:
+			del dictionary[key]
+		logger_main.info(f"✅ Удалено {to_remove} старых записей из {dict_name}")
+
+
+async def cleanup_deal_alerts(deal_id: int) -> None:
+	"""Удаляет записи о завершенной сделке из глобальных словарей и БД"""
+	global buy_deal_alerts, large_order_alerts
+	
+	from app.di import get_db
+	db = get_db()
+	logger_main = logging.getLogger("app.main")
+	
+	# Удаляем из глобальных словарей
+	if deal_id in buy_deal_alerts:
+		# Удаляем из БД перед удалением из памяти
+		for admin_id in buy_deal_alerts[deal_id].keys():
+			try:
+				await db.delete_deal_alert(deal_id, admin_id, "buy_deal")
+			except Exception as e:
+				logger_main.warning(f"⚠️ Ошибка при удалении deal alert из БД: {e}")
+		del buy_deal_alerts[deal_id]
+		logger_main.debug(f"🧹 Удалена запись deal_id={deal_id} из buy_deal_alerts")
+	
+	# Также удаляем из large_order_alerts, если есть
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if deal:
+		user_tg_id = deal.get("user_tg_id")
+		if user_tg_id in large_order_alerts:
+			# Проверяем, есть ли активные сделки у этого пользователя
+			active_deal = await db.get_active_buy_deal_by_user(user_tg_id)
+			if not active_deal or active_deal == deal_id:
+				# Если нет активных сделок или это была последняя, удаляем
+				del large_order_alerts[user_tg_id]
+				logger_main.debug(f"🧹 Удалена запись user_tg_id={user_tg_id} из large_order_alerts")
+
+
+async def save_deal_alert_to_db(deal_id: int, admin_id: int, message_id: int) -> None:
+	"""Сохраняет deal alert в БД"""
+	from app.di import get_db
+	db = get_db()
+	try:
+		await db.save_deal_alert(deal_id, admin_id, message_id, "buy_deal")
+	except Exception as e:
+		logger_main = logging.getLogger("app.main")
+		logger_main.warning(f"⚠️ Ошибка при сохранении deal alert в БД: {e}")
+
+
+async def load_deal_alerts_from_db() -> None:
+	"""Загружает deal alerts из БД при старте бота"""
+	global buy_deal_alerts
+	from app.di import get_db
+	db = get_db()
+	logger_main = logging.getLogger("app.main")
+	
+	try:
+		alerts = await db.get_deal_alerts(alert_type="buy_deal")
+		logger_main.info(f"📥 Загрузка {len(alerts)} deal alerts из БД")
+		
+		for alert in alerts:
+			deal_id = alert["deal_id"]
+			admin_id = alert["admin_id"]
+			message_id = alert["message_id"]
+			
+			if deal_id not in buy_deal_alerts:
+				buy_deal_alerts[deal_id] = {}
+			buy_deal_alerts[deal_id][admin_id] = message_id
+		
+		logger_main.info(f"✅ Загружено {len(buy_deal_alerts)} активных deal alerts")
+	except Exception as e:
+		logger_main.error(f"❌ Ошибка при загрузке deal alerts из БД: {e}", exc_info=True)
+
+
+async def periodic_cleanup_alerts():
+	"""Периодически очищает старые записи из глобальных словарей"""
+	from app.di import get_db
+	logger_main = logging.getLogger("app.main")
+	
+	while True:
+		await asyncio.sleep(3600)  # Каждый час
+		try:
+			# Ограничиваем размер словарей
+			limit_dict_size(large_order_alerts, MAX_LARGE_ORDER_ALERTS, "large_order_alerts")
+			limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
+			
+			# Удаляем записи для завершенных сделок
+			db = get_db()
+			# Получаем список активных deal_id (статус не "completed")
+			active_deals = await db.get_active_buy_deals()
+			active_deal_ids = {deal["id"] for deal in active_deals}
+			inactive_deal_ids = set(buy_deal_alerts.keys()) - active_deal_ids
+			for deal_id in inactive_deal_ids:
+				await cleanup_deal_alerts(deal_id)
+			
+			logger_main.info(f"🧹 Периодическая очистка: удалено {len(inactive_deal_ids)} неактивных deal alerts")
+			
+			logger_main.debug("🧹 Периодическая очистка глобальных словарей завершена")
+		except Exception as e:
+			logger_main.error(f"❌ Ошибка при очистке глобальных словарей: {e}", exc_info=True)
+
 
 def is_not_admin_message(message: Message) -> bool:
 	"""Фильтр: пропускаем только сообщения от НЕ админов."""
@@ -1065,6 +1178,8 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 		admin_ids = get_admin_ids()
 		if not admin_ids:
 			return
+		# Защита от переполнения памяти
+		limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
 		buy_deal_alerts[deal_id] = {}
 		for admin_id in admin_ids:
 			reply_markup = (
@@ -1080,6 +1195,8 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 					reply_markup=reply_markup
 				)
 				buy_deal_alerts[deal_id][admin_id] = sent.message_id
+				# Сохраняем в БД для восстановления после перезапуска
+				await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
 			except Exception:
 				pass
 		return
@@ -1298,10 +1415,33 @@ async def main() -> None:
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 	dp = Dispatcher(storage=MemoryStorage())
 	
-	# Инициализируем глобальный словарь для хранения message_id сообщений о крупных заявках
-	# Формат: {user_tg_id: {admin_id: message_id}}
-	global large_order_alerts
+	# Инициализируем глобальные словари
+	global large_order_alerts, buy_deal_alerts
 	large_order_alerts = {}
+	buy_deal_alerts = {}
+	
+	# Загружаем deal alerts из БД для восстановления после перезапуска
+	await load_deal_alerts_from_db()
+	logger.info("✅ Deal alerts загружены из БД")
+	
+	# Инициализируем rate limiters с параметрами из настроек
+	from app.rate_limiter import init_rate_limiters, RateLimitMiddleware, CallbackRateLimitMiddleware, periodic_cleanup as rate_limiter_cleanup
+	init_rate_limiters(settings)
+	
+	# Добавляем rate limiting middleware для защиты от flood атак
+	dp.message.middleware(RateLimitMiddleware())
+	dp.callback_query.middleware(CallbackRateLimitMiddleware())
+	logger.info("✅ Rate limiting middleware добавлен")
+	
+	# Запускаем периодическую очистку rate limiters
+	asyncio.create_task(rate_limiter_cleanup())
+	logger.info("✅ Периодическая очистка rate limiters запущена")
+	
+	# Запускаем периодическую очистку глобальных словарей
+	asyncio.create_task(periodic_cleanup_alerts())
+	logger.info("✅ Периодическая очистка глобальных словарей запущена")
+	
+	# Глобальные словари уже инициализированы выше
 	
 	# Определяем команды для админов
 	from aiogram.types import BotCommand, BotCommandScopeDefault
@@ -1653,17 +1793,26 @@ async def main() -> None:
 			return
 		await delete_user_message(message)
 		data = await state.get_data()
+		# Удаляем предыдущее сообщение об ошибке минимальной суммы, если оно есть
+		min_amount_error_message_id = data.get("min_amount_error_message_id")
+		if min_amount_error_message_id:
+			await delete_previous_bot_message(message.bot, message.chat.id, min_amount_error_message_id)
+			await state.update_data(min_amount_error_message_id=None)
 		crypto_type = data.get("crypto_type", "")
 		crypto_display = data.get("crypto_display", "")
 		selected_country = data.get("selected_country", "BYN")
 		amount_str_raw = message.text.strip().replace(",", ".")
 		try:
 			amount = float(amount_str_raw)
-			if amount <= 0:
-				await message.answer("❌ Сумма должна быть больше нуля. Введите корректную сумму:")
-				return
 		except ValueError:
 			await message.answer("❌ Неверный формат суммы. Введите число (например: 0.008 или 100):")
+			return
+		
+		# Валидация суммы с проверкой максимального значения
+		from app.validators import validate_amount
+		is_valid, error_msg = validate_amount(amount, min_value=0.0, max_value=1000000.0)
+		if not is_valid:
+			await message.answer(error_msg)
 			return
 		from app.google_sheets import get_btc_price_usd, get_ltc_price_usd, get_xmr_price_usd
 		crypto_price_usd = None
@@ -1703,10 +1852,12 @@ async def main() -> None:
 		except (ValueError, TypeError):
 			min_usd = 15.0
 		if amount_usd < min_usd:
-			await message.answer(
+			error_message = await message.answer(
 				f"❌ Минимальная сумма сделки {min_usd}$.\n"
 				f"Введите сумму больше {min_usd}$:"
 			)
+			# Сохраняем ID сообщения об ошибке для последующего удаления
+			await state.update_data(min_amount_error_message_id=error_message.message_id)
 			return
 		if amount_usd <= 100:
 			markup_percent_key = "buy_markup_percent_small"
@@ -1835,6 +1986,8 @@ async def main() -> None:
 			from app.keyboards import deal_alert_admin_kb
 			logger_main = logging.getLogger("app.main")
 			if deal_id and deal_id not in buy_deal_alerts:
+				# Защита от переполнения памяти
+				limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
 				buy_deal_alerts[deal_id] = {}
 			for admin_id in admin_ids:
 				try:
@@ -1846,6 +1999,8 @@ async def main() -> None:
 					)
 					if deal_id:
 						buy_deal_alerts[deal_id][admin_id] = sent_msg.message_id
+						# Сохраняем в БД для восстановления после перезапуска
+						await save_deal_alert_to_db(deal_id, admin_id, sent_msg.message_id)
 				except Exception as e:
 					logger_main.error(
 						f"❌ ОШИБКА при отправке алерта админу {admin_id}: {type(e).__name__}: {e}",
@@ -2252,8 +2407,12 @@ async def main() -> None:
 			return
 		data = await state.get_data()
 		crypto_type = data.get("crypto_type", "")
-		if not validate_wallet_address(wallet_address, crypto_type):
-			await message.answer("❌ Неверный адрес кошелька. Проверьте и отправьте снова.")
+		
+		# Валидация адреса кошелька
+		from app.validators import validate_wallet_address
+		is_valid, error_msg = validate_wallet_address(wallet_address, crypto_type)
+		if not is_valid:
+			await message.answer(error_msg)
 			return
 		await delete_user_message(message)
 		await state.update_data(wallet_address=wallet_address)
@@ -2420,6 +2579,17 @@ async def main() -> None:
 		reply_text = message.text or message.caption or ""
 		if not reply_text.strip():
 			return
+		
+		# Валидация текста сообщения
+		from app.validators import validate_text, sanitize_text
+		is_valid, error_msg = validate_text(reply_text, max_length=4096, min_length=1)
+		if not is_valid:
+			await message.answer(error_msg)
+			return
+		
+		# Очистка текста от опасных символов
+		reply_text = sanitize_text(reply_text)
+		
 		await delete_user_message(message)
 		data = await state.get_data()
 		deal_id = data.get("deal_id")
@@ -2911,6 +3081,19 @@ async def main() -> None:
 		"""Обработчик ввода суммы для покупки криптовалюты"""
 		if not message.from_user:
 			return
+		
+		# Проверяем лимит на создание сделок (защита от массового создания)
+		from app.rate_limiter import check_deal_creation_limit
+		is_allowed, wait_time = await check_deal_creation_limit(message.from_user.id)
+		if not is_allowed:
+			logger_main = logging.getLogger("app.main")
+			logger_main.warning(f"⚠️ Deal creation limit exceeded: user_id={message.from_user.id}, wait={wait_time:.1f}s")
+			await message.answer(
+				f"⏳ Превышен лимит создания сделок. Подождите {int(wait_time)} секунд перед созданием новой сделки.",
+				show_alert=False
+			)
+			return
+		
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
@@ -2946,6 +3129,11 @@ async def main() -> None:
 		
 		# Получаем данные о выбранной криптовалюте
 		data = await state.get_data()
+		# Удаляем предыдущее сообщение об ошибке минимальной суммы, если оно есть
+		min_amount_error_message_id = data.get("min_amount_error_message_id")
+		if min_amount_error_message_id:
+			await delete_previous_bot_message(message.bot, message.chat.id, min_amount_error_message_id)
+			await state.update_data(min_amount_error_message_id=None)
 		crypto_name = data.get("selected_crypto", "")
 		crypto_display = data.get("crypto_display", "")
 		
@@ -3022,12 +3210,14 @@ async def main() -> None:
 		except (ValueError, TypeError):
 			min_usd = 15.0
 		if amount_usd < min_usd:
-			await send_and_save_message(
+			error_message = await send_and_save_message(
 				message,
 				f"❌ Минимальная сумма сделки {min_usd}$.\n"
 				f"Введите сумму больше {min_usd}$:",
 				state=state
 			)
+			# Сохраняем ID сообщения об ошибке для последующего удаления
+			await state.update_data(min_amount_error_message_id=error_message.message_id)
 			return
 		
 		# Определяем процент наценки в зависимости от суммы заказа
@@ -3110,6 +3300,9 @@ async def main() -> None:
 			logger_main = logging.getLogger("app.main")
 			logger_main.info(f"🔍 Создание записи для user_tg_id={user_tg_id} в large_order_alerts")
 			logger_main.info(f"🔍 Текущее состояние large_order_alerts: {list(large_order_alerts.keys())}")
+			
+			# Защита от переполнения памяти
+			limit_dict_size(large_order_alerts, MAX_LARGE_ORDER_ALERTS, "large_order_alerts")
 			
 			if user_tg_id not in large_order_alerts:
 				large_order_alerts[user_tg_id] = {"message_ids": {}, "question_id": None}
