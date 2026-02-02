@@ -980,19 +980,26 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 		if not message_ids:
 			logger_main.warning(f"⚠️ update_buy_deal_alert: message_ids пустые для deal_id={deal_id}")
 			return
+		# Инициализируем необходимые переменные
+		financial_lines = await _get_admin_user_financial_lines(db_local, user_tg_id)
+		requisites_label = await _get_deal_requisites_label(
+			db_local,
+			user_tg_id,
+			deal.get("country_code")
+		)
 		# Получаем question_id из large_order_alerts, если есть
 		user_data = large_order_alerts.get(user_tg_id)
 		question_id = None
 		if isinstance(user_data, dict):
 			question_id = user_data.get("question_id")
-			financial_lines = await _get_admin_user_financial_lines(db_local, user_tg_id)
-			requisites_label = await _get_deal_requisites_label(
-				db_local,
-				user_tg_id,
-				deal.get("country_code")
-			)
 		messages = await db_local.get_buy_deal_messages(deal_id)
+		logger_main.info(f"🧪 update_buy_deal_alert: got {len(messages)} messages from DB for deal_id={deal_id}")
+		if messages:
+			logger_main.info(f"🧪 update_buy_deal_alert: last message: sender={messages[-1].get('sender_type')}, text={messages[-1].get('message_text', '')[:50]}")
 		chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+		logger_main.info(f"🧪 update_buy_deal_alert: chat_lines count={len(chat_lines)}")
+		if chat_lines:
+			logger_main.info(f"🧪 update_buy_deal_alert: last chat_line={chat_lines[-1][:100]}")
 		# Для крупных сделок проверяем question_messages, если есть question_id
 		if question_id:
 			try:
@@ -1002,7 +1009,9 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 					logger_main.info(f"🧪 update_buy_deal_alert: using question_messages, count={len(q_messages)}")
 			except Exception as e:
 				logger_main.warning(f"⚠️ update_buy_deal_alert: error getting question_messages: {e}")
+		logger_main.info(f"🧪 update_buy_deal_alert: final chat_lines count={len(chat_lines)}, requisites_label={requisites_label}")
 		alert_text = _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines)
+		logger_main.info(f"🧪 update_buy_deal_alert: alert_text length={len(alert_text)}, preview={alert_text[:200]}")
 		logger_main.info(f"🧪 update_buy_deal_alert: alert_text_len={len(alert_text)}")
 		from app.keyboards import deal_alert_admin_kb, deal_alert_admin_completed_kb
 		reply_markup = (
@@ -2414,10 +2423,13 @@ async def main() -> None:
 		await delete_user_message(message)
 		data = await state.get_data()
 		deal_id = data.get("deal_id")
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"🔵 on_deal_user_reply_send: deal_id={deal_id}, user_id={message.from_user.id}, text={reply_text[:50]}")
 		if not deal_id:
 			await state.clear()
 			return
 		await db_local.add_buy_deal_message(deal_id, "user", reply_text)
+		logger_main.info(f"🔵 on_deal_user_reply_send: message saved to buy_deal_messages, deal_id={deal_id}")
 		try:
 			if message.from_user.id in large_order_alerts:
 				user_data = large_order_alerts.get(message.from_user.id)
@@ -2444,7 +2456,9 @@ async def main() -> None:
 		except Exception:
 			pass
 		messages = await db_local.get_buy_deal_messages(deal_id)
+		logger_main.info(f"🔵 on_deal_user_reply_send: got {len(messages)} messages from DB for deal_id={deal_id}")
 		chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+		logger_main.info(f"🔵 on_deal_user_reply_send: chat_lines count={len(chat_lines)}")
 		requisites_text = await _get_deal_requisites_text(
 			db_local,
 			deal.get("user_tg_id"),
@@ -2459,6 +2473,7 @@ async def main() -> None:
 		is_large_order = (deal.get("total_usd") or 0) >= alert_threshold
 		admin_amount_set = bool(deal.get("admin_amount_set"))
 		hide_requisites = is_large_order and not admin_amount_set
+		logger_main.info(f"🔵 on_deal_user_reply_send: is_large_order={is_large_order}, admin_amount_set={admin_amount_set}, hide_requisites={hide_requisites}")
 		if deal.get("status") == "completed":
 			hide_requisites = True
 		prompt_wallet = "➡️Введи адрес кошелька:" if deal.get("status") == "await_wallet" else None
@@ -2502,11 +2517,16 @@ async def main() -> None:
 					reply_markup=reply_markup
 				)
 				await db_local.update_buy_deal_user_message_id(deal_id, sent.message_id)
-		except Exception:
-			pass
+		except Exception as e:
+			logger_main.warning(f"⚠️ on_deal_user_reply_send: error updating user message: {e}")
 		# Обновляем алерт сделки для админа
 		# Для крупных сделок используем update_buy_deal_alert, которая берет актуальные message_ids из buy_deal_alerts[deal_id]
-		await update_buy_deal_alert(message.bot, deal_id)
+		logger_main.info(f"🔵 on_deal_user_reply_send: calling update_buy_deal_alert for deal_id={deal_id}")
+		try:
+			await update_buy_deal_alert(message.bot, deal_id)
+			logger_main.info(f"✅ on_deal_user_reply_send: update_buy_deal_alert completed for deal_id={deal_id}")
+		except Exception as e:
+			logger_main.error(f"❌ on_deal_user_reply_send: error in update_buy_deal_alert: {type(e).__name__}: {e}", exc_info=True)
 		prompt_id = data.get("deal_reply_prompt_id")
 		if prompt_id:
 			try:

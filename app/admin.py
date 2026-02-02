@@ -107,12 +107,12 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 				show_requisites=False,
 			)
 		else:
-			user_text = _build_user_deal_with_requisites_chat_text(
-				deal=deal,
-				requisites_text=requisites_text,
-				chat_lines=chat_lines,
-				prompt=prompt,
-			)
+		user_text = _build_user_deal_with_requisites_chat_text(
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+			prompt=prompt,
+		)
 	elif deal.get("status") == "await_admin":
 		show_requisites = (not is_large_order) or admin_amount_set
 		amount_currency_for_user = deal.get("amount_currency") if show_requisites else None
@@ -701,7 +701,7 @@ def _one_card_groups_kb(
 	kb.button(
 		text="⛔ Отключить функцию",
 		callback_data=f"settings:one_card_for_all:disable:{country_code}"
-	)
+		)
 	kb.button(text="⬅️ Назад", callback_data="settings:one_card_for_all")
 	kb.adjust(1)
 	return kb
@@ -2608,13 +2608,13 @@ async def alert_message_send(message: Message, state: FSMContext, bot: Bot):
 				try:
 					if deal.get("user_message_id"):
 						try:
-							await bot.edit_message_text(
-								chat_id=user_tg_id,
-								message_id=deal["user_message_id"],
-								text=user_text,
-								parse_mode="HTML",
-								reply_markup=reply_markup
-							)
+						await bot.edit_message_text(
+							chat_id=user_tg_id,
+							message_id=deal["user_message_id"],
+							text=user_text,
+							parse_mode="HTML",
+							reply_markup=reply_markup
+						)
 							logger.info("🧪 alert_message_send: user message edited")
 						except Exception as edit_error:
 							logger.warning(f"🧪 alert_message_send: edit failed: {edit_error}")
@@ -3660,7 +3660,9 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 		await state.clear()
 		return
 	await db.add_buy_deal_message(deal_id, "admin", reply_text)
+	logger.info(f"🔵 deal_alert_message_send: message saved to buy_deal_messages, deal_id={deal_id}, text={reply_text[:50]}")
 	messages = await db.get_buy_deal_messages(deal_id)
+	logger.info(f"🔵 deal_alert_message_send: got {len(messages)} messages from DB for deal_id={deal_id}")
 	user_name = deal.get("user_name", "Пользователь")
 	from app.main import _build_user_deal_admin_message_text, _build_user_deal_chat_text, _build_user_deal_with_requisites_chat_text, _build_deal_chat_lines, _get_deal_requisites_text, update_buy_deal_alert, _notify_user_new_message, _append_prompt
 	user_text = ""
@@ -3722,13 +3724,13 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 			reply_markup = buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 		if deal.get("user_message_id"):
 			try:
-				await bot.edit_message_text(
-					chat_id=user_tg_id,
-					message_id=deal["user_message_id"],
-					text=user_text,
-					parse_mode="HTML",
-					reply_markup=reply_markup
-				)
+			await bot.edit_message_text(
+				chat_id=user_tg_id,
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=user_tg_id,
@@ -3837,7 +3839,12 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 				logger.error(f"❌ deal_alert_message_send: failed to update alert: {type(e).__name__}: {e}", exc_info=True)
 		else:
 			logger.warning(f"⚠️ deal_alert_message_send: alert_message_id not found, use_admin_id={use_admin_id}, deal_id={deal_id}")
-	await update_buy_deal_alert(bot, deal_id)
+	logger.info(f"🔵 deal_alert_message_send: calling update_buy_deal_alert for deal_id={deal_id}")
+	try:
+		await update_buy_deal_alert(bot, deal_id)
+		logger.info(f"✅ deal_alert_message_send: update_buy_deal_alert completed for deal_id={deal_id}")
+	except Exception as e:
+		logger.error(f"❌ deal_alert_message_send: error in update_buy_deal_alert: {type(e).__name__}: {e}", exc_info=True)
 	prompt_id = data.get("deal_prompt_message_id")
 	if prompt_id:
 		try:
@@ -4132,17 +4139,17 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 		if deal.get("status") == "await_payment":
 			reply_markup = buy_deal_paid_reply_kb(deal_id)
 	except Exception:
-		user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
 		if deal.get("user_message_id"):
 			try:
-				await bot.edit_message_text(
-					chat_id=deal["user_tg_id"],
-					message_id=deal["user_message_id"],
-					text=user_text,
-					parse_mode="HTML",
-					reply_markup=reply_markup
-				)
+			await bot.edit_message_text(
+				chat_id=deal["user_tg_id"],
+				message_id=deal["user_message_id"],
+				text=user_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup
+			)
 			except Exception:
 				sent = await bot.send_message(
 					chat_id=deal["user_tg_id"],
@@ -4337,14 +4344,14 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		# Списываем долг без изменения суммы сделки
 		await db.add_user_debt(deal["user_tg_id"], -debt_amount, currency_symbol)
 	else:
-		base_amount_currency = float(deal.get("amount_currency", 0))
-		if debt_amount > base_amount_currency:
-			await message.answer("❌ Долг не может быть больше суммы сделки.")
-			return
-		new_amount_currency = base_amount_currency - debt_amount
-		await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
-		await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
-		deal["amount_currency"] = new_amount_currency
+	base_amount_currency = float(deal.get("amount_currency", 0))
+	if debt_amount > base_amount_currency:
+		await message.answer("❌ Долг не может быть больше суммы сделки.")
+		return
+	new_amount_currency = base_amount_currency - debt_amount
+	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+	deal["amount_currency"] = new_amount_currency
 	from app.main import update_buy_deal_alert
 	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
 	try:
