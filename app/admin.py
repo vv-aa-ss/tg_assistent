@@ -107,12 +107,12 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 				show_requisites=False,
 			)
 		else:
-		user_text = _build_user_deal_with_requisites_chat_text(
-			deal=deal,
-			requisites_text=requisites_text,
-			chat_lines=chat_lines,
-			prompt=prompt,
-		)
+			user_text = _build_user_deal_with_requisites_chat_text(
+				deal=deal,
+				requisites_text=requisites_text,
+				chat_lines=chat_lines,
+				prompt=prompt,
+			)
 	elif deal.get("status") == "await_admin":
 		show_requisites = (not is_large_order) or admin_amount_set
 		amount_currency_for_user = deal.get("amount_currency") if show_requisites else None
