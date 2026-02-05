@@ -108,24 +108,184 @@ async def _get_btc_from_coingecko() -> Optional[float]:
 	return None
 
 
-async def get_btc_price_usd() -> Optional[float]:
+# ============ Кэширование курсов криптовалют ============
+
+# Локальный кэш в памяти (для быстрого доступа между запросами к БД)
+_crypto_cache = {
+	"btc": {"price": None, "updated": 0},
+	"ltc": {"price": None, "updated": 0},
+	"xmr": {"price": None, "updated": 0},
+}
+_MEMORY_CACHE_TTL = 30  # Кэш в памяти на 30 секунд
+
+
+async def _get_crypto_rate_update_interval() -> int:
+	"""Получает интервал обновления курсов криптовалют (в минутах)"""
+	try:
+		db = get_db()
+		interval_str = await db.get_setting("crypto_rates_update_interval", "5")
+		return int(interval_str) if interval_str else 5
+	except Exception:
+		return 5
+
+
+async def _get_cached_crypto_price(crypto: str) -> Optional[float]:
 	"""
-	Получает текущий курс BTC в USD, пробуя несколько источников.
-	Порядок приоритета: Binance -> Coinbase -> CoinGecko
+	Получает курс криптовалюты из кэша (БД).
+	Возвращает None если кэш устарел или отсутствует.
 	"""
-	# Пробуем Binance (самый быстрый и надежный)
+	global _crypto_cache
+	
+	# Сначала проверяем локальный кэш в памяти
+	now = time.time()
+	if _crypto_cache[crypto]["price"] and (now - _crypto_cache[crypto]["updated"]) < _MEMORY_CACHE_TTL:
+		return _crypto_cache[crypto]["price"]
+	
+	try:
+		db = get_db()
+		
+		# Получаем интервал обновления
+		update_interval = await _get_crypto_rate_update_interval()
+		
+		# Получаем время последнего обновления
+		last_update_str = await db.get_setting(f"crypto_{crypto}_last_update", "0")
+		last_update = float(last_update_str) if last_update_str else 0
+		
+		# Проверяем, не устарел ли кэш
+		if (now - last_update) > (update_interval * 60):
+			return None  # Кэш устарел, нужно обновить
+		
+		# Получаем цену из БД
+		price_str = await db.get_setting(f"crypto_{crypto}_price", None)
+		if price_str:
+			price = float(price_str)
+			# Обновляем локальный кэш
+			_crypto_cache[crypto]["price"] = price
+			_crypto_cache[crypto]["updated"] = now
+			return price
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка получения кэшированного курса {crypto.upper()}: {e}")
+	
+	return None
+
+
+async def _save_crypto_price_to_cache(crypto: str, price: float) -> None:
+	"""Сохраняет курс криптовалюты в кэш (БД)"""
+	global _crypto_cache
+	
+	try:
+		db = get_db()
+		now = time.time()
+		
+		await db.set_setting(f"crypto_{crypto}_price", str(price))
+		await db.set_setting(f"crypto_{crypto}_last_update", str(now))
+		
+		# Обновляем локальный кэш
+		_crypto_cache[crypto]["price"] = price
+		_crypto_cache[crypto]["updated"] = now
+		
+		logger.debug(f"✅ Курс {crypto.upper()} сохранён в кэш: ${price:,.2f}")
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка сохранения курса {crypto.upper()} в кэш: {e}")
+
+
+async def _fetch_btc_price_from_api() -> Optional[float]:
+	"""Получает курс BTC из API (Binance -> Coinbase -> CoinGecko)"""
 	price = await _get_btc_from_binance()
 	if price:
 		return price
-	
-	# Пробуем Coinbase
 	price = await _get_btc_from_coinbase()
 	if price:
 		return price
-	
-	# Пробуем CoinGecko
 	price = await _get_btc_from_coingecko()
 	if price:
+		return price
+	return None
+
+
+async def _fetch_ltc_price_from_api() -> Optional[float]:
+	"""Получает курс LTC из API (Binance -> Coinbase -> CoinGecko)"""
+	price = await _get_ltc_from_binance()
+	if price:
+		return price
+	price = await _get_ltc_from_coinbase()
+	if price:
+		return price
+	price = await _get_ltc_from_coingecko()
+	if price:
+		return price
+	return None
+
+
+async def _fetch_xmr_price_from_api() -> Optional[float]:
+	"""Получает курс XMR из API (Binance -> Coinbase -> CoinGecko)"""
+	price = await _get_xmr_from_binance()
+	if price:
+		return price
+	price = await _get_xmr_from_coinbase()
+	if price:
+		return price
+	price = await _get_xmr_from_coingecko()
+	if price:
+		return price
+	return None
+
+
+async def update_all_crypto_rates() -> Dict[str, Optional[float]]:
+	"""
+	Обновляет все курсы криптовалют из API и сохраняет в кэш.
+	Возвращает словарь с курсами.
+	"""
+	rates = {}
+	
+	# BTC
+	btc_price = await _fetch_btc_price_from_api()
+	if btc_price:
+		await _save_crypto_price_to_cache("btc", btc_price)
+		rates["btc"] = btc_price
+		logger.info(f"✅ Курс BTC обновлён: ${btc_price:,.2f}")
+	else:
+		rates["btc"] = None
+		logger.warning("⚠️ Не удалось обновить курс BTC")
+	
+	# LTC
+	ltc_price = await _fetch_ltc_price_from_api()
+	if ltc_price:
+		await _save_crypto_price_to_cache("ltc", ltc_price)
+		rates["ltc"] = ltc_price
+		logger.info(f"✅ Курс LTC обновлён: ${ltc_price:,.2f}")
+	else:
+		rates["ltc"] = None
+		logger.warning("⚠️ Не удалось обновить курс LTC")
+	
+	# XMR
+	xmr_price = await _fetch_xmr_price_from_api()
+	if xmr_price:
+		await _save_crypto_price_to_cache("xmr", xmr_price)
+		rates["xmr"] = xmr_price
+		logger.info(f"✅ Курс XMR обновлён: ${xmr_price:,.2f}")
+	else:
+		rates["xmr"] = None
+		logger.warning("⚠️ Не удалось обновить курс XMR")
+	
+	return rates
+
+
+async def get_btc_price_usd() -> Optional[float]:
+	"""
+	Получает курс BTC в USD.
+	Сначала проверяет кэш, если устарел - обновляет из API.
+	"""
+	# Пробуем получить из кэша
+	cached_price = await _get_cached_crypto_price("btc")
+	if cached_price:
+		return cached_price
+	
+	# Кэш устарел, получаем из API
+	price = await _fetch_btc_price_from_api()
+	if price:
+		await _save_crypto_price_to_cache("btc", price)
+		logger.info(f"✅ Binance: курс BTC = ${price:,.2f} USD")
 		return price
 	
 	logger.error("❌ Не удалось получить курс BTC ни с одного источника")
@@ -188,22 +348,19 @@ async def _get_ltc_from_coingecko() -> Optional[float]:
 
 async def get_ltc_price_usd() -> Optional[float]:
 	"""
-	Получает текущий курс LTC в USD, пробуя несколько источников.
-	Порядок приоритета: Binance -> Coinbase -> CoinGecko
+	Получает курс LTC в USD.
+	Сначала проверяет кэш, если устарел - обновляет из API.
 	"""
-	# Пробуем Binance (самый быстрый и надежный)
-	price = await _get_ltc_from_binance()
-	if price:
-		return price
+	# Пробуем получить из кэша
+	cached_price = await _get_cached_crypto_price("ltc")
+	if cached_price:
+		return cached_price
 	
-	# Пробуем Coinbase
-	price = await _get_ltc_from_coinbase()
+	# Кэш устарел, получаем из API
+	price = await _fetch_ltc_price_from_api()
 	if price:
-		return price
-	
-	# Пробуем CoinGecko
-	price = await _get_ltc_from_coingecko()
-	if price:
+		await _save_crypto_price_to_cache("ltc", price)
+		logger.info(f"✅ Binance: курс LTC = ${price:,.2f} USD")
 		return price
 	
 	logger.error("❌ Не удалось получить курс LTC ни с одного источника")
@@ -266,22 +423,19 @@ async def _get_xmr_from_coingecko() -> Optional[float]:
 
 async def get_xmr_price_usd() -> Optional[float]:
 	"""
-	Получает текущий курс XMR в USD, пробуя несколько источников.
-	Порядок приоритета: Binance -> Coinbase -> CoinGecko
+	Получает курс XMR в USD.
+	Сначала проверяет кэш, если устарел - обновляет из API.
 	"""
-	# Пробуем Binance (самый быстрый и надежный)
-	price = await _get_xmr_from_binance()
-	if price:
-		return price
+	# Пробуем получить из кэша
+	cached_price = await _get_cached_crypto_price("xmr")
+	if cached_price:
+		return cached_price
 	
-	# Пробуем Coinbase
-	price = await _get_xmr_from_coinbase()
+	# Кэш устарел, получаем из API
+	price = await _fetch_xmr_price_from_api()
 	if price:
-		return price
-	
-	# Пробуем CoinGecko
-	price = await _get_xmr_from_coingecko()
-	if price:
+		await _save_crypto_price_to_cache("xmr", price)
+		logger.info(f"✅ Binance: курс XMR = ${price:,.2f} USD")
 		return price
 	
 	logger.error("❌ Не удалось получить курс XMR ни с одного источника")
@@ -649,12 +803,13 @@ def _write_to_google_sheet_sync(
 			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
 			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
-				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
+				# Добавляем 1 USD за затраты на отправку для всех криптовалют
+				usd_amount_rounded = int(round(usd_amount + 1.0))  # Округляем до целого
 				
 				if crypto_column:
 					# Записываем USD в столбец из базы данных (метод update требует список списков)
 					worksheet.update(f"{crypto_column}{empty_row}", [[usd_amount_rounded]])
-					logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {crypto_column}{empty_row} ({crypto_currency})")
+					logger.info(f"✅ Записано {usd_amount_rounded} USD (включая +1 USD за отправку) в ячейку {crypto_column}{empty_row} ({crypto_currency})")
 				else:
 					logger.warning(f"⚠️ Не найден адрес столбца для криптовалюты {crypto_currency}")
 			else:
@@ -937,10 +1092,11 @@ def _write_xmr_to_google_sheet_sync(
 			usd_amount = crypto_data.get("usd_amount", crypto_data.get("value", 0.0))
 			
 			if usd_amount != 0:  # Разрешаем как положительные, так и отрицательные значения
-				usd_amount_rounded = int(round(usd_amount))  # Округляем до целого
+				# Добавляем 1 USD за затраты на отправку для XMR
+				usd_amount_rounded = int(round(usd_amount + 1.0))  # Округляем до целого
 				# Записываем USD в соответствующий столбец (метод update требует список списков)
 				worksheet.update(f"{usd_column}{empty_row}", [[usd_amount_rounded]])
-				logger.info(f"✅ Записано {usd_amount_rounded} USD в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
+				logger.info(f"✅ Записано {usd_amount_rounded} USD (включая +1 USD за отправку) в ячейку {usd_column}{empty_row} (XMR-{xmr_number})")
 			else:
 				logger.warning(f"⚠️ USD сумма равна 0 для XMR-{xmr_number}")
 		
@@ -1262,7 +1418,8 @@ def _write_all_to_google_sheet_one_row_sync(
 		
 		# Подготавливаем данные для batch-записи криптовалют
 		for currency, total_amount in crypto_sum.items():
-			usd_amount_rounded = int(round(total_amount))
+			# Добавляем 1 USD за затраты на отправку для всех криптовалют
+			usd_amount_rounded = int(round(total_amount + 1.0))
 			column = crypto_columns.get(currency)
 			
 			if column:
@@ -1281,7 +1438,7 @@ def _write_all_to_google_sheet_one_row_sync(
 						"currency": "USD",
 					}
 				)
-				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} ({currency})")
+				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD (включая +1 USD за отправку) в ячейку {cell_address} ({currency})")
 			else:
 				logger.warning(f"⚠️ Не найден столбец для криптовалюты {currency}, пропускаем запись")
 		
@@ -1297,7 +1454,8 @@ def _write_all_to_google_sheet_one_row_sync(
 		
 		# Подготавливаем данные для batch-записи XMR
 		for xmr_number, total_amount in xmr_sum.items():
-			usd_amount_rounded = int(round(total_amount))
+			# Добавляем 1 USD за затраты на отправку для XMR
+			usd_amount_rounded = int(round(total_amount + 1.0))
 			usd_column = xmr_columns.get(xmr_number)
 			
 			if usd_column:
@@ -1316,7 +1474,7 @@ def _write_all_to_google_sheet_one_row_sync(
 						"currency": "USD",
 					}
 				)
-				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD в ячейку {cell_address} (XMR-{xmr_number})")
+				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD (включая +1 USD за отправку) в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Суммируем наличные для каждой карты (по card_id для правильного суммирования)
 		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name, "group_name": group_name}}
@@ -3033,3 +3191,292 @@ async def read_cell_value(
 		cell_address,
 		sheet_name
 	)
+
+
+def _calculate_profit_from_row_sync(
+	sheet_id: str,
+	credentials_path: str,
+	row: int,
+	usd_to_byn_rate: float,
+	usd_to_rub_rate: float,
+	sheet_name: Optional[str] = None
+) -> Optional[float]:
+	"""
+	Синхронная функция для расчета профита по формуле из Google Sheets.
+	Формула: ОКРУГЛ(СУММ(G9:AP9)/$BF$9-СУММ(AU9:BB9)-СУММ(AS9)+СУММ(B9:E9)/$BF$10+AQ9;0)
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		row: Номер строки для расчета
+		usd_to_byn_rate: Курс USD→BYN (BF9)
+		usd_to_rub_rate: Курс USD→RUB (BF10)
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Рассчитанный профит или None при ошибке
+	"""
+	try:
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets")
+			return None
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
+		
+		# Читаем диапазоны из строки
+		# G9:AP9 - доходы в BYN (карты для Беларуси)
+		range_byn = f"G{row}:AP{row}"
+		# B9:E9 - доходы в RUB (карты для России)
+		range_rub = f"B{row}:E{row}"
+		# AU9:BB9 - расходы по LTC/XMR/USDT
+		range_crypto = f"AU{row}:BB{row}"
+		# AS9 - расходы по BTC
+		cell_btc = f"AS{row}"
+		# AQ9 - наличные в USD
+		cell_cash_usd = f"AQ{row}"
+		
+		# Читаем все диапазоны
+		values_byn = worksheet.get(range_byn)
+		values_rub = worksheet.get(range_rub)
+		values_crypto = worksheet.get(range_crypto)
+		value_btc = worksheet.acell(cell_btc).value
+		value_cash_usd = worksheet.acell(cell_cash_usd).value
+		
+		# Функция для парсинга значения ячейки
+		def parse_cell_value(cell_value) -> float:
+			if not cell_value:
+				return 0.0
+			try:
+				return float(str(cell_value).replace(",", ".").replace(" ", ""))
+			except (ValueError, TypeError):
+				return 0.0
+		
+		# Собираем значения из диапазонов с адресами ячеек
+		def collect_range_values(values, start_col: str, row_num: int):
+			"""Собирает значения с адресами ячеек из диапазона"""
+			cells_with_values = []
+			total = 0.0
+			if values:
+				col_index = 0
+				for row_data in values:
+					if row_data:
+						for cell_value in row_data:
+							# Вычисляем букву столбца
+							col_letter = _get_column_letter(start_col, col_index)
+							value = parse_cell_value(cell_value)
+							if value != 0:
+								cells_with_values.append((value, f"{col_letter}{row_num}"))
+								total += value
+							col_index += 1
+			return total, cells_with_values
+		
+		# Вспомогательная функция для вычисления буквы столбца
+		def _get_column_letter(start_col: str, offset: int) -> str:
+			"""Вычисляет букву столбца с учетом смещения"""
+			# Преобразуем начальный столбец в число
+			col_num = 0
+			for char in start_col.upper():
+				col_num = col_num * 26 + (ord(char) - ord('A') + 1)
+			# Добавляем смещение
+			col_num += offset
+			# Преобразуем обратно в буквы
+			result = ""
+			while col_num > 0:
+				col_num -= 1
+				result = chr(col_num % 26 + ord('A')) + result
+				col_num //= 26
+			return result
+		
+		# Собираем данные из диапазонов
+		sum_byn, byn_cells = collect_range_values(values_byn, "G", row)
+		sum_rub, rub_cells = collect_range_values(values_rub, "B", row)
+		sum_crypto, crypto_cells = collect_range_values(values_crypto, "AU", row)
+		
+		# Получаем значения из отдельных ячеек
+		btc_value = parse_cell_value(value_btc)
+		cash_usd_value = parse_cell_value(value_cash_usd)
+		
+		# Рассчитываем компоненты формулы
+		byn_usd = sum_byn / usd_to_byn_rate if usd_to_byn_rate else 0
+		rub_usd = sum_rub / usd_to_rub_rate if usd_to_rub_rate else 0
+		
+		# Рассчитываем профит по формуле
+		# ОКРУГЛ(СУММ(G9:AP9)/$BF$9 - СУММ(AU9:BB9) - СУММ(AS9) + СУММ(B9:E9)/$BF$10 + AQ9; 0)
+		profit = byn_usd - sum_crypto - btc_value + rub_usd + cash_usd_value
+		
+		# Округляем до целого
+		profit_rounded = round(profit)
+		
+		# Формируем подробный расчет для лога
+		calc_parts = []
+		
+		# Доходы BYN (делим на курс)
+		if byn_cells:
+			byn_parts = "+".join([f"{v}({addr})" for v, addr in byn_cells])
+			calc_parts.append(f"({byn_parts})/{usd_to_byn_rate}={byn_usd:.2f}")
+		
+		# Доходы RUB (делим на курс)
+		if rub_cells:
+			rub_parts = "+".join([f"{v}({addr})" for v, addr in rub_cells])
+			calc_parts.append(f"+({rub_parts})/{usd_to_rub_rate}={rub_usd:.2f}")
+		
+		# Расходы криптовалют AU:BB (вычитаем)
+		if crypto_cells:
+			crypto_parts = "+".join([f"{v}({addr})" for v, addr in crypto_cells])
+			calc_parts.append(f"-({crypto_parts})=-{sum_crypto:.0f}")
+		
+		# Расходы BTC (вычитаем)
+		if btc_value != 0:
+			calc_parts.append(f"-{btc_value:.0f}({cell_btc})")
+		
+		# Наличные USD (прибавляем)
+		if cash_usd_value != 0:
+			calc_parts.append(f"+{cash_usd_value:.0f}({cell_cash_usd})")
+		
+		calc_str = " ".join(calc_parts) if calc_parts else "0"
+		
+		logger.info(
+			f"📊 Расчет профита для строки {row}:\n"
+			f"   Формула: {calc_str} = {profit_rounded} USD"
+		)
+		
+		return float(profit_rounded)
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка расчета профита для строки {row}: {e}")
+		return None
+
+
+async def calculate_and_write_profit(
+	sheet_id: str,
+	credentials_path: str,
+	row: int,
+	usd_to_byn_rate: float,
+	usd_to_rub_rate: float,
+	profit_column: str = "BC",
+	sheet_name: Optional[str] = None
+) -> Optional[float]:
+	"""
+	Рассчитывает профит по формуле и записывает его в столбец BC.
+	
+	Args:
+		sheet_id: ID Google Sheets таблицы
+		credentials_path: Путь к файлу с учетными данными
+		row: Номер строки для расчета
+		usd_to_byn_rate: Курс USD→BYN
+		usd_to_rub_rate: Курс USD→RUB
+		profit_column: Столбец для записи профита (по умолчанию "BC")
+		sheet_name: Название листа (опционально)
+	
+	Returns:
+		Рассчитанный профит или None при ошибке
+	"""
+	try:
+		# Рассчитываем профит
+		profit = await asyncio.to_thread(
+			_calculate_profit_from_row_sync,
+			sheet_id,
+			credentials_path,
+			row,
+			usd_to_byn_rate,
+			usd_to_rub_rate,
+			sheet_name
+		)
+		
+		if profit is None:
+			return None
+		
+		# Записываем профит в столбец BC
+		client = _get_google_sheets_client(credentials_path)
+		if not client:
+			logger.error("Не удалось создать клиент Google Sheets для записи профита")
+			return None
+		
+		spreadsheet = client.open_by_key(sheet_id)
+		worksheet = _get_worksheet(spreadsheet, sheet_name)
+		
+		cell_address = f"{profit_column}{row}"
+		worksheet.update(cell_address, [[int(profit)]])
+		logger.info(f"✅ Профит {int(profit)} USD записан в ячейку {cell_address}")
+		
+		return profit
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка расчета и записи профита для строки {row}: {e}")
+		return None
+
+
+async def calculate_profit_from_deal_data(
+	deal: Dict[str, Any],
+	db: Any,
+	usd_to_byn_rate: float,
+	usd_to_rub_rate: float
+) -> Optional[float]:
+	"""
+	Рассчитывает профит на основе данных сделки.
+	
+	Формула: Профит = (Получено в валюте / курс валюты) - (Количество крипты × курс крипты) - 1 USD (комиссия)
+	
+	Args:
+		deal: Словарь с данными сделки
+		db: Экземпляр базы данных
+		usd_to_byn_rate: Курс USD→BYN
+		usd_to_rub_rate: Курс USD→RUB
+	
+	Returns:
+		Рассчитанный профит или None при ошибке
+	"""
+	try:
+		country_code = deal.get("country_code", "BYN")
+		crypto_type = deal.get("crypto_type", "")
+		amount_currency = deal.get("amount_currency", 0.0)  # Сумма в валюте (BYN/RUB)
+		crypto_amount = deal.get("amount", 0.0)  # Количество криптовалюты
+		
+		# Если нет всех необходимых данных, возвращаем None
+		if not amount_currency or not crypto_type or not crypto_amount:
+			return None
+		
+		# Получаем текущий курс криптовалюты
+		crypto_price_usd = 0.0
+		if crypto_type == "BTC":
+			crypto_price_usd = await get_btc_price_usd() or 0.0
+		elif crypto_type == "LTC":
+			crypto_price_usd = await get_ltc_price_usd() or 0.0
+		elif crypto_type == "XMR":
+			crypto_price_usd = await get_xmr_price_usd() or 0.0
+		elif crypto_type == "USDT":
+			crypto_price_usd = 1.0  # USDT = 1 USD
+		
+		if crypto_price_usd == 0:
+			logger.warning(f"⚠️ Не удалось получить курс {crypto_type}")
+			return None
+		
+		# Рассчитываем реальную стоимость криптовалюты в USD + комиссия 1 USD за отправку
+		crypto_cost_usd = crypto_amount * crypto_price_usd + 1.0  # +1 USD комиссия (как при записи в Google Sheets)
+		
+		# Рассчитываем доход в USD (конвертируем из BYN или RUB)
+		if country_code == "BYN":
+			income_usd = amount_currency / usd_to_byn_rate if usd_to_byn_rate else 0
+		else:  # RUB
+			income_usd = amount_currency / usd_to_rub_rate if usd_to_rub_rate else 0
+		
+		# Рассчитываем профит: доход - расход (включая комиссию)
+		profit = income_usd - crypto_cost_usd
+		
+		# Округляем до целого
+		profit_rounded = round(profit)
+		
+		logger.info(
+			f"📊 Расчет профита для deal_id={deal.get('id')}: "
+			f"{amount_currency} {country_code} / {usd_to_byn_rate if country_code == 'BYN' else usd_to_rub_rate} = {income_usd:.2f} USD (доход) - "
+			f"({crypto_amount} {crypto_type} × {crypto_price_usd:.2f} + 1 комиссия) = {crypto_cost_usd:.2f} USD (расход) = "
+			f"{profit_rounded} USD (профит)"
+		)
+		
+		return float(profit_rounded)
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка расчета профита: {e}")
+		return None

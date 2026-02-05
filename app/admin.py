@@ -47,6 +47,7 @@ from app.keyboards import (
 	multipliers_settings_kb,
 	markup_percents_settings_kb,
 	buy_calc_settings_kb,
+	mempool_settings_kb,
 	buy_payment_confirmed_kb,
 	buy_deal_paid_kb,
 	buy_deal_user_reply_kb,
@@ -108,10 +109,10 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			)
 		else:
 			user_text = await _build_user_deal_with_requisites_chat_text(
-				deal=deal,
-				requisites_text=requisites_text,
-				chat_lines=chat_lines,
-				prompt=prompt,
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+			prompt=prompt,
 		)
 	elif deal.get("status") == "await_admin":
 		show_requisites = (not is_large_order) or admin_amount_set
@@ -528,6 +529,11 @@ class CardRequisiteStates(StatesGroup):
 	waiting_edit_requisite = State()
 
 
+class MempoolEditStates(StatesGroup):
+	waiting_value = State()
+	waiting_edit_requisite = State()
+
+
 class CardColumnBindStates(StatesGroup):
 	selecting_card = State()
 	waiting_column = State()
@@ -726,6 +732,93 @@ async def _one_card_for_all_enabled(db) -> bool:
 	byn = await db.get_setting("one_card_for_all_BYN")
 	rub = await db.get_setting("one_card_for_all_RUB")
 	return bool(byn) or bool(rub)
+
+
+async def _notify_on_deposit_enabled(db) -> bool:
+	"""Проверяет, включено ли оповещение о зачислении"""
+	setting = await db.get_setting("notify_on_deposit", "0")
+	return setting == "1"
+
+
+async def _check_deposit_periodically(
+	bot: Bot,
+	wallet_address: str,
+	user_tg_id: int,
+	deal_id: int
+) -> None:
+	"""
+	Периодически проверяет наличие транзакции для адреса кошелька
+	Использует настройки из БД
+	
+	Args:
+		bot: Экземпляр бота для отправки сообщений
+		wallet_address: Адрес кошелька Bitcoin
+		user_tg_id: Telegram ID пользователя
+		deal_id: ID сделки
+	"""
+	import asyncio
+	from app.mempool_check import check_btc_transaction
+	from app.di import get_db
+	
+	db = get_db()
+	
+	# Получаем настройки из БД
+	check_interval_str = await db.get_setting("mempool_check_interval_minutes", "0.5")
+	max_attempts_str = await db.get_setting("mempool_max_attempts", "20")
+	initial_delay_str = await db.get_setting("mempool_initial_delay_minutes", "0.17")
+	
+	try:
+		check_interval_minutes = float(check_interval_str) if check_interval_str else 0.5
+	except (ValueError, TypeError):
+		check_interval_minutes = 0.5
+	
+	try:
+		max_attempts = int(max_attempts_str) if max_attempts_str else 20
+	except (ValueError, TypeError):
+		max_attempts = 20
+	
+	try:
+		initial_delay_minutes = float(initial_delay_str) if initial_delay_str else 0.17
+	except (ValueError, TypeError):
+		initial_delay_minutes = 0.17
+	
+	# Конвертируем минуты в секунды
+	interval_seconds = int(check_interval_minutes * 60)
+	initial_delay_seconds = int(initial_delay_minutes * 60)
+	
+	logger.info(f"🔄 Запущена периодическая проверка транзакции для deal_id={deal_id}, адрес={wallet_address}")
+	logger.info(f"🔄 Настройки: интервал={check_interval_minutes} мин, максимум={max_attempts} раз, отсрочка={initial_delay_minutes} мин")
+	
+	# Первая задержка перед началом проверки
+	await asyncio.sleep(initial_delay_seconds)
+	
+	for attempt in range(1, max_attempts + 1):
+		try:
+			has_transactions, error = await check_btc_transaction(wallet_address)
+			
+			if has_transactions:
+				mempool_url = f"https://mempool.space/address/{wallet_address}"
+				await bot.send_message(
+					chat_id=user_tg_id,
+					text=f"✅ Получено первое подтверждение транзакции!\n\n🔗 Проверить: {mempool_url}"
+				)
+				logger.info(f"✅ Оповещение о зачислении отправлено пользователю {user_tg_id} для deal_id={deal_id} (попытка {attempt})")
+				return  # Успешно, прекращаем проверку
+			elif error:
+				logger.debug(f"🔄 Попытка {attempt}/{max_attempts}: транзакция еще не найдена для deal_id={deal_id}, ошибка: {error}")
+			else:
+				logger.debug(f"🔄 Попытка {attempt}/{max_attempts}: транзакция еще не найдена для deal_id={deal_id}")
+			
+			# Задержка перед следующей проверкой (кроме последней попытки)
+			if attempt < max_attempts:
+				await asyncio.sleep(interval_seconds)
+		except Exception as e:
+			logger.error(f"❌ Ошибка при проверке транзакции (попытка {attempt}/{max_attempts}) для deal_id={deal_id}: {e}", exc_info=True)
+			# Задержка перед следующей попыткой даже при ошибке
+			if attempt < max_attempts:
+				await asyncio.sleep(interval_seconds)
+	
+	logger.warning(f"⚠️ Превышено максимальное количество попыток ({max_attempts}) для deal_id={deal_id}, транзакция не найдена")
 
 
 async def _one_card_for_all_status_text(db) -> str:
@@ -1715,8 +1808,23 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	await state.clear()
 	db = get_db()
 	enabled = await _one_card_for_all_enabled(db)
-	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled))
+	notify_on_deposit = await _notify_on_deposit_enabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit))
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data == "settings:notify_on_deposit")
+async def settings_notify_on_deposit(cb: CallbackQuery, state: FSMContext):
+	"""Переключает оповещение о зачислении"""
+	db = get_db()
+	current = await _notify_on_deposit_enabled(db)
+	new_value = "1" if not current else "0"
+	await db.set_setting("notify_on_deposit", new_value)
+	enabled = await _one_card_for_all_enabled(db)
+	notify_on_deposit = await _notify_on_deposit_enabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit))
+	status = "включено" if not current else "выключено"
+	await cb.answer(f"Оповещение о зачислении {status} ✅")
 
 
 @admin_router.callback_query(F.data == "settings:notifications")
@@ -2147,9 +2255,10 @@ async def _get_buy_calc_settings(db) -> dict:
 		"buy_extra_fee_mid_byn": _parse_float(await db.get_setting("buy_extra_fee_mid_byn", "5"), 5),
 		"buy_extra_fee_low_rub": _parse_float(await db.get_setting("buy_extra_fee_low_rub", "10"), 10),
 		"buy_extra_fee_mid_rub": _parse_float(await db.get_setting("buy_extra_fee_mid_rub", "5"), 5),
-	"buy_alert_usd_threshold": _parse_float(await db.get_setting("buy_alert_usd_threshold", "400"), 400),
+		"buy_alert_usd_threshold": _parse_float(await db.get_setting("buy_alert_usd_threshold", "400"), 400),
 		"buy_usd_to_byn_rate": _parse_float(await db.get_setting("buy_usd_to_byn_rate", "2.97"), 2.97),
 		"buy_usd_to_rub_rate": _parse_float(await db.get_setting("buy_usd_to_rub_rate", "95"), 95),
+		"crypto_rates_update_interval": int(_parse_float(await db.get_setting("crypto_rates_update_interval", "5"), 5)),
 	}
 
 
@@ -2174,8 +2283,9 @@ async def settings_buy_calc(cb: CallbackQuery):
 		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
 		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
 		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
-		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (обновляется автоматически)\n"
-		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (обновляется автоматически)\n\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (авто)\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (авто)\n"
+		f"🪙 Обновление курсов крипты: каждые {settings['crypto_rates_update_interval']} мин\n\n"
 		"Выберите параметр для редактирования:",
 		reply_markup=buy_calc_settings_kb(settings),
 	)
@@ -2248,6 +2358,159 @@ async def settings_buy_calc_save(message: Message, state: FSMContext):
 		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (обновляется автоматически)\n\n"
 		"Выберите параметр для редактирования:",
 		reply_markup=buy_calc_settings_kb(settings),
+	)
+
+
+@admin_router.callback_query(F.data == "settings:mempool")
+async def settings_mempool(cb: CallbackQuery):
+	"""Показывает настройки мемпула"""
+	db = get_db()
+	
+	# Получаем настройки из БД с значениями по умолчанию
+	check_interval_str = await db.get_setting("mempool_check_interval_minutes", "0.5")
+	max_attempts_str = await db.get_setting("mempool_max_attempts", "20")
+	initial_delay_str = await db.get_setting("mempool_initial_delay_minutes", "0.17")
+	
+	try:
+		check_interval = float(check_interval_str) if check_interval_str else 0.5
+	except (ValueError, TypeError):
+		check_interval = 0.5
+	
+	try:
+		max_attempts = int(max_attempts_str) if max_attempts_str else 20
+	except (ValueError, TypeError):
+		max_attempts = 20
+	
+	try:
+		initial_delay = float(initial_delay_str) if initial_delay_str else 0.17
+	except (ValueError, TypeError):
+		initial_delay = 0.17
+	
+	await safe_edit_text(
+		cb.message,
+		"🔍 Настройки проверки мемпула:\n\n"
+		f"⏱ Периодичность проверок: {check_interval} мин\n"
+		f"🔢 Максимум проверок: {max_attempts} раз\n"
+		f"⏳ Отсрочка проверки: {initial_delay} мин\n\n"
+		"Выберите параметр для редактирования:",
+		reply_markup=mempool_settings_kb(check_interval, max_attempts, initial_delay)
+	)
+	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("settings:mempool:edit:"))
+async def settings_mempool_edit(cb: CallbackQuery, state: FSMContext):
+	"""Начинает редактирование параметра мемпула"""
+	parts = cb.data.split(":")
+	if len(parts) < 4:
+		await cb.answer("Ошибка данных", show_alert=True)
+		return
+	key = parts[3]  # check_interval, max_attempts, initial_delay
+	
+	db = get_db()
+	
+	# Определяем ключ БД и значение по умолчанию
+	if key == "check_interval":
+		db_key = "mempool_check_interval_minutes"
+		default_value = "0.5"
+		param_name = "Периодичность проверок (в минутах)"
+		example = "0.5"
+	elif key == "max_attempts":
+		db_key = "mempool_max_attempts"
+		default_value = "20"
+		param_name = "Максимум проверок (в разах)"
+		example = "20"
+	elif key == "initial_delay":
+		db_key = "mempool_initial_delay_minutes"
+		default_value = "0.17"
+		param_name = "Отсрочка проверки (в минутах)"
+		example = "0.17"
+	else:
+		await cb.answer("Неизвестный параметр", show_alert=True)
+		return
+	
+	current_value = await db.get_setting(db_key, default_value)
+	await state.update_data(mempool_key=db_key, mempool_param_name=param_name)
+	await state.set_state(MempoolEditStates.waiting_value)
+	
+	await safe_edit_text(
+		cb.message,
+		f"🔍 Введите новое значение для '{param_name}':\n\n"
+		f"Текущее значение: {current_value}\n\n"
+		f"Введите число (например: {example}):",
+		reply_markup=simple_back_kb("settings:mempool")
+	)
+	await cb.answer()
+
+
+@admin_router.message(MempoolEditStates.waiting_value)
+async def settings_mempool_save(message: Message, state: FSMContext):
+	"""Сохраняет параметр мемпула"""
+	data = await state.get_data()
+	db_key = data.get("mempool_key")
+	param_name = data.get("mempool_param_name")
+	
+	if not db_key:
+		await state.clear()
+		await message.answer("❌ Ошибка: не найден ключ настройки.")
+		return
+	
+	value_str = message.text.strip().replace(",", ".")
+	
+	# Валидация в зависимости от типа параметра
+	if db_key == "mempool_max_attempts":
+		# Целое число
+		try:
+			value = int(value_str)
+			if value <= 0:
+				await message.answer("❌ Количество проверок должно быть больше нуля. Введите число:")
+				return
+		except ValueError:
+			await message.answer("❌ Неверный формат. Введите целое число (например: 20):")
+			return
+	else:
+		# Дробное число (минуты)
+		try:
+			value = float(value_str)
+			if value <= 0:
+				await message.answer("❌ Значение должно быть больше нуля. Введите число:")
+				return
+		except ValueError:
+			await message.answer("❌ Неверный формат. Введите число (например: 0.5):")
+			return
+	
+	db = get_db()
+	await db.set_setting(db_key, str(value))
+	await state.clear()
+	await message.answer(f"✅ Настройка '{param_name}' обновлена: {value}")
+	
+	# Возвращаемся к настройкам мемпула
+	check_interval_str = await db.get_setting("mempool_check_interval_minutes", "0.5")
+	max_attempts_str = await db.get_setting("mempool_max_attempts", "20")
+	initial_delay_str = await db.get_setting("mempool_initial_delay_minutes", "0.17")
+	
+	try:
+		check_interval = float(check_interval_str) if check_interval_str else 0.5
+	except (ValueError, TypeError):
+		check_interval = 0.5
+	
+	try:
+		max_attempts = int(max_attempts_str) if max_attempts_str else 20
+	except (ValueError, TypeError):
+		max_attempts = 20
+	
+	try:
+		initial_delay = float(initial_delay_str) if initial_delay_str else 0.17
+	except (ValueError, TypeError):
+		initial_delay = 0.17
+	
+	await message.answer(
+		"🔍 Настройки проверки мемпула:\n\n"
+		f"⏱ Периодичность проверок: {check_interval} мин\n"
+		f"🔢 Максимум проверок: {max_attempts} раз\n"
+		f"⏳ Отсрочка проверки: {initial_delay} мин\n\n"
+		"Выберите параметр для редактирования:",
+		reply_markup=mempool_settings_kb(check_interval, max_attempts, initial_delay)
 	)
 
 
@@ -3817,8 +4080,8 @@ async def deal_alert_message_send(message: Message, state: FSMContext, bot: Bot)
 	# Если реквизиты есть и их нужно показать, используем _build_user_deal_with_requisites_chat_text
 	if requisites_text and not hide_requisites:
 		user_text = await _build_user_deal_with_requisites_chat_text(
-			deal=deal,
-			requisites_text=requisites_text,
+				deal=deal,
+				requisites_text=requisites_text,
 			chat_lines=chat_lines,
 			prompt=prompt_wallet,
 		)
@@ -4086,24 +4349,27 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 		prompt=None
 	)
 	try:
+		from app.keyboards import buy_deal_paid_reply_kb
+		show_how_pay = bool(requisites_text)
 		if deal.get("user_message_id"):
 			await bot.edit_message_text(
 				chat_id=user_tg_id,
 				message_id=deal["user_message_id"],
 				text=user_text,
 				parse_mode="HTML",
-				reply_markup=buy_deal_paid_reply_kb(deal_id)
+				reply_markup=buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 			)
 		else:
 			sent = await bot.send_message(
 				chat_id=user_tg_id,
 				text=user_text,
 				parse_mode="HTML",
-				reply_markup=buy_deal_paid_reply_kb(deal_id)
+				reply_markup=buy_deal_paid_reply_kb(deal_id, show_how_pay=show_how_pay)
 			)
 			await db.update_buy_deal_user_message_id(deal_id, sent.message_id)
-	except Exception:
-		pass
+		logger.info(f"✅ Сообщение пользователя обновлено после выбора реквизитов для deal_id={deal_id}")
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка обновления сообщения пользователя для deal_id={deal_id}: {e}")
 	await db.update_buy_deal_fields(deal_id, status="await_payment")
 	from app.main import update_buy_deal_alert, _build_deal_chat_lines, _build_user_deal_with_requisites_chat_text
 	try:
@@ -4116,6 +4382,7 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 				)
 			except Exception:
 				pass
+		# Отправляем временное уведомление пользователю о получении реквизитов
 		notice = await bot.send_message(
 			chat_id=user_tg_id,
 			text="✅ Реквизиты получены"
@@ -4125,8 +4392,16 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 			deal_id,
 			requisites_notice_message_id=notice.message_id
 		)
-	except Exception:
-		pass
+		logger.info(f"✅ Временное уведомление о реквизитах отправлено пользователю {user_tg_id} для deal_id={deal_id}")
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка отправки временного уведомления пользователю {user_tg_id}: {e}")
+	
+	# Обновляем сообщение админа после выбора реквизитов
+	try:
+		await update_buy_deal_alert(bot, deal_id)
+		logger.info(f"✅ Сообщение админа обновлено после выбора реквизитов для deal_id={deal_id}")
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка обновления сообщения админа для deal_id={deal_id}: {e}")
 	
 	# Проверяем настройку оповещений и отправляем оповещение, если нужно
 	notification_type = await db.get_setting("deal_notification_type", "after_proof")
@@ -4548,32 +4823,57 @@ async def deal_alert_debt_save(message: Message, state: FSMContext, bot: Bot):
 		await state.clear()
 		return
 	currency_symbol = deal.get("currency_symbol", "Br")
+	
 	if debt_action == "take":
 		# Списываем долг без изменения суммы сделки
 		await db.add_user_debt(deal["user_tg_id"], -debt_amount, currency_symbol)
 	else:
+		# Добавляем долг и уменьшаем сумму сделки
 		base_amount_currency = float(deal.get("amount_currency", 0))
-	if debt_amount > base_amount_currency:
-		await message.answer("❌ Долг не может быть больше суммы сделки.")
-		return
-	new_amount_currency = base_amount_currency - debt_amount
-	await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
-	await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
-	deal["amount_currency"] = new_amount_currency
+		if debt_amount > base_amount_currency:
+			await message.answer("❌ Долг не может быть больше суммы сделки.")
+			await state.clear()
+			return
+		new_amount_currency = base_amount_currency - debt_amount
+		await db.add_user_debt(deal["user_tg_id"], debt_amount, currency_symbol)
+		await db.update_buy_deal_fields(deal_id, amount_currency=new_amount_currency)
+		deal["amount_currency"] = new_amount_currency
+		
+		# Обновляем сумму в orders, если есть order_id
+		order_id = deal.get("order_id")
+		if order_id:
+			try:
+				await db._db.execute(
+					"UPDATE orders SET amount_currency = ? WHERE id = ?",
+					(new_amount_currency, order_id)
+				)
+				await db._db.commit()
+				logger.info(f"✅ Синхронизирована сумма по order_id={order_id} для deal_id={deal_id}: {new_amount_currency}")
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось синхронизировать сумму по order_id={order_id} для deal_id={deal_id}: {e}")
+	
+	# Обновляем сообщения админа и пользователя
 	from app.main import update_buy_deal_alert
-	user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
-	try:
-		if deal.get("user_message_id"):
-			await bot.edit_message_text(
-				chat_id=deal["user_tg_id"],
-				message_id=deal["user_message_id"],
-				text=user_text,
-				parse_mode="HTML",
-				reply_markup=reply_markup
-			)
-	except Exception:
-		pass
-	await update_buy_deal_alert(bot, deal_id)
+	# Получаем актуальные данные сделки
+	deal = await db.get_buy_deal_by_id(deal_id)
+	if deal:
+		user_text, reply_markup = await _build_user_deal_text_for_admin_update(db, deal)
+		try:
+			if deal.get("user_message_id"):
+				await bot.edit_message_text(
+					chat_id=deal["user_tg_id"],
+					message_id=deal["user_message_id"],
+					text=user_text,
+					parse_mode="HTML",
+					reply_markup=reply_markup
+				)
+				logger.info(f"✅ Сообщение пользователя обновлено после изменения долга для deal_id={deal_id}")
+		except Exception as e:
+			logger.warning(f"⚠️ Ошибка обновления сообщения пользователя для deal_id={deal_id}: {e}")
+		
+		# Обновляем сообщение админа
+		await update_buy_deal_alert(bot, deal_id)
+		logger.info(f"✅ Сообщение админа обновлено после изменения долга для deal_id={deal_id}")
 	from app.main import delete_user_message
 	await delete_user_message(message)
 	prompt_id = data.get("deal_prompt_message_id")
@@ -4655,16 +4955,36 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	
 	# Проверка прав доступа (только админы могут завершать сделки)
 	# Для админов проверка уже есть через middleware, но добавим для надежности
+	# Используем глобальный импорт get_admin_ids
 	admin_ids = get_admin_ids()
 	if cb.from_user and cb.from_user.id not in admin_ids:
 		await cb.answer("❌ Нет доступа", show_alert=True)
 		return
+	
+	# Отвечаем на callback сразу, до длительных операций (Google Sheets)
+	await cb.answer("Сделка завершена ✅")
+	
 	await db.update_buy_deal_fields(deal_id, status="completed")
 	deal["status"] = "completed"
 	
-	# Удаляем записи о сделке из глобальных словарей и БД
-	from app.main import cleanup_deal_alerts
-	await cleanup_deal_alerts(deal_id)
+	# НЕ удаляем записи о сделке из buy_deal_alerts, так как нам нужно обновить существующее сообщение
+	# Удаляем только из других словарей
+	from app.main import proof_notification_ids
+	
+	# Удаляем уведомления о получении скриншота для всех админов
+	if deal_id in proof_notification_ids:
+		notification_ids_for_deal = proof_notification_ids[deal_id]
+		for admin_id, notification_message_id in notification_ids_for_deal.items():
+			try:
+				await bot.delete_message(
+					chat_id=admin_id,
+					message_id=notification_message_id
+				)
+				logger.info(f"✅ Удалено уведомление о скриншоте для админа {admin_id}, deal_id={deal_id}")
+			except Exception as e:
+				logger.warning(f"⚠️ Не удалось удалить уведомление о скриншоте для админа {admin_id}, deal_id={deal_id}: {e}")
+		# Удаляем запись из словаря
+		del proof_notification_ids[deal_id]
 	from app.main import _build_user_deal_completed_text, _build_order_completion_message
 	from app.keyboards import buy_deal_completed_delete_kb
 	user_text = await _build_user_deal_completed_text(deal)
@@ -4680,10 +5000,92 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 			)
 	except Exception:
 		pass
-	from app.main import update_buy_deal_alert
-	await update_buy_deal_alert(bot, deal_id)
 	profit_line = ""
 	google_sheet_report = ""  # Отчет о записи в Google Sheets
+	
+	# Рассчитываем приблизительный профит для отображения сразу после завершения
+	try:
+		from app.currency_rates import get_rate_with_fallback
+		from app.google_sheets import calculate_profit_from_deal_data
+		
+		# Получаем курсы
+		usd_to_byn = await get_rate_with_fallback("BYN", db, bot)
+		if not usd_to_byn:
+			byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+			usd_to_byn = float(byn_rate_str) if byn_rate_str else 3.3
+		
+		usd_to_rub = await get_rate_with_fallback("RUB", db, bot)
+		if not usd_to_rub:
+			rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+			usd_to_rub = float(rub_rate_str) if rub_rate_str else 95
+		
+		# Рассчитываем приблизительный профит
+		estimated_profit = await calculate_profit_from_deal_data(deal, db, usd_to_byn, usd_to_rub)
+		if estimated_profit is not None:
+			profit_formatted = f"{int(estimated_profit):,}".replace(",", " ")
+			profit_line = f"📈 Профит: {profit_formatted} USD"
+	except Exception as e:
+		logger.warning(f"⚠️ Ошибка расчета приблизительного профита: {e}")
+	
+	# Первое обновление сообщения - с быстрым профитом (без отчета Google Sheets)
+	try:
+		from app.main import buy_deal_alerts, build_admin_open_deal_text_with_chat
+		from app.keyboards import deal_alert_admin_completed_kb
+		
+		message_ids = buy_deal_alerts.get(deal_id, {})
+		
+		# Если message_ids пустые, пытаемся получить из БД
+		if not message_ids:
+			admin_ids = get_admin_ids()
+			alerts = await db.get_deal_alerts(alert_type="buy_deal")
+			for alert in alerts:
+				if alert["deal_id"] == deal_id and alert["admin_id"] in admin_ids:
+					if deal_id not in buy_deal_alerts:
+						buy_deal_alerts[deal_id] = {}
+					buy_deal_alerts[deal_id][alert["admin_id"]] = alert["message_id"]
+			message_ids = buy_deal_alerts.get(deal_id, {})
+		
+		# Если все еще пустые, используем message_id из callback query
+		if not message_ids and cb.message and cb.from_user:
+			admin_id = cb.from_user.id
+			message_id = cb.message.message_id
+			if deal_id not in buy_deal_alerts:
+				buy_deal_alerts[deal_id] = {}
+			buy_deal_alerts[deal_id][admin_id] = message_id
+			message_ids = {admin_id: message_id}
+			logger.info(f"✅ Использован message_id из callback query для deal_id={deal_id}, admin_id={admin_id}, message_id={message_id}")
+		
+		if message_ids:
+			# Первое обновление - только с быстрым профитом, без отчета Google Sheets
+			alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
+			if profit_line:
+				alert_text = f"{alert_text}\n{profit_line}"
+			
+			for admin_id, message_id in message_ids.items():
+				try:
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode="HTML",
+						reply_markup=deal_alert_admin_completed_kb(deal_id)
+					)
+					logger.info(f"✅ Первое обновление сообщения сделки (с быстрым профитом) для админа {admin_id}, deal_id={deal_id}")
+				except Exception as e:
+					try:
+						await bot.edit_message_caption(
+							chat_id=admin_id,
+							message_id=message_id,
+							caption=alert_text,
+							parse_mode="HTML",
+							reply_markup=deal_alert_admin_completed_kb(deal_id)
+						)
+						logger.info(f"✅ Первое обновление сообщения сделки (caption, с быстрым профитом) для админа {admin_id}, deal_id={deal_id}")
+					except Exception as e2:
+						logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}: {e2}")
+	except Exception as e:
+		logger.error(f"❌ Ошибка при первом обновлении сообщения сделки для deal_id={deal_id}: {e}", exc_info=True)
+	
 	try:
 		from app.config import get_settings
 		from app.google_sheets import write_order_to_google_sheet, read_profit
@@ -4705,6 +5107,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				order_id = last_order_id
 		profit_value = None
 		if order and settings.google_sheet_id and settings.google_credentials_path:
+			logger.info(f"📝 Начинаем запись в Google Sheets для deal_id={deal_id}, order_id={order_id}")
 			result = await write_order_to_google_sheet(
 				sheet_id=settings.google_sheet_id,
 				credentials_path=settings.google_credentials_path,
@@ -4713,6 +5116,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				sheet_name=settings.google_sheet_name,
 				xmr_number=None
 			)
+			logger.info(f"📝 Результат записи в Google Sheets: success={result.get('success')}, row={result.get('row')}, entries={len(result.get('written_entries', []))}")
 			if result.get("success"):
 				row_number = result.get("row")
 				written_entries = result.get("written_entries", [])
@@ -4730,16 +5134,14 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 					cash_entries = [e for e in written_entries if e.get("type") == "cash"]
 					
 					if crypto_entries:
-						report_lines.append("🪙 Криптовалюты:")
 						for entry in crypto_entries:
 							label = entry.get("label", "")
 							cell = entry.get("cell", "")
 							amount = entry.get("amount", 0)
 							currency = entry.get("currency", "USD")
-							report_lines.append(f"  • {label}: {amount:,} {currency} → {cell}")
+							report_lines.append(f"🔜{label}: {amount:,} {currency} → {cell}")
 					
 					if card_entries:
-						report_lines.append("💳 Карты:")
 						for entry in card_entries:
 							card_name = entry.get("card", "")
 							group_name = entry.get("group", "")
@@ -4747,7 +5149,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 							amount = entry.get("amount", 0)
 							currency = entry.get("currency", "RUB")
 							group_info = f" ({group_name})" if group_name and group_name != "Без группы" else ""
-							report_lines.append(f"  • {card_name}{group_info}: {amount:,} {currency} → {cell}")
+							report_lines.append(f"🔜{card_name}{group_info}: {amount:,} {currency} → {cell}")
 					
 					if cash_entries:
 						report_lines.append("💵 Наличные:")
@@ -4772,14 +5174,55 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 						google_sheet_report = "\n".join(report_lines)
 				
 				if row_number:
+					# Рассчитываем и записываем профит в столбец BC
+					from app.currency_rates import get_rate_with_fallback
+					from app.google_sheets import calculate_and_write_profit
+					
+					# Получаем курсы
+					usd_to_byn = await get_rate_with_fallback("BYN", db, bot)
+					if not usd_to_byn:
+						byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+						usd_to_byn = float(byn_rate_str) if byn_rate_str else 3.3
+					
+					usd_to_rub = await get_rate_with_fallback("RUB", db, bot)
+					if not usd_to_rub:
+						rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+						usd_to_rub = float(rub_rate_str) if rub_rate_str else 95
+					
+					# Рассчитываем и записываем профит
 					profit_column = await db.get_google_sheets_setting("profit_column", "BC")
-					profit_value = await read_profit(
+					calculated_profit = await calculate_and_write_profit(
 						sheet_id=settings.google_sheet_id,
 						credentials_path=settings.google_credentials_path,
 						row=row_number,
+						usd_to_byn_rate=usd_to_byn,
+						usd_to_rub_rate=usd_to_rub,
 						profit_column=profit_column,
 						sheet_name=settings.google_sheet_name
 					)
+					
+					# Читаем профит из таблицы (после записи)
+					if calculated_profit is not None:
+						profit_value = str(int(calculated_profit))
+					else:
+						# Если расчет не удался, пытаемся прочитать из таблицы
+						profit_value = await read_profit(
+							sheet_id=settings.google_sheet_id,
+							credentials_path=settings.google_credentials_path,
+							row=row_number,
+							profit_column=profit_column,
+							sheet_name=settings.google_sheet_name
+						)
+					
+					# Обновляем profit_line с точным профитом после записи
+					if calculated_profit is not None:
+						profit_formatted = f"{int(calculated_profit):,}".replace(",", " ")
+						profit_line = f"📈 Профит: {profit_formatted} USD"
+						# Добавляем профит в отчет Google Sheets
+						if google_sheet_report:
+							google_sheet_report += f"\n📈 Профит: {profit_formatted} USD → {profit_column}{row_number}"
+						else:
+							google_sheet_report = f"📈 Профит: {profit_formatted} USD → {profit_column}{row_number}"
 			else:
 				# Если запись не удалась, добавляем информацию об ошибке
 				error_msg = result.get("error", "Неизвестная ошибка")
@@ -4838,44 +5281,89 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				)
 			except Exception:
 				pass
+			
+			# Проверяем оповещение о зачислении, если функция включена
+			notify_enabled = await _notify_on_deposit_enabled(db)
+			if notify_enabled:
+				wallet_address = order.get("wallet_address")
+				crypto_type = order.get("crypto_type", "")
+				if wallet_address and crypto_type == "BTC":
+					# Запускаем фоновую задачу для периодической проверки транзакции
+					import asyncio
+					asyncio.create_task(_check_deposit_periodically(
+						bot=bot,
+						wallet_address=wallet_address,
+						user_tg_id=deal["user_tg_id"],
+						deal_id=deal_id
+					))
 		else:
 			logger.warning(f"⚠️ Не найден order для завершенной сделки deal_id={deal_id}, user_tg_id={deal['user_tg_id']}")
 	except Exception:
 		pass
-	# Убираем кнопки у админа после завершения
+	# Обновляем существующее сообщение админа после завершения сделки (второе обновление с отчётом Google Sheets)
+	logger.info(f"📝 Второе обновление сообщения для deal_id={deal_id}: profit_line='{profit_line}', google_sheet_report='{google_sheet_report[:50] if google_sheet_report else 'пусто'}...'")
 	try:
 		from app.main import buy_deal_alerts, build_admin_open_deal_text_with_chat
 		from app.keyboards import deal_alert_admin_completed_kb
+		# get_admin_ids уже импортирован глобально, используем его
+		
 		message_ids = buy_deal_alerts.get(deal_id, {})
-		alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
-		if profit_line:
-			alert_text = f"{alert_text}\n{profit_line}"
-		# Добавляем отчет о записи в Google Sheets
-		if google_sheet_report:
-			alert_text = f"{alert_text}\n\n{google_sheet_report}"
-		for admin_id, message_id in message_ids.items():
-			try:
-				await bot.edit_message_text(
-					chat_id=admin_id,
-					message_id=message_id,
-					text=alert_text,
-					parse_mode="HTML",
-					reply_markup=deal_alert_admin_completed_kb(deal_id)
-				)
-			except Exception:
+		
+		# Если message_ids пустые, пытаемся получить из БД
+		if not message_ids:
+			admin_ids = get_admin_ids()
+			alerts = await db.get_deal_alerts(alert_type="buy_deal")
+			for alert in alerts:
+				if alert["deal_id"] == deal_id and alert["admin_id"] in admin_ids:
+					if deal_id not in buy_deal_alerts:
+						buy_deal_alerts[deal_id] = {}
+					buy_deal_alerts[deal_id][alert["admin_id"]] = alert["message_id"]
+			message_ids = buy_deal_alerts.get(deal_id, {})
+		
+		# Если все еще пустые, используем message_id из callback query (сообщение, на котором нажата кнопка)
+		if not message_ids and cb.message and cb.from_user:
+			admin_id = cb.from_user.id
+			message_id = cb.message.message_id
+			if deal_id not in buy_deal_alerts:
+				buy_deal_alerts[deal_id] = {}
+			buy_deal_alerts[deal_id][admin_id] = message_id
+			message_ids = {admin_id: message_id}
+			logger.info(f"✅ Использован message_id из callback query для deal_id={deal_id}, admin_id={admin_id}, message_id={message_id}")
+		
+		if message_ids:
+			alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
+			if profit_line:
+				alert_text = f"{alert_text}\n{profit_line}"
+			# Добавляем отчет о записи в Google Sheets
+			if google_sheet_report:
+				alert_text = f"{alert_text}\n{google_sheet_report}"
+			
+			for admin_id, message_id in message_ids.items():
 				try:
-					await bot.edit_message_caption(
+					await bot.edit_message_text(
 						chat_id=admin_id,
 						message_id=message_id,
-						caption=alert_text,
+						text=alert_text,
 						parse_mode="HTML",
 						reply_markup=deal_alert_admin_completed_kb(deal_id)
 					)
-				except Exception:
-					pass
-	except Exception:
-		pass
-	await cb.answer("Сделка завершена")
+					logger.info(f"✅ Сообщение сделки обновлено для админа {admin_id}, deal_id={deal_id}, message_id={message_id}")
+				except Exception as e:
+					try:
+						await bot.edit_message_caption(
+							chat_id=admin_id,
+							message_id=message_id,
+							caption=alert_text,
+							parse_mode="HTML",
+							reply_markup=deal_alert_admin_completed_kb(deal_id)
+						)
+						logger.info(f"✅ Сообщение сделки обновлено (caption) для админа {admin_id}, deal_id={deal_id}, message_id={message_id}")
+					except Exception as e2:
+						logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}, message_id={message_id}: {e2}")
+		else:
+			logger.warning(f"⚠️ Не найдены message_ids для обновления сделки deal_id={deal_id}")
+	except Exception as e:
+		logger.error(f"❌ Ошибка при обновлении сообщения сделки для deal_id={deal_id}: {e}", exc_info=True)
 
 
 @admin_router.callback_query(F.data == "settings:users")

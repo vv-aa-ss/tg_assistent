@@ -37,6 +37,10 @@ large_order_alerts: dict[int, dict] = {}
 # Формат: {deal_id: {admin_id: message_id}}
 buy_deal_alerts: dict[int, dict[int, int]] = {}
 
+# Глобальный словарь для хранения message_id уведомлений о получении скриншота
+# Формат: {deal_id: {admin_id: message_id}}
+proof_notification_ids: dict[int, dict[int, int]] = {}
+
 # Лимиты для глобальных словарей (защита от переполнения памяти)
 MAX_LARGE_ORDER_ALERTS = 1000  # Максимум 1000 активных крупных заявок
 MAX_BUY_DEAL_ALERTS = 5000  # Максимум 5000 активных сделок
@@ -1002,18 +1006,49 @@ async def _build_admin_open_deal_text(
 	if db:
 		rates_text = await _get_rates_text(db)
 	
+	# Рассчитываем профит, если есть все необходимые данные
+	profit_text = ""
+	if db and amount_currency and deal.get("crypto_type"):
+		try:
+			from app.currency_rates import get_rate_with_fallback
+			from app.google_sheets import calculate_profit_from_deal_data
+			from app.di import get_db as get_db_func
+			from app.config import get_settings
+			
+			# Получаем курсы
+			settings = get_settings()
+			usd_to_byn = await get_rate_with_fallback("BYN", db, None)
+			if not usd_to_byn:
+				byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+				usd_to_byn = float(byn_rate_str) if byn_rate_str else 3.3
+			
+			usd_to_rub = await get_rate_with_fallback("RUB", db, None)
+			if not usd_to_rub:
+				rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+				usd_to_rub = float(rub_rate_str) if rub_rate_str else 95
+			
+			# Рассчитываем приблизительный профит
+			profit = await calculate_profit_from_deal_data(deal, db, usd_to_byn, usd_to_rub)
+			if profit is not None:
+				profit_formatted = f"{int(profit):,}".replace(",", " ")
+				profit_text = f"📈 Профит: {profit_formatted} USD"
+		except Exception as e:
+			logger_main = logging.getLogger("app.main")
+			logger_main.warning(f"⚠️ Ошибка расчета профита для отображения: {e}")
+	
 	parts = [
 		"⬇️Открыта Сделка⬇️",
 		"〰️〰️〰️〰️〰️",
 		f"👤 {user_name} (@{user_username})",
 		f"🌍 Страна: {_deal_country_label(deal.get('country_code', 'BYN'))}",
 		*(financial_lines or []),
-		f"🆔 ID: {deal.get('user_tg_id')}",
+		"➖➖➖➖➖➖➖➖➖➖➖",  # Разделитель после долга
 		f"🪙Крипта: {crypto_label}",
 		f"💴Сумма: {int(amount_currency)} {currency_symbol}" if amount_currency is not None else None,
 		f"🤑{deal.get('crypto_type', '')}={crypto_amount}",
 		f"👛<code>{escape(wallet_address)}</code>" if wallet_address else None,
 		rates_text,  # Добавляем курсы
+		profit_text if profit_text else None,  # Добавляем профит
 		"➖➖➖➖➖➖➖➖➖➖➖",
 		requisites_label,
 		"➖➖➖➖➖➖➖➖➖➖➖",
@@ -2485,6 +2520,7 @@ async def main() -> None:
 
 	@dp.message(DealStates.waiting_wallet_address, ~F.text.startswith("/"))
 	async def on_deal_wallet_address_entered(message: Message, state: FSMContext):
+		global buy_deal_alerts
 		if not message.from_user:
 			return
 		from app.di import get_db
@@ -2632,6 +2668,7 @@ async def main() -> None:
 						logger_main.info(f"🔔 on_deal_wallet_address_entered: обновляем существующее оповещение для deal_id={deal_id}")
 						await update_buy_deal_alert(message.bot, deal_id)
 		else:
+			# Реквизитов нет - отправляем оповещение админу
 			await state.set_state(DealStates.waiting_payment)
 			message_id = await _send_or_edit_deal_message(
 				bot=message.bot,
@@ -2650,48 +2687,70 @@ async def main() -> None:
 				currency_symbol=currency_symbol,
 				wallet_address=wallet_address
 			)
-			user_id = await db_local.get_or_create_user(
-				message.from_user.id,
-				message.from_user.username,
-				message.from_user.full_name
-			)
-			# Проверяем настройку оповещений
-			notification_type = await db_local.get_setting("deal_notification_type", "after_proof")
-			admin_ids = get_admin_ids()
-			if admin_ids and user_id != -1:
-				# Отправляем оповещение только если настройка "after_requisites"
-				# (для "after_proof" оповещение будет отправлено после скриншота)
-				if notification_type == "after_requisites":
-					from app.keyboards import deal_alert_admin_kb
-					financial_lines = await _get_admin_user_financial_lines(db_local, message.from_user.id)
-					alert_text = await _build_admin_deal_alert_text(
-						{
-							"user_name": message.from_user.full_name or "Не указано",
-							"user_username": message.from_user.username or "нет",
-							"user_tg_id": message.from_user.id,
-							"crypto_display": crypto_display or crypto_type,
-							"amount_currency": amount_currency,
-							"currency_symbol": currency_symbol,
-							"wallet_address": wallet_address,
-						},
-						[],
-						financial_lines,
-						db_local
-					)
-				if deal_id and deal_id not in buy_deal_alerts:
-					buy_deal_alerts[deal_id] = {}
-				for admin_id in admin_ids:
-					try:
-						sent_msg = await message.bot.send_message(
-							chat_id=admin_id,
-							text=alert_text,
-							parse_mode="HTML",
-							reply_markup=deal_alert_admin_kb(deal_id) if deal_id else None
+			
+			# Отправляем оповещение админу о сделке без реквизитов
+			if deal_id:
+				from app.di import get_admin_ids
+				from app.keyboards import deal_alert_admin_kb
+				from app.main import _build_admin_open_deal_text, _get_admin_user_financial_lines, _get_deal_requisites_label, _build_deal_chat_lines, limit_dict_size, MAX_BUY_DEAL_ALERTS, save_deal_alert_to_db
+				
+				admin_ids = get_admin_ids()
+				if admin_ids:
+					deal = await db_local.get_buy_deal_by_id(deal_id)
+					if deal:
+						financial_lines = await _get_admin_user_financial_lines(db_local, message.from_user.id)
+						requisites_text_check = await _get_deal_requisites_text(
+							db_local,
+							message.from_user.id,
+							selected_country
 						)
-						if deal_id:
-							buy_deal_alerts[deal_id][admin_id] = sent_msg.message_id
-					except Exception:
-						pass
+						# Проверяем, есть ли реквизиты
+						if not requisites_text_check or not requisites_text_check.strip():
+							# Реквизитов нет - добавляем заметную пометку
+							requisites_label = "❗️❗️❗️❗️⬇️⬇️⬇️⬇️❗️❗️❗️❗️\n⚠️ У ПОЛЬЗОВАТЕЛЯ НЕТ РЕКВИЗИТОВ ⚠️\n❗️❗️❗️❗️⬆️⬆️⬆️⬆️❗️❗️❗️❗️"
+						else:
+							# Реквизиты есть - получаем обычный label
+							requisites_label = await _get_deal_requisites_label(
+								db_local,
+								message.from_user.id,
+								selected_country
+							)
+						
+						messages = await db_local.get_buy_deal_messages(deal_id)
+						chat_lines = _build_deal_chat_lines(messages, message.from_user.full_name or "Пользователь")
+						
+						alert_text = await _build_admin_open_deal_text(
+							deal,
+							requisites_label,
+							chat_lines,
+							financial_lines,
+							db_local
+						)
+						
+						# Защита от переполнения памяти
+						limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
+						
+						if deal_id not in buy_deal_alerts:
+							buy_deal_alerts[deal_id] = {}
+						
+						reply_markup = deal_alert_admin_kb(deal_id)
+						
+						for admin_id in admin_ids:
+							try:
+								sent = await message.bot.send_message(
+									chat_id=admin_id,
+									text=alert_text,
+									parse_mode="HTML",
+									reply_markup=reply_markup
+								)
+								buy_deal_alerts[deal_id][admin_id] = sent.message_id
+								# Сохраняем в БД для восстановления после перезапуска
+								await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
+								logger_main = logging.getLogger("app.main")
+								logger_main.info(f"✅ Оповещение о сделке без реквизитов отправлено админу {admin_id}, deal_id={deal_id}, message_id={sent.message_id}")
+							except Exception as e:
+								logger_main = logging.getLogger("app.main")
+								logger_main.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
 
 	@dp.callback_query(F.data.startswith("deal:user:delete:"))
 	async def on_deal_user_delete(cb: CallbackQuery):
@@ -3096,6 +3155,34 @@ async def main() -> None:
 						await db_local.update_order_admin_message_id(order_id, proof_msg.message_id)
 				except Exception as e:
 					logger_main.error(f"❌ Ошибка отправки заявки #{order_number} админу {admin_id}: {e}", exc_info=True)
+		# Отправляем уведомление админу о получении скриншота (как ответ на сообщение сделки)
+		logger_main = logging.getLogger("app.main")
+		if deal_id:
+			admin_ids = get_admin_ids()
+			if admin_ids:
+				# Получаем message_id сообщения сделки для каждого админа
+				for admin_id in admin_ids:
+					try:
+						deal_alert_message_id = None
+						if deal_id in buy_deal_alerts and admin_id in buy_deal_alerts[deal_id]:
+							deal_alert_message_id = buy_deal_alerts[deal_id][admin_id]
+						
+						if deal_alert_message_id:
+							# Отправляем уведомление как ответ на сообщение сделки
+							notification_text = "🔔 Получен скриншот оплаты"
+							notification_msg = await message.bot.send_message(
+								chat_id=admin_id,
+								text=notification_text,
+								reply_to_message_id=deal_alert_message_id
+							)
+							# Сохраняем message_id уведомления для последующего удаления
+							proof_notification_ids.setdefault(deal_id, {})[admin_id] = notification_msg.message_id
+							logger_main.info(f"✅ Уведомление о скриншоте отправлено админу {admin_id} как ответ на сообщение сделки (message_id={deal_alert_message_id}, notification_id={notification_msg.message_id})")
+						else:
+							logger_main.warning(f"⚠️ Не найден message_id сообщения сделки для админа {admin_id}, deal_id={deal_id}")
+					except Exception as e:
+						logger_main.warning(f"⚠️ Ошибка отправки уведомления админу {admin_id}: {e}")
+		
 		# Проверяем настройку оповещений и отправляем оповещение, если нужно
 		if deal_id:
 			notification_type = await db_local.get_setting("deal_notification_type", "after_proof")
@@ -7427,6 +7514,35 @@ async def main() -> None:
 	
 	# Запускаем задачу очистки логов в фоне
 	asyncio.create_task(periodic_log_cleanup())
+	
+	# Фоновая задача для периодического обновления курсов криптовалют
+	async def periodic_crypto_rates_update():
+		"""Периодически обновляет курсы криптовалют в фоне"""
+		from app.google_sheets import update_all_crypto_rates, _get_crypto_rate_update_interval
+		
+		# Начальная задержка 10 секунд, чтобы бот успел запуститься
+		await asyncio.sleep(10)
+		
+		# Первое обновление при запуске
+		logger.info("🔄 Первоначальное обновление курсов криптовалют...")
+		await update_all_crypto_rates()
+		
+		while True:
+			try:
+				# Получаем интервал обновления из настроек (в минутах)
+				interval_minutes = await _get_crypto_rate_update_interval()
+				await asyncio.sleep(interval_minutes * 60)
+				
+				logger.debug(f"🔄 Обновление курсов криптовалют (интервал: {interval_minutes} мин)")
+				await update_all_crypto_rates()
+			except asyncio.CancelledError:
+				break
+			except Exception as e:
+				logger.warning(f"⚠️ Ошибка при обновлении курсов криптовалют: {e}")
+				await asyncio.sleep(60)  # Ждём минуту перед повторной попыткой
+	
+	# Запускаем задачу обновления курсов в фоне
+	asyncio.create_task(periodic_crypto_rates_update())
 	
 	logger.debug("Starting polling...")
 	try:

@@ -132,7 +132,7 @@ async def get_usd_to_byn_rate(bot=None) -> Optional[float]:
 
 async def get_usd_to_rub_rate(bot=None) -> Optional[float]:
 	"""
-	Получает курс USD→RUB с сайта (нужно указать URL)
+	Получает курс USD→RUB с сайта myfin.by (курсы в России)
 	
 	Returns:
 		Курс валюты или None в случае ошибки
@@ -148,13 +148,15 @@ async def get_usd_to_rub_rate(bot=None) -> Optional[float]:
 		logger.error("⚠️ Библиотеки aiohttp и BeautifulSoup не установлены. Установите: pip install aiohttp beautifulsoup4")
 		return None
 	
-	# Используем myfin.by для получения курса RUB
-	# XPath: //*[@id="st-container"]/div/div/div/div[1]/div/div[2]/div/div/div[4]/section/div/div/div[2]/div[1]/div[2]/div[2]/div/div[2]/div[2]/div[2]/span
-	url = "https://myfin.by/currency/minsk"
+	# Используем myfin.by страницу курса USD/RUB в России
+	url = "https://myfin.by/currency/usdrub/ross"
 	
 	try:
+		headers = {
+			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+		}
 		async with aiohttp.ClientSession() as session:
-			async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+			async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
 				if response.status != 200:
 					logger.warning(f"⚠️ Не удалось получить курс RUB: HTTP {response.status}")
 					_failure_count_rub += 1
@@ -164,44 +166,69 @@ async def get_usd_to_rub_rate(bot=None) -> Optional[float]:
 				html = await response.text()
 				soup = BeautifulSoup(html, 'html.parser')
 				
-				# XPath: //*[@id="st-container"]/div/div/div/div[1]/div/div[2]/div/div/div[4]/section/div/div/div[2]/div[1]/div[2]/div[2]/div/div[2]/div[2]/div[2]/span
-				# Ищем элемент с id='st-container'
-				st_container = soup.find(id='st-container')
-				if not st_container:
-					logger.warning("⚠️ Не найден элемент st-container на странице")
-					_failure_count_rub += 1
-					await _check_and_alert_rub(bot)
-					return None
+				# Ищем курс на странице USD/RUB
+				# Метод 1: Ищем элемент с классом rate или курсом
+				rate = None
 				
-				# Пытаемся пройти по пути из XPath
-				# st-container > div > div > div > div[0] > div > div[1] > div > div > div[3] > section > ...
-				try:
-					# Упрощенный поиск: ищем section внутри st-container
-					sections = st_container.find_all('section')
-					if not sections:
-						raise ValueError("Не найдены section элементы")
-					
-					# Ищем span с курсом в разумном диапазоне (50-150 для RUB)
-					for section in sections:
-						spans = section.find_all('span')
-						for span in spans:
-							text = span.get_text(strip=True)
-							# Ищем число от 50 до 150 (разумный диапазон для RUB)
-							match = re.search(r'(\d+\.?\d*)', text)
-							if match:
-								rate = float(match.group(1))
-								if 50 <= rate <= 150:
-									# Нашли разумное значение
-									_rate_cache_rub = rate
-									_cache_timestamp_rub = datetime.now()
-									_failure_count_rub = 0
-									_last_success_rub = datetime.now()
-									logger.info(f"✅ Курс USD→RUB успешно получен: {rate}")
-									return rate
-				except Exception as e:
-					logger.warning(f"⚠️ Ошибка при поиске курса RUB: {e}")
+				# Пробуем найти через data-атрибуты или классы с курсом
+				# Ищем span/div с числом похожим на курс (60-120 для USD/RUB)
+				for tag in soup.find_all(['span', 'div', 'td']):
+					text = tag.get_text(strip=True)
+					# Ищем число с точкой или запятой (формат курса)
+					text_clean = text.replace(',', '.').replace(' ', '')
+					match = re.search(r'^(\d{2,3}(?:\.\d{1,4})?)$', text_clean)
+					if match:
+						try:
+							value = float(match.group(1))
+							# Курс USD/RUB обычно в диапазоне 60-120
+							if 60 <= value <= 120:
+								# Проверяем, что это не просто случайное число
+								# Ищем контекст - рядом должны быть слова про курс/доллар/рубль
+								parent = tag.parent
+								if parent:
+									parent_text = parent.get_text().lower()
+									if any(word in parent_text for word in ['курс', 'usd', 'рубл', 'доллар', 'продаж', 'покупк', 'цб', 'банк']):
+										rate = value
+										break
+								# Если первое найденное значение в диапазоне, используем его
+								if rate is None:
+									rate = value
+						except ValueError:
+							continue
 				
-				logger.warning("⚠️ Не удалось найти курс RUB на странице")
+				# Метод 2: Ищем через более специфичные селекторы
+				if rate is None:
+					# Ищем таблицу с курсами банков
+					tables = soup.find_all('table')
+					for table in tables:
+						rows = table.find_all('tr')
+						for row in rows:
+							cells = row.find_all(['td', 'th'])
+							for cell in cells:
+								text = cell.get_text(strip=True).replace(',', '.').replace(' ', '')
+								match = re.search(r'(\d{2}\.\d{2,4})', text)
+								if match:
+									try:
+										value = float(match.group(1))
+										if 60 <= value <= 120:
+											rate = value
+											break
+									except ValueError:
+										continue
+							if rate:
+								break
+						if rate:
+							break
+				
+				if rate:
+					_rate_cache_rub = rate
+					_cache_timestamp_rub = datetime.now()
+					_failure_count_rub = 0
+					_last_success_rub = datetime.now()
+					logger.info(f"✅ Курс USD→RUB успешно получен: {rate}")
+					return rate
+				
+				logger.warning("⚠️ Не удалось найти курс RUB на странице myfin.by/currency/usdrub/ross")
 				_failure_count_rub += 1
 				await _check_and_alert_rub(bot)
 				return None

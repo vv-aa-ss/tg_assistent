@@ -187,7 +187,7 @@ def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def admin_settings_kb(one_card_for_all_enabled: bool = False) -> InlineKeyboardMarkup:
+def admin_settings_kb(one_card_for_all_enabled: bool = False, notify_on_deposit_enabled: bool = False) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="👥 Пользователи", callback_data="settings:users")
 	kb.button(text="🧮 Расчет покупки", callback_data="settings:buy_calc")
@@ -196,6 +196,9 @@ def admin_settings_kb(one_card_for_all_enabled: bool = False) -> InlineKeyboardM
 	kb.button(text=one_card_text, callback_data="settings:one_card_for_all")
 	kb.button(text="🔔 Оповещения", callback_data="settings:notifications")
 	kb.button(text="💱 Курсы валют", callback_data="settings:currency_rates")
+	notify_text = "✅ Оповещать о зачислении" if notify_on_deposit_enabled else "❌ Оповещать о зачислении"
+	kb.button(text=notify_text, callback_data="settings:notify_on_deposit")
+	kb.button(text="🔍 Мемпул", callback_data="settings:mempool")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
 	kb.adjust(1)
 	return kb.as_markup()
@@ -218,6 +221,21 @@ def notifications_settings_kb(current_type: str = "after_proof") -> InlineKeyboa
 	after_proof_text = "✅ После отправки скриншота" if current_type == "after_proof" else "После отправки скриншота"
 	kb.button(text=after_proof_text, callback_data="settings:notifications:set:after_proof")
 	
+	kb.button(text="⬅️ Назад", callback_data="admin:settings")
+	kb.adjust(1)
+	return kb.as_markup()
+
+
+def mempool_settings_kb(
+	check_interval_minutes: float = 0.5,
+	max_attempts: int = 20,
+	initial_delay_minutes: float = 0.17
+) -> InlineKeyboardMarkup:
+	"""Создает клавиатуру для настроек мемпула"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text=f"⏱ Периодичность проверок: {check_interval_minutes} мин", callback_data="settings:mempool:edit:check_interval")
+	kb.button(text=f"🔢 Максимум проверок: {max_attempts} раз", callback_data="settings:mempool:edit:max_attempts")
+	kb.button(text=f"⏳ Отсрочка проверки: {initial_delay_minutes} мин", callback_data="settings:mempool:edit:initial_delay")
 	kb.button(text="⬅️ Назад", callback_data="admin:settings")
 	kb.adjust(1)
 	return kb.as_markup()
@@ -1315,9 +1333,9 @@ def buy_calc_settings_kb(settings: dict) -> InlineKeyboardMarkup:
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +RUB {settings['buy_extra_fee_low_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_rub")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +RUB {settings['buy_extra_fee_mid_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_rub")
 	kb.button(text=f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}", callback_data="settings:buy_calc:edit:buy_alert_usd_threshold")
-	# Курсы валют обновляются автоматически, поэтому не показываем кнопки редактирования
-	# kb.button(text=f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_byn_rate")
-	# kb.button(text=f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']}", callback_data="settings:buy_calc:edit:buy_usd_to_rub_rate")
+	# Интервал обновления курсов криптовалют
+	crypto_interval = settings.get('crypto_rates_update_interval', 5)
+	kb.button(text=f"🪙 Обновление курсов: {crypto_interval} мин", callback_data="settings:buy_calc:edit:crypto_rates_update_interval")
 	kb.button(text="⬅️ Назад", callback_data="admin:settings")
 	kb.adjust(1)
 	return kb.as_markup()
