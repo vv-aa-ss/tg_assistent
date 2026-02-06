@@ -740,6 +740,12 @@ async def _notify_on_deposit_enabled(db) -> bool:
 	return setting == "1"
 
 
+async def _bot_disabled(db) -> bool:
+	"""Проверяет, выключен ли бот (для пользователей)"""
+	setting = await db.get_setting("bot_disabled", "0")
+	return setting == "1"
+
+
 async def _check_deposit_periodically(
 	bot: Bot,
 	wallet_address: str,
@@ -1809,7 +1815,8 @@ async def admin_settings(cb: CallbackQuery, state: FSMContext):
 	db = get_db()
 	enabled = await _one_card_for_all_enabled(db)
 	notify_on_deposit = await _notify_on_deposit_enabled(db)
-	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit))
+	bot_disabled = await _bot_disabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit, bot_disabled))
 	await cb.answer()
 
 
@@ -1822,9 +1829,51 @@ async def settings_notify_on_deposit(cb: CallbackQuery, state: FSMContext):
 	await db.set_setting("notify_on_deposit", new_value)
 	enabled = await _one_card_for_all_enabled(db)
 	notify_on_deposit = await _notify_on_deposit_enabled(db)
-	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit))
+	bot_disabled = await _bot_disabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit, bot_disabled))
 	status = "включено" if not current else "выключено"
 	await cb.answer(f"Оповещение о зачислении {status} ✅")
+
+
+@admin_router.callback_query(F.data == "settings:bot_toggle")
+async def settings_bot_toggle(cb: CallbackQuery, state: FSMContext, bot: Bot):
+	"""Переключает режим выключения бота для пользователей"""
+	db = get_db()
+	current = await _bot_disabled(db)
+	new_value = "1" if not current else "0"
+	await db.set_setting("bot_disabled", new_value)
+	
+	enabled = await _one_card_for_all_enabled(db)
+	notify_on_deposit = await _notify_on_deposit_enabled(db)
+	bot_disabled = await _bot_disabled(db)
+	await safe_edit_text(cb.message, "⚙️ Настройки:", reply_markup=admin_settings_kb(enabled, notify_on_deposit, bot_disabled))
+	
+	if bot_disabled:
+		status_text = "🔴 Бот выключен для пользователей"
+	else:
+		status_text = "🟢 Бот включен для пользователей"
+	
+	# Отправляем уведомление админу, которое удалится через 15 секунд
+	notification_msg = await bot.send_message(
+		chat_id=cb.message.chat.id,
+		text=status_text
+	)
+	
+	# Планируем удаление сообщения через 15 секунд
+	import asyncio
+	asyncio.create_task(_delete_message_after_delay(bot, cb.message.chat.id, notification_msg.message_id, 15))
+	
+	await cb.answer()
+
+
+async def _delete_message_after_delay(bot: Bot, chat_id: int, message_id: int, delay: int):
+	"""Удаляет сообщение через указанное количество секунд"""
+	import asyncio
+	await asyncio.sleep(delay)
+	try:
+		await bot.delete_message(chat_id=chat_id, message_id=message_id)
+	except Exception:
+		pass  # Игнорируем ошибки, если сообщение уже удалено
 
 
 @admin_router.callback_query(F.data == "settings:notifications")
@@ -1990,10 +2039,12 @@ async def settings_one_card_for_all_card(cb: CallbackQuery, state: FSMContext):
 		return
 	await db.set_setting(f"one_card_for_all_{country_code}", str(card_id))
 	enabled = await _one_card_for_all_enabled(db)
+	notify_on_deposit = await _notify_on_deposit_enabled(db)
+	bot_disabled = await _bot_disabled(db)
 	await safe_edit_text(
 		cb.message,
 		"✅ Карта установлена для всех пользователей выбранной страны.",
-		reply_markup=admin_settings_kb(enabled)
+		reply_markup=admin_settings_kb(enabled, notify_on_deposit, bot_disabled)
 	)
 	await cb.answer()
 
@@ -5106,16 +5157,44 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				order = await db.get_order_by_id(last_order_id)
 				order_id = last_order_id
 		profit_value = None
+		result = None  # Инициализируем result для использования в обоих ветках
 		if order and settings.google_sheet_id and settings.google_credentials_path:
-			logger.info(f"📝 Начинаем запись в Google Sheets для deal_id={deal_id}, order_id={order_id}")
+			# Используем актуальную сумму из deal, а не из order
+			# т.к. deal.amount_currency может быть обновлён (изменение суммы, долг и т.д.)
+			actual_amount_currency = deal.get("amount_currency", order.get("amount_currency", 0.0))
+			order_for_sheets = dict(order)
+			order_for_sheets["amount_currency"] = actual_amount_currency
+			logger.info(f"📝 Начинаем запись в Google Sheets для deal_id={deal_id}, order_id={order_id}, amount_currency={actual_amount_currency}")
 			result = await write_order_to_google_sheet(
 				sheet_id=settings.google_sheet_id,
 				credentials_path=settings.google_credentials_path,
-				order=order,
+				order=order_for_sheets,
 				db=db,
 				sheet_name=settings.google_sheet_name,
 				xmr_number=None
 			)
+		elif not order and settings.google_sheet_id and settings.google_credentials_path:
+			# Fallback: если order не найден, используем данные из deal для записи в Google Sheets
+			logger.info(f"📝 Order не найден, используем данные из deal для записи в Google Sheets для deal_id={deal_id}")
+			
+			# Создаем order-like словарь из данных deal
+			order_from_deal = {
+				"user_tg_id": deal.get("user_tg_id"),
+				"crypto_type": deal.get("crypto_type"),
+				"amount": deal.get("amount", 0.0),  # Количество крипты
+				"amount_currency": deal.get("amount_currency", 0.0),  # Сумма в рублях
+			}
+			
+			result = await write_order_to_google_sheet(
+				sheet_id=settings.google_sheet_id,
+				credentials_path=settings.google_credentials_path,
+				order=order_from_deal,
+				db=db,
+				sheet_name=settings.google_sheet_name,
+				xmr_number=None
+			)
+		# Обработка результата записи в Google Sheets (для обеих веток)
+		if result:
 			logger.info(f"📝 Результат записи в Google Sheets: success={result.get('success')}, row={result.get('row')}, entries={len(result.get('written_entries', []))}")
 			if result.get("success"):
 				row_number = result.get("row")
@@ -5234,7 +5313,7 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				profit_num = float(str(profit_value).replace(",", ".").replace(" ", ""))
 			except (ValueError, AttributeError):
 				profit_num = None
-		if order_id:
+		if order_id and order:
 			if profit_num is not None:
 				await db.complete_order(order_id, profit_num)
 			else:
@@ -5263,41 +5342,53 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 			last_order_id = user_row.get("last_order_id") if user_row else None
 			if last_order_id:
 				order = await db.get_order_by_id(last_order_id)
+		
+		# Определяем источник данных: order или deal (fallback)
 		if order:
+			message_data = order
+			logger.info(f"📤 Отправляем уведомление пользователю из order для deal_id={deal_id}")
+		else:
+			# Fallback: используем данные из deal
+			message_data = {
+				"amount": deal.get("amount", 0),
+				"crypto_display": deal.get("crypto_display"),
+				"crypto_type": deal.get("crypto_type"),
+				"wallet_address": deal.get("wallet_address"),
+			}
+			logger.info(f"📤 Order не найден, отправляем уведомление пользователю из deal для deal_id={deal_id}")
+		
+		await bot.send_message(
+			chat_id=deal["user_tg_id"],
+			text=_build_order_completion_message(message_data)
+		)
+		await bot.send_sticker(
+			chat_id=deal["user_tg_id"],
+			sticker="CAACAgIAAxkBAAEVPMRpZ3yqu0lezCX6Gr6tMGiJnBBj7QACYAYAAvoLtgg_BZcxRs21uzgE"
+		)
+		try:
+			from app.keyboards import client_menu_kb
 			await bot.send_message(
 				chat_id=deal["user_tg_id"],
-				text=_build_order_completion_message(order)
+				text="Выберите действие:",
+				reply_markup=client_menu_kb()
 			)
-			await bot.send_sticker(
-				chat_id=deal["user_tg_id"],
-				sticker="CAACAgIAAxkBAAEVPMRpZ3yqu0lezCX6Gr6tMGiJnBBj7QACYAYAAvoLtgg_BZcxRs21uzgE"
-			)
-			try:
-				from app.keyboards import client_menu_kb
-				await bot.send_message(
-					chat_id=deal["user_tg_id"],
-					text="Выберите действие:",
-					reply_markup=client_menu_kb()
-				)
-			except Exception:
-				pass
-			
-			# Проверяем оповещение о зачислении, если функция включена
-			notify_enabled = await _notify_on_deposit_enabled(db)
-			if notify_enabled:
-				wallet_address = order.get("wallet_address")
-				crypto_type = order.get("crypto_type", "")
-				if wallet_address and crypto_type == "BTC":
-					# Запускаем фоновую задачу для периодической проверки транзакции
-					import asyncio
-					asyncio.create_task(_check_deposit_periodically(
-						bot=bot,
-						wallet_address=wallet_address,
-						user_tg_id=deal["user_tg_id"],
-						deal_id=deal_id
-					))
-		else:
-			logger.warning(f"⚠️ Не найден order для завершенной сделки deal_id={deal_id}, user_tg_id={deal['user_tg_id']}")
+		except Exception:
+			pass
+		
+		# Проверяем оповещение о зачислении, если функция включена
+		notify_enabled = await _notify_on_deposit_enabled(db)
+		if notify_enabled:
+			wallet_address = message_data.get("wallet_address")
+			crypto_type = message_data.get("crypto_type", "")
+			if wallet_address and crypto_type == "BTC":
+				# Запускаем фоновую задачу для периодической проверки транзакции
+				import asyncio
+				asyncio.create_task(_check_deposit_periodically(
+					bot=bot,
+					wallet_address=wallet_address,
+					user_tg_id=deal["user_tg_id"],
+					deal_id=deal_id
+				))
 	except Exception:
 		pass
 	# Обновляем существующее сообщение админа после завершения сделки (второе обновление с отчётом Google Sheets)
@@ -6906,6 +6997,32 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			logger.info(f"📍 Режим /add: {day_name}, диапазон строк {add_start_row}-{add_max_row}")
 			
+			# Рассчитываем профит для записи в таблицу
+			from app.currency_rates import get_rate_with_fallback
+			from app.google_sheets import calculate_profit_from_add_data
+			
+			# Получаем курсы валют
+			usd_to_byn = await get_rate_with_fallback("BYN", db, bot)
+			if not usd_to_byn:
+				byn_rate_str = await db.get_setting("buy_usd_to_byn_rate", "3.3")
+				usd_to_byn = float(byn_rate_str) if byn_rate_str else 3.3
+			
+			usd_to_rub = await get_rate_with_fallback("RUB", db, bot)
+			if not usd_to_rub:
+				rub_rate_str = await db.get_setting("buy_usd_to_rub_rate", "95")
+				usd_to_rub = float(rub_rate_str) if rub_rate_str else 95
+			
+			# Рассчитываем профит
+			calculated_profit = calculate_profit_from_add_data(
+				crypto_list, xmr_list, cash_list, card_cash_pairs,
+				usd_to_byn, usd_to_rub
+			)
+			
+			# Получаем столбец для профита
+			profit_column = await db.get_google_sheets_setting("profit_column", "BC")
+			
+			logger.info(f"📊 Рассчитанный профит для /add: {calculated_profit} USD, столбец: {profit_column}")
+			
 			result = await write_all_to_google_sheet_one_row(
 				settings.google_sheet_id,
 				settings.google_credentials_path,
@@ -6916,7 +7033,9 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 				mode="add",
 				sheet_name=settings.google_sheet_name,
 				bot=bot,
-				chat_id=cb.message.chat.id
+				chat_id=cb.message.chat.id,
+				profit_column=profit_column,
+				calculated_profit=calculated_profit
 			)
 			
 			# Проверяем, есть ли свободная строка в диапазоне
@@ -7236,7 +7355,15 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			profit_section_lines = []
 			
 			# Профит сделки (для режимов /add и /move)
-			if profits and mode in ["add", "move"]:
+			# Используем рассчитанный профит из result, если он есть
+			result_calculated_profit = result.get("calculated_profit")
+			if result_calculated_profit is not None and mode == "add":
+				row_num = result.get("row")
+				profit_col = await db.get_google_sheets_setting("profit_column", "BC")
+				cell_address = f"{profit_col}{row_num}" if row_num else "BC?"
+				profit_section_lines.append(f"  💹 <b>Профит сделки ({cell_address}) = {result_calculated_profit} USD </b>💹\n")
+			elif profits and mode in ["add", "move"]:
+				# Fallback: используем профит из таблицы, если рассчитанный недоступен
 				for cell_address, profit_value in profits.items():
 					profit_section_lines.append(f"  💹 <b>Профит сделки ({cell_address}) = {profit_value} USD </b>💹\n")
 			

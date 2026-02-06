@@ -187,7 +187,7 @@ def sell_order_user_reply_kb(order_id: int) -> InlineKeyboardMarkup:
 	return kb.as_markup()
 
 
-def admin_settings_kb(one_card_for_all_enabled: bool = False, notify_on_deposit_enabled: bool = False) -> InlineKeyboardMarkup:
+def admin_settings_kb(one_card_for_all_enabled: bool = False, notify_on_deposit_enabled: bool = False, bot_disabled: bool = False) -> InlineKeyboardMarkup:
 	kb = InlineKeyboardBuilder()
 	kb.button(text="👥 Пользователи", callback_data="settings:users")
 	kb.button(text="🧮 Расчет покупки", callback_data="settings:buy_calc")
@@ -199,6 +199,9 @@ def admin_settings_kb(one_card_for_all_enabled: bool = False, notify_on_deposit_
 	notify_text = "✅ Оповещать о зачислении" if notify_on_deposit_enabled else "❌ Оповещать о зачислении"
 	kb.button(text=notify_text, callback_data="settings:notify_on_deposit")
 	kb.button(text="🔍 Мемпул", callback_data="settings:mempool")
+	# Кнопка выключения бота: зеленая галочка если выключен, красный крест если включен
+	bot_toggle_text = "✅ Выключить бота" if bot_disabled else "❌ Выключить бота"
+	kb.button(text=bot_toggle_text, callback_data="settings:bot_toggle")
 	kb.button(text="⬅️ Назад", callback_data="admin:back")
 	kb.adjust(1)
 	return kb.as_markup()
@@ -1442,4 +1445,12 @@ def user_access_request_kb(user_id: int) -> InlineKeyboardMarkup:
 	kb.button(text="✅ Разрешить", callback_data=f"settings:users:set:{user_id}:allow")
 	kb.button(text="👤 Меню пользователя", callback_data=f"user:view:{user_id}")
 	kb.adjust(1, 1)
+	return kb.as_markup()
+
+
+def bot_disabled_kb() -> InlineKeyboardMarkup:
+	"""Клавиатура для пользователя когда бот выключен (с кнопкой 'Написать админу')"""
+	kb = InlineKeyboardBuilder()
+	kb.button(text="💬 Написать админу", callback_data="bot_disabled:contact_admin")
+	kb.adjust(1)
 	return kb.as_markup()

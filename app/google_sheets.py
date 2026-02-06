@@ -1133,7 +1133,9 @@ async def write_all_to_google_sheet_one_row(
 	mode: str = "add",  # Режим: "add" или "move"
 	sheet_name: Optional[str] = None,
 	bot: Optional[Any] = None,  # Bot объект для отправки уведомлений
-	chat_id: Optional[int] = None  # ID чата для отправки уведомлений
+	chat_id: Optional[int] = None,  # ID чата для отправки уведомлений
+	profit_column: Optional[str] = None,  # Столбец для записи профита
+	calculated_profit: Optional[int] = None  # Рассчитанный профит для записи
 ) -> Dict[str, Any]:
 	"""
 	Записывает все данные в одну строку Google Sheets.
@@ -1267,7 +1269,9 @@ async def write_all_to_google_sheet_one_row(
 					start_row,
 					max_row,
 					delete_range,
-					sheet_name
+					sheet_name,
+					profit_column,
+					calculated_profit
 				)
 				
 				# Если успешно, возвращаем результат
@@ -1375,10 +1379,16 @@ def _write_all_to_google_sheet_one_row_sync(
 	start_row: int = 5,
 	max_row: int = 374,
 	delete_range: str = "A:BB",
-	sheet_name: Optional[str] = None
+	sheet_name: Optional[str] = None,
+	profit_column: Optional[str] = None,
+	calculated_profit: Optional[int] = None
 ) -> Dict[str, Any]:
 	"""
 	Синхронная функция для записи всех данных в одну строку Google Sheets.
+	
+	Args:
+		profit_column: Столбец для записи профита (например "BC")
+		calculated_profit: Рассчитанный профит для записи
 	"""
 	try:
 		# Создаем клиент
@@ -1552,6 +1562,23 @@ def _write_all_to_google_sheet_one_row_sync(
 				written_cells.append(f"{cell_address} (Наличные {cash_name}: {total_amount} {cash_currency})")
 				logger.info(f"✅ Подготовлено к записи {total_amount} {cash_currency} в ячейку {cell_address} (наличные: {cash_name})")
 		
+		# Добавляем профит в batch-запись, если он рассчитан
+		if profit_column and calculated_profit is not None:
+			profit_cell_address = f"{profit_column}{empty_row}"
+			batch_updates.append({
+				'range': profit_cell_address,
+				'values': [[calculated_profit]]
+			})
+			written_cells.append(f"{profit_cell_address} (Профит: {calculated_profit} USD)")
+			written_entries.append({
+				"type": "profit",
+				"label": "Профит",
+				"cell": profit_cell_address,
+				"amount": calculated_profit,
+				"currency": "USD",
+			})
+			logger.info(f"✅ Подготовлено к записи профит {calculated_profit} USD в ячейку {profit_cell_address}")
+		
 		# Выполняем batch-запись всех ячеек одним запросом
 		if batch_updates:
 			try:
@@ -1567,7 +1594,7 @@ def _write_all_to_google_sheet_one_row_sync(
 					except Exception as e2:
 						logger.error(f"❌ Ошибка записи ячейки {update['range']}: {e2}")
 		
-		return {"success": True, "written_cells": written_cells, "written_entries": written_entries, "row": empty_row}
+		return {"success": True, "written_cells": written_cells, "written_entries": written_entries, "row": empty_row, "calculated_profit": calculated_profit}
 		
 	except Exception as e:
 		logger.exception(f"Ошибка записи всех данных в Google Sheet: {e}")
@@ -3479,4 +3506,97 @@ async def calculate_profit_from_deal_data(
 		
 	except Exception as e:
 		logger.exception(f"❌ Ошибка расчета профита: {e}")
+		return None
+
+
+def calculate_profit_from_add_data(
+	crypto_list: List[Dict[str, Any]],
+	xmr_list: List[Dict[str, Any]],
+	cash_list: List[Dict[str, Any]],
+	card_cash_pairs: List[Dict[str, Any]],
+	usd_to_byn_rate: float,
+	usd_to_rub_rate: float
+) -> Optional[int]:
+	"""
+	Рассчитывает профит на основе данных из команды /add.
+	
+	Формула: Профит = Доход (в USD) - Расход (в USD)
+	Где:
+		- Расход = сумма всех crypto + сумма всех xmr (+ 1 USD комиссия за каждую криптовалюту, уже добавлено при записи)
+		- Доход = (сумма карт + сумма наличных) / курс валюты
+	
+	Args:
+		crypto_list: Список криптовалют [{"currency": "BTC", "usd_amount": 100}, ...]
+		xmr_list: Список XMR [{"xmr_number": 1, "usd_amount": 50}, ...]
+		cash_list: Список наличных [{"currency": "RUB", "value": 5000, "cash_name": "..."}, ...]
+		card_cash_pairs: Список пар карта-наличные [{"card": {...}, "cash": {"value": ..., "currency": ...}}, ...]
+		usd_to_byn_rate: Курс USD→BYN
+		usd_to_rub_rate: Курс USD→RUB
+	
+	Returns:
+		Рассчитанный профит (целое число) или None при ошибке
+	"""
+	try:
+		# Рассчитываем общий расход в USD (криптовалюта)
+		total_crypto_usd = 0.0
+		
+		# Суммируем обычные криптовалюты
+		for crypto in crypto_list:
+			usd_amount = crypto.get("usd_amount", 0.0)
+			total_crypto_usd += usd_amount
+		
+		# Суммируем XMR
+		for xmr in xmr_list:
+			usd_amount = xmr.get("usd_amount", 0.0)
+			total_crypto_usd += usd_amount
+		
+		# Добавляем комиссию 1 USD за каждую криптовалюту (как при записи в таблицу)
+		num_crypto_entries = len(crypto_list) + len(xmr_list)
+		total_expense_usd = total_crypto_usd + num_crypto_entries  # +1 USD за каждую запись
+		
+		# Рассчитываем общий доход (из карт и наличных)
+		total_income_usd = 0.0
+		
+		# Доход от карт
+		for pair in card_cash_pairs:
+			cash_data = pair.get("cash")
+			if cash_data:
+				value = cash_data.get("value", 0.0)
+				currency = cash_data.get("currency", "RUB")
+				
+				if currency == "BYN" and usd_to_byn_rate:
+					total_income_usd += value / usd_to_byn_rate
+				elif currency == "RUB" and usd_to_rub_rate:
+					total_income_usd += value / usd_to_rub_rate
+				else:
+					# Если неизвестная валюта, пропускаем
+					logger.warning(f"⚠️ Неизвестная валюта карты: {currency}")
+		
+		# Доход от наличных (без карты)
+		for cash in cash_list:
+			value = cash.get("value", 0.0)
+			currency = cash.get("currency", "RUB")
+			
+			if currency == "BYN" and usd_to_byn_rate:
+				total_income_usd += value / usd_to_byn_rate
+			elif currency == "RUB" and usd_to_rub_rate:
+				total_income_usd += value / usd_to_rub_rate
+			else:
+				logger.warning(f"⚠️ Неизвестная валюта наличных: {currency}")
+		
+		# Рассчитываем профит
+		profit = total_income_usd - total_expense_usd
+		profit_rounded = round(profit)
+		
+		logger.info(
+			f"📊 Расчет профита для /add: "
+			f"Доход = {total_income_usd:.2f} USD, "
+			f"Расход = {total_expense_usd:.2f} USD (крипта: {total_crypto_usd:.2f} + комиссия: {num_crypto_entries}), "
+			f"Профит = {profit_rounded} USD"
+		)
+		
+		return profit_rounded
+		
+	except Exception as e:
+		logger.exception(f"❌ Ошибка расчета профита для /add: {e}")
 		return None

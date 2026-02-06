@@ -2100,31 +2100,31 @@ class Database:
 			# Настройки расчета покупки крипты
 			if 'buy_markup_percent_small' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_small', '15')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_small', '20')"
 				)
 			if 'buy_markup_percent_101_449' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_101_449', '11')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_101_449', '15')"
 				)
 			if 'buy_markup_percent_450_699' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_450_699', '9')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_450_699', '14')"
 				)
 			if 'buy_markup_percent_700_999' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_700_999', '8')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_700_999', '13')"
 				)
 			if 'buy_markup_percent_1000_1499' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1000_1499', '7')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1000_1499', '12')"
 				)
 			if 'buy_markup_percent_1500_1999' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1500_1999', '6')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_1500_1999', '11')"
 				)
 			if 'buy_markup_percent_2000_plus' not in existing_keys:
 				await self._db.execute(
-					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_2000_plus', '5')"
+					"INSERT INTO settings(key, value) VALUES('buy_markup_percent_2000_plus', '10')"
 				)
 			if 'buy_min_usd' not in existing_keys:
 				await self._db.execute(

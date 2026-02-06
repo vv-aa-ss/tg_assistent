@@ -22,7 +22,7 @@ from aiogram import F
 from app.config import get_settings
 from app.db import Database
 from app.admin import admin_router, is_admin
-from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_country_inline_kb, buy_crypto_kb, buy_crypto_inline_kb, buy_deal_confirm_kb, buy_deal_paid_kb, buy_deal_paid_reply_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb, sell_crypto_kb, sell_confirmation_kb, sell_order_user_reply_kb, question_user_reply_kb, question_reply_kb, order_user_reply_kb
+from app.keyboards import admin_menu_kb, client_menu_kb, buy_country_kb, buy_country_inline_kb, buy_crypto_kb, buy_crypto_inline_kb, buy_deal_confirm_kb, buy_deal_paid_kb, buy_deal_paid_reply_kb, buy_delivery_method_kb, buy_payment_confirmed_kb, order_action_kb, user_access_request_kb, sell_crypto_kb, sell_confirmation_kb, sell_order_user_reply_kb, question_user_reply_kb, question_reply_kb, order_user_reply_kb, bot_disabled_kb
 from app.di import get_admin_ids, get_admin_usernames
 from app.di import set_dependencies
 from app.notifications import notification_ids
@@ -125,6 +125,54 @@ async def load_deal_alerts_from_db() -> None:
 		logger_main.info(f"✅ Загружено {len(buy_deal_alerts)} активных deal alerts")
 	except Exception as e:
 		logger_main.error(f"❌ Ошибка при загрузке deal alerts из БД: {e}", exc_info=True)
+
+
+async def check_bot_disabled_for_user(message_or_callback, bot: Bot) -> bool:
+	"""
+	Проверяет, выключен ли бот для пользователей.
+	Если выключен, отправляет сообщение с кнопкой "Написать админу".
+	
+	Args:
+		message_or_callback: Message или CallbackQuery объект
+		bot: Bot объект
+	
+	Returns:
+		True если бот выключен (нужно прервать обработку), False если работает
+	"""
+	from app.di import get_db
+	db = get_db()
+	
+	setting = await db.get_setting("bot_disabled", "0")
+	if setting != "1":
+		return False
+	
+	# Бот выключен - отправляем сообщение пользователю
+	chat_id = None
+	if hasattr(message_or_callback, 'chat'):
+		chat_id = message_or_callback.chat.id
+	elif hasattr(message_or_callback, 'message') and message_or_callback.message:
+		chat_id = message_or_callback.message.chat.id
+	
+	if chat_id:
+		try:
+			await bot.send_message(
+				chat_id=chat_id,
+				text="⚠️ <b>Бот временно не работает</b>\n\n"
+					 "Пожалуйста, попробуйте позже или свяжитесь с администратором.",
+				parse_mode=ParseMode.HTML,
+				reply_markup=bot_disabled_kb()
+			)
+		except Exception:
+			pass
+	
+	# Отвечаем на callback если это CallbackQuery
+	if hasattr(message_or_callback, 'answer') and hasattr(message_or_callback, 'data'):
+		try:
+			await message_or_callback.answer("Бот временно не работает", show_alert=True)
+		except Exception:
+			pass
+	
+	return True
 
 
 async def periodic_cleanup_alerts():
@@ -1657,6 +1705,10 @@ async def main() -> None:
 			from app.di import get_db
 			db_local = get_db()
 			if await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+				# Проверяем, выключен ли бот
+				if await check_bot_disabled_for_user(message, bot):
+					return
+				
 				# Устанавливаем команды для пользователя (чтобы было "Меню")
 				try:
 					from aiogram.types import BotCommandScopeChat
@@ -1764,6 +1816,9 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
+			return
 		# Удаляем сообщение пользователя
 		await delete_user_message(message)
 		if message.text == "🚀 Купить":
@@ -1817,6 +1872,26 @@ async def main() -> None:
 				state=state
 			)
 
+	@dp.callback_query(F.data == "bot_disabled:contact_admin")
+	async def on_bot_disabled_contact_admin(cb: CallbackQuery, state: FSMContext):
+		"""Обработчик для кнопки 'Написать админу' когда бот выключен"""
+		if not cb.from_user:
+			return
+		await cb.answer()
+		
+		# Переводим пользователя в состояние ожидания вопроса (как при "❓ Задать вопрос")
+		await state.set_state(QuestionStates.waiting_question)
+		
+		try:
+			await cb.message.edit_text(
+				"📝 Пожалуйста, введите ваше сообщение. Администратор получит его и свяжется с вами.",
+			)
+		except Exception:
+			await bot.send_message(
+				chat_id=cb.message.chat.id,
+				text="📝 Пожалуйста, введите ваше сообщение. Администратор получит его и свяжется с вами."
+			)
+
 	@dp.callback_query(F.data.startswith("deal:country:"))
 	async def on_deal_country_selected(cb: CallbackQuery, state: FSMContext):
 		if not cb.from_user:
@@ -1824,6 +1899,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(cb, bot):
 			return
 		await cb.answer()
 		country_code = cb.data.split(":")[2]
@@ -1855,6 +1933,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(cb, bot):
 			return
 		await cb.answer()
 		crypto_type = cb.data.split(":")[2]
@@ -1899,6 +1980,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
 			return
 		await delete_user_message(message)
 		data = await state.get_data()
@@ -2200,6 +2284,9 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
 			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(cb, bot):
+			return
 		await cb.answer()
 		data = await state.get_data()
 		selected_country = data.get("selected_country", "BYN")
@@ -2236,6 +2323,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(cb.from_user.id, cb.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(cb, bot):
 			return
 		data = await state.get_data()
 		deal_id = data.get("deal_id")
@@ -2526,6 +2616,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
 			return
 		wallet_address = (message.text or "").strip()
 		if not wallet_address:
@@ -2928,6 +3021,9 @@ async def main() -> None:
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
 			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
+			return
 		has_photo = message.photo is not None and len(message.photo) > 0
 		has_document = message.document is not None
 		if not has_photo and not has_document:
@@ -3284,6 +3380,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
 			return
 		await delete_user_message(message)
 		crypto_name = message.text
@@ -3647,10 +3746,17 @@ async def main() -> None:
 		
 		# Логируем расчет для отладки
 		logger = logging.getLogger("app.main")
-		logger.debug(
-			f"Расчет: ({crypto_price_usd} USD + {markup_percent}%) × {amount} {crypto_type} = {total_usd} USD; "
-			f"курс {usd_to_currency_rate} {currency_symbol}/USD, доп. комиссия {extra_fee_currency} {currency_symbol}; "
-			f"итого {amount_currency} {currency_symbol}"
+		logger.info(
+			f"📊 РАСЧЁТ СДЕЛКИ:\n"
+			f"  Крипта: {crypto_type}, Кол-во: {amount}\n"
+			f"  Курс крипты: ${crypto_price_usd:,.2f}\n"
+			f"  Сумма без наценки: ${amount_usd:.2f}\n"
+			f"  Наценка: {markup_percent}%\n"
+			f"  Курс с наценкой: ${crypto_price_with_markup:,.2f}\n"
+			f"  Сумма с наценкой (total_usd): ${total_usd:.2f}\n"
+			f"  Курс USD→{currency_symbol}: {usd_to_currency_rate}\n"
+			f"  Доп. комиссия: {extra_fee_currency} {currency_symbol} (total_usd < 200: {total_usd < 200})\n"
+			f"  Расчёт: {total_usd:.2f} × {usd_to_currency_rate} + {extra_fee_currency} = {amount_currency:.2f} {currency_symbol}"
 		)
 		
 		# Сохраняем данные о сделке
@@ -5482,6 +5588,9 @@ async def main() -> None:
 		from app.di import get_db
 		db_local = get_db()
 		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		# Проверяем, выключен ли бот
+		if await check_bot_disabled_for_user(message, bot):
 			return
 		
 		# Проверяем, не является ли это командой - если да, пропускаем обработку
