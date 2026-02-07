@@ -1189,28 +1189,68 @@ async def _get_requisites_label_by_card_id(db, card_id: int) -> str:
 
 
 async def _get_deal_requisites_text(db, user_tg_id: int, country_code: str | None = None) -> str:
-	global_card_id = await _get_global_card_id_for_country(db, country_code)
-	if global_card_id:
-		return await _get_requisites_text_by_card_id(db, global_card_id)
+	import logging
+	_logger = logging.getLogger("app.main")
 	user_cards = await db.get_cards_for_user_tg(user_tg_id)
 	if not user_cards:
+		# Нет карт у пользователя — проверяем глобальную карту по стране сделки (fallback)
+		global_card_id = await _get_global_card_id_for_country(db, country_code)
+		if global_card_id:
+			_logger.info(f"🔍 _get_deal_requisites_text: нет карт у user {user_tg_id}, используем глобальную карту для {country_code}: card_id={global_card_id}")
+			return await _get_requisites_text_by_card_id(db, global_card_id)
 		return ""
-	card = user_cards[0]
-	card_id = card["card_id"]
+
+	# Определяем валюту (страну) первой карты пользователя по её группе
+	first_card = user_cards[0]
+	card_id = first_card["card_id"]
+	card_info = await db.get_card_by_id(card_id)
+	user_card_currency = None
+	if card_info and card_info.get("group_id"):
+		group = await db.get_card_group_by_id(card_info["group_id"])
+		if group:
+			user_card_currency = group.get("currency")  # "BYN" or "RUB"
+
+	_logger.info(f"🔍 _get_deal_requisites_text: user {user_tg_id}, первая карта card_id={card_id}, валюта группы={user_card_currency}")
+
+	# Проверяем глобальную карту для валюты карты пользователя (а не для страны сделки!)
+	if user_card_currency:
+		global_card_id = await _get_global_card_id_for_country(db, user_card_currency)
+		if global_card_id:
+			_logger.info(f"✅ _get_deal_requisites_text: используем глобальную карту для {user_card_currency}: card_id={global_card_id}")
+			return await _get_requisites_text_by_card_id(db, global_card_id)
+
+	# Глобальная карта не установлена для валюты карт пользователя — используем первую карту
+	_logger.info(f"✅ _get_deal_requisites_text: глобальная карта для {user_card_currency} не установлена, используем карту пользователя card_id={card_id}")
 	return await _get_requisites_text_by_card_id(db, card_id)
 
 
 async def _get_deal_requisites_label(db, user_tg_id: int, country_code: str | None = None) -> str:
-	global_card_id = await _get_global_card_id_for_country(db, country_code)
-	if global_card_id:
-		return await _get_requisites_label_by_card_id(db, global_card_id)
 	user_cards = await db.get_cards_for_user_tg(user_tg_id)
 	if not user_cards:
+		# Нет карт — проверяем глобальную карту по стране сделки (fallback)
+		global_card_id = await _get_global_card_id_for_country(db, country_code)
+		if global_card_id:
+			return await _get_requisites_label_by_card_id(db, global_card_id)
 		return "Реквизиты не привязаны"
-	card = user_cards[0]
-	card_id = card["card_id"]
+
+	# Определяем валюту первой карты пользователя
+	first_card = user_cards[0]
+	card_id = first_card["card_id"]
 	card_info = await db.get_card_by_id(card_id)
-	card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
+	user_card_currency = None
+	if card_info and card_info.get("group_id"):
+		group = await db.get_card_group_by_id(card_info["group_id"])
+		if group:
+			user_card_currency = group.get("currency")
+
+	# Проверяем глобальную карту для валюты карты пользователя
+	if user_card_currency:
+		global_card_id = await _get_global_card_id_for_country(db, user_card_currency)
+		if global_card_id:
+			return await _get_requisites_label_by_card_id(db, global_card_id)
+
+	# Глобальная карта не установлена — используем карту пользователя
+	card_name = (card_info.get("name") if card_info else None) or first_card.get("card_name") or first_card.get("name") or ""
 	group_name = ""
 	if card_info and card_info.get("group_id"):
 		group = await db.get_card_group_by_id(card_info["group_id"])
@@ -2410,6 +2450,76 @@ async def main() -> None:
 		)
 		await state.update_data(proof_request_message_id=message_id)
 		await cb.answer()
+
+	@dp.message(DealStates.waiting_payment, F.photo | F.document)
+	async def on_deal_payment_proof_while_waiting_payment(message: Message, state: FSMContext):
+		"""Пользователь отправил скриншот ДО нажатия 'ОПЛАТИЛ' — автоматически принимаем и обрабатываем"""
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"📷 on_deal_payment_proof_while_waiting_payment: user={message.from_user.id if message.from_user else None}, автоматический приём скриншота в состоянии waiting_payment")
+		if not message.from_user:
+			return
+		from app.di import get_db
+		db_local = get_db()
+		if not await db_local.is_allowed_user(message.from_user.id, message.from_user.username):
+			return
+		if await check_bot_disabled_for_user(message, bot):
+			return
+
+		data = await state.get_data()
+		deal_id = data.get("deal_id")
+		amount_currency = data.get("amount_currency")
+
+		# Если в состоянии нет данных, берем активную сделку из БД
+		if not deal_id or amount_currency is None:
+			active_deal_id = await db_local.get_active_buy_deal_by_user(message.from_user.id)
+			if not active_deal_id:
+				await delete_user_message(message)
+				await message.answer("Нет активной сделки.")
+				return
+			deal = await db_local.get_buy_deal_by_id(active_deal_id)
+			if not deal:
+				await delete_user_message(message)
+				await message.answer("Сделка не найдена.")
+				return
+			await state.update_data(
+				deal_id=deal["id"],
+				selected_country=deal.get("country_code", "BYN"),
+				crypto_type=deal.get("crypto_type", ""),
+				crypto_display=deal.get("crypto_display", ""),
+				amount=deal.get("amount", 0),
+				amount_currency=deal.get("amount_currency", 0),
+				currency_symbol=deal.get("currency_symbol", "Br"),
+				wallet_address=deal.get("wallet_address"),
+				deal_message_id=deal.get("user_message_id"),
+				order_message_id=deal.get("user_message_id"),
+			)
+			data = await state.get_data()
+			deal_id = data.get("deal_id")
+
+		# Удаляем уведомление о получении реквизитов
+		if deal_id:
+			deal = await db_local.get_buy_deal_by_id(deal_id)
+			if deal and deal.get("requisites_notice_message_id"):
+				try:
+					await message.bot.delete_message(
+						chat_id=message.from_user.id,
+						message_id=deal["requisites_notice_message_id"]
+					)
+				except Exception:
+					pass
+				await db_local.update_buy_deal_fields(
+					deal_id,
+					requisites_notice_message_id=None
+				)
+			# Обновляем статус сделки на ожидание скриншота
+			await db_local.update_buy_deal_fields(deal_id, status="await_proof")
+
+		# Переключаем состояние
+		await state.set_state(DealStates.waiting_payment_proof)
+		logger_main.info(f"📷 on_deal_payment_proof_while_waiting_payment: состояние переключено на waiting_payment_proof, делегируем обработку скриншота")
+
+		# Делегируем обработку скриншота в основной обработчик
+		await on_deal_payment_proof_received(message, state)
 
 	@dp.callback_query(F.data.startswith("deal:user:reply:"))
 	async def on_deal_user_reply_start(cb: CallbackQuery, state: FSMContext):
@@ -5305,13 +5415,21 @@ async def main() -> None:
 		
 		if settings.google_sheet_id and settings.google_credentials_path:
 			try:
+				# Определяем country_code из currency_symbol для проверки "одна карта на всех"
+				_currency_sym = order.get("currency_symbol", "")
+				_country_code = None
+				if _currency_sym == "Br":
+					_country_code = "BYN"
+				elif _currency_sym in ("₽", "руб", "RUB"):
+					_country_code = "RUB"
 				result = await write_order_to_google_sheet(
 					sheet_id=settings.google_sheet_id,
 					credentials_path=settings.google_credentials_path,
 					order=order,
 					db=db_local,
 					sheet_name=settings.google_sheet_name,
-					xmr_number=xmr_number
+					xmr_number=xmr_number,
+					country_code=_country_code
 				)
 				if result.get("success"):
 					logger_main = logging.getLogger("app.main")

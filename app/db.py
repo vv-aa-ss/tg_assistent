@@ -365,6 +365,13 @@ class Database:
 			)
 			_logger.debug("Created table card_groups")
 		
+		# Добавляем поле currency в таблицу card_groups, если его нет
+		cur = await self._db.execute("PRAGMA table_info(card_groups)")
+		group_cols = [r[1] for r in await cur.fetchall()]
+		if "currency" not in group_cols:
+			await self._db.execute("ALTER TABLE card_groups ADD COLUMN currency TEXT DEFAULT 'BYN'")
+			_logger.debug("Added currency column to card_groups table")
+		
 		# Добавляем поле group_id в таблицу cards, если его нет
 		cur = await self._db.execute("PRAGMA table_info(cards)")
 		cols = [r[1] for r in await cur.fetchall()]
@@ -1656,11 +1663,11 @@ class Database:
 			group_id: ID группы карт
 			
 		Returns:
-			Словарь с ключами: id, name, created_at или None, если группа не найдена
+			Словарь с ключами: id, name, created_at, currency или None, если группа не найдена
 		"""
 		assert self._db
 		cur = await self._db.execute(
-			"SELECT id, name, created_at FROM card_groups WHERE id = ?",
+			"SELECT id, name, created_at, currency FROM card_groups WHERE id = ?",
 			(group_id,)
 		)
 		row = await cur.fetchone()
@@ -1668,7 +1675,8 @@ class Database:
 			return {
 				"id": row[0],
 				"name": row[1],
-				"created_at": row[2]
+				"created_at": row[2],
+				"currency": row[3] if len(row) > 3 and row[3] else "BYN"
 			}
 		return None
 		rows = await cur.fetchall()

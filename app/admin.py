@@ -5171,7 +5171,8 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				order=order_for_sheets,
 				db=db,
 				sheet_name=settings.google_sheet_name,
-				xmr_number=None
+				xmr_number=None,
+				country_code=deal.get("country_code")
 			)
 		elif not order and settings.google_sheet_id and settings.google_credentials_path:
 			# Fallback: если order не найден, используем данные из deal для записи в Google Sheets
@@ -5191,7 +5192,8 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 				order=order_from_deal,
 				db=db,
 				sheet_name=settings.google_sheet_name,
-				xmr_number=None
+				xmr_number=None,
+				country_code=deal.get("country_code")
 			)
 		# Обработка результата записи в Google Sheets (для обеих веток)
 		if result:
@@ -6354,11 +6356,26 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 		data = await state.get_data()
 		editing_block_idx = data.get("editing_block_idx")
 		
-		# Сохраняем наличные для карты
+		# Определяем валюту по группе карты
+		card_data = data.get("card_data")
+		currency = "BYN"  # По умолчанию белорусские рубли
+		
+		if card_data and card_data.get("group_id"):
+			db = get_db()
+			group = await db.get_card_group_by_id(card_data["group_id"])
+			if group:
+				currency = group.get("currency", "BYN")
+			logger.info(
+				f"💱 Определена валюта карты: card_id={card_data.get('card_id')}, "
+				f"card_name={card_data.get('card_name')}, group_id={card_data.get('group_id')}, "
+				f"group_name={card_data.get('group_name')}, currency={currency}"
+			)
+		
+		# Сохраняем наличные для карты с правильной валютой
 		card_cash_data = {
-			"currency": "RUB",
+			"currency": currency,
 			"value": amount,
-			"display": f"{amount} RUB"
+			"display": f"{amount} {currency}"
 		}
 		
 		# Если редактируется сохраненный блок, обновляем его

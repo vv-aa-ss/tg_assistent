@@ -1487,7 +1487,7 @@ def _write_all_to_google_sheet_one_row_sync(
 				logger.info(f"✅ Подготовлено к записи {usd_amount_rounded} USD (включая +1 USD за отправку) в ячейку {cell_address} (XMR-{xmr_number})")
 		
 		# Суммируем наличные для каждой карты (по card_id для правильного суммирования)
-		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name, "group_name": group_name}}
+		card_cash_sum = {}  # {card_id: {"column": column, "amount": total_amount, "card_name": card_name, "group_name": group_name, "currency": currency}}
 		for pair in card_cash_pairs:
 			card_data = pair.get("card")
 			cash_data = pair.get("cash")
@@ -1496,13 +1496,15 @@ def _write_all_to_google_sheet_one_row_sync(
 			
 			if card_id and column and cash_data:
 				cash_amount = cash_data.get("value", 0)
+				cash_currency = cash_data.get("currency", "BYN")
 				if cash_amount != 0:
 					if card_id not in card_cash_sum:
 						card_cash_sum[card_id] = {
 							"column": column,
 							"amount": 0,
 							"card_name": card_data.get("card_name", ""),
-							"group_name": card_data.get("group_name") or "Без группы"
+							"group_name": card_data.get("group_name") or "Без группы",
+							"currency": cash_currency
 						}
 					card_cash_sum[card_id]["amount"] += cash_amount
 		
@@ -1512,6 +1514,7 @@ def _write_all_to_google_sheet_one_row_sync(
 			total_amount = card_info["amount"]
 			card_name = card_info["card_name"]
 			group_name = card_info.get("group_name") or "Без группы"
+			card_currency = card_info.get("currency", "BYN")
 			
 			if total_amount != 0:
 				cell_address = f"{column}{empty_row}"
@@ -1519,7 +1522,7 @@ def _write_all_to_google_sheet_one_row_sync(
 					'range': cell_address,
 					'values': [[total_amount]]
 				})
-				written_cells.append(f"{cell_address} (Карта {card_name}: {total_amount} RUB)")
+				written_cells.append(f"{cell_address} (Карта {card_name}: {total_amount} {card_currency})")
 				written_entries.append(
 					{
 						"type": "card",
@@ -1527,10 +1530,10 @@ def _write_all_to_google_sheet_one_row_sync(
 						"card": card_name,
 						"cell": cell_address,
 						"amount": total_amount,
-						"currency": "RUB",
+						"currency": card_currency,
 					}
 				)
-				logger.info(f"✅ Подготовлено к записи {total_amount} RUB в ячейку {cell_address} (карта: {card_name})")
+				logger.info(f"✅ Подготовлено к записи {total_amount} {card_currency} в ячейку {cell_address} (карта: {card_name})")
 		
 		# Суммируем наличные без карты (по cash_name)
 		cash_sum = {}  # {cash_name: {"column": column, "amount": total_amount, "currency": currency}}
@@ -1607,7 +1610,8 @@ async def write_order_to_google_sheet(
 	order: Dict[str, Any],
 	db: Any,
 	sheet_name: Optional[str] = None,
-	xmr_number: Optional[int] = None
+	xmr_number: Optional[int] = None,
+	country_code: Optional[str] = None
 ) -> Dict[str, Any]:
 	"""
 	Записывает данные заявки в Google Sheets при нажатии "Выполнено".
@@ -1618,14 +1622,45 @@ async def write_order_to_google_sheet(
 		order: Словарь с данными заявки
 		db: Экземпляр базы данных
 		sheet_name: Название листа (опционально)
+		country_code: Код страны (BYN/RUB) для проверки 'одна карта на всех'
 	
 	Returns:
 		Словарь с результатами: {"success": bool, "written_cells": list}
 	"""
 	try:
-		# Получаем первую карту пользователя (как при создании заявки)
+		# Получаем карты пользователя
 		user_tg_id = order.get("user_tg_id")
 		user_cards = await db.get_cards_for_user_tg(user_tg_id)
+		
+		# Определяем глобальную карту на основе валюты группы карт пользователя
+		# (согласовано с логикой выдачи реквизитов _get_deal_requisites_text)
+		global_card_id = None
+		user_card_currency = None
+		if user_cards:
+			# Определяем валюту первой карты пользователя по её группе
+			first_user_card = user_cards[0]
+			first_card_info = await db.get_card_by_id(first_user_card["card_id"])
+			if first_card_info and first_card_info.get("group_id"):
+				group = await db.get_card_group_by_id(first_card_info["group_id"])
+				if group:
+					user_card_currency = group.get("currency")  # "BYN" or "RUB"
+			if user_card_currency:
+				global_card_str = await db.get_setting(f"one_card_for_all_{user_card_currency}")
+				if global_card_str:
+					try:
+						global_card_id = int(global_card_str)
+						logger.info(f"🔍 write_order_to_google_sheet: валюта карт пользователя={user_card_currency}, глобальная карта card_id={global_card_id}")
+					except (ValueError, TypeError):
+						pass
+		elif country_code:
+			# Нет карт у пользователя — fallback на country_code из сделки
+			global_card_str = await db.get_setting(f"one_card_for_all_{country_code}")
+			if global_card_str:
+				try:
+					global_card_id = int(global_card_str)
+					logger.info(f"🔍 write_order_to_google_sheet: нет карт, используем country_code={country_code}, глобальная карта card_id={global_card_id}")
+				except (ValueError, TypeError):
+					pass
 		
 		# Подготавливаем данные для записи
 		crypto_list = []
@@ -1694,10 +1729,26 @@ async def write_order_to_google_sheet(
 			})
 		
 		# Получаем ячейку для карты (рубли)
-		if user_cards:
-			card = user_cards[0]
-			card_id = card.get("card_id")
-			card_name = card.get("card_name", "")
+		# Если есть глобальная карта ("одна карта на всех"), используем её
+		selected_card = None
+		if global_card_id:
+			card_info = await db.get_card_by_id(global_card_id)
+			if card_info:
+				selected_card = {
+					"card_id": global_card_id,
+					"card_name": card_info.get("name", ""),
+				}
+				logger.info(f"✅ write_order_to_google_sheet: используем глобальную карту card_id={global_card_id}, name={card_info.get('name')}")
+			else:
+				logger.warning(f"⚠️ Глобальная карта card_id={global_card_id} не найдена в БД, используем карту пользователя")
+		
+		if not selected_card and user_cards:
+			selected_card = user_cards[0]
+			logger.info(f"✅ write_order_to_google_sheet: используем первую карту пользователя card_id={selected_card.get('card_id')}, name={selected_card.get('card_name')}")
+		
+		if selected_card:
+			card_id = selected_card.get("card_id")
+			card_name = selected_card.get("card_name", "")
 			group_name = "Без группы"
 			card_info = await db.get_card_by_id(card_id)
 			if card_info and card_info.get("group_id"):
@@ -3560,17 +3611,24 @@ def calculate_profit_from_add_data(
 		# Доход от карт
 		for pair in card_cash_pairs:
 			cash_data = pair.get("cash")
+			card_data = pair.get("card", {})
 			if cash_data:
 				value = cash_data.get("value", 0.0)
 				currency = cash_data.get("currency", "RUB")
+				card_name = card_data.get("card_name", "?")
+				group_name = card_data.get("group_name", "?")
 				
 				if currency == "BYN" and usd_to_byn_rate:
-					total_income_usd += value / usd_to_byn_rate
+					income = value / usd_to_byn_rate
+					total_income_usd += income
+					logger.info(f"💱 Карта {card_name} ({group_name}): {value} BYN / {usd_to_byn_rate} = {income:.2f} USD")
 				elif currency == "RUB" and usd_to_rub_rate:
-					total_income_usd += value / usd_to_rub_rate
+					income = value / usd_to_rub_rate
+					total_income_usd += income
+					logger.info(f"💱 Карта {card_name} ({group_name}): {value} RUB / {usd_to_rub_rate} = {income:.2f} USD")
 				else:
 					# Если неизвестная валюта, пропускаем
-					logger.warning(f"⚠️ Неизвестная валюта карты: {currency}")
+					logger.warning(f"⚠️ Неизвестная валюта карты {card_name} ({group_name}): {currency}")
 		
 		# Доход от наличных (без карты)
 		for cash in cash_list:
