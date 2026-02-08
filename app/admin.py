@@ -127,6 +127,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			requisites_text=requisites_text if show_requisites else None,
 			wallet_address=deal.get("wallet_address"),
 			show_empty_amount=is_large_order and not admin_amount_set,
+			amount_usd=deal.get("amount_usd"),
 		)
 	elif deal.get("status") == "await_wallet":
 		amount_currency_for_user = None if is_large_order else deal.get("amount_currency")
@@ -140,6 +141,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			requisites_text=None,
 			wallet_address=deal.get("wallet_address"),
 			show_empty_amount=is_large_order,
+			amount_usd=deal.get("amount_usd"),
 		)
 	elif messages:
 		if requisites_text:
@@ -163,6 +165,7 @@ async def _build_user_deal_text_for_admin_update(db, deal: dict) -> tuple[str, o
 			currency_symbol=deal.get("currency_symbol", "Br"),
 			prompt=None,
 			requisites_text=requisites_text,
+			amount_usd=deal.get("amount_usd"),
 		)
 	reply_markup = None
 	show_how_pay = bool(requisites_text) and not (is_large_order and not admin_amount_set)
@@ -646,6 +649,11 @@ class DealAlertCryptoStates(StatesGroup):
 class DealAlertDebtStates(StatesGroup):
 	"""Состояние для добавления долга по сделке"""
 	waiting_amount = State()
+
+
+class DealTimeLimitEditStates(StatesGroup):
+	"""Состояние для редактирования времени на сделку"""
+	waiting_value = State()
 
 
 class CardGroupStates(StatesGroup):
@@ -2292,14 +2300,27 @@ def _parse_float(value: str, default: float) -> float:
 
 async def _get_buy_calc_settings(db) -> dict:
 	return {
-		"buy_markup_percent_small": _parse_float(await db.get_setting("buy_markup_percent_small", "20"), 20),
-		"buy_markup_percent_101_449": _parse_float(await db.get_setting("buy_markup_percent_101_449", "15"), 15),
-		"buy_markup_percent_450_699": _parse_float(await db.get_setting("buy_markup_percent_450_699", "14"), 14),
-		"buy_markup_percent_700_999": _parse_float(await db.get_setting("buy_markup_percent_700_999", "13"), 13),
-		"buy_markup_percent_1000_1499": _parse_float(await db.get_setting("buy_markup_percent_1000_1499", "12"), 12),
-		"buy_markup_percent_1500_1999": _parse_float(await db.get_setting("buy_markup_percent_1500_1999", "11"), 11),
-		"buy_markup_percent_2000_plus": _parse_float(await db.get_setting("buy_markup_percent_2000_plus", "10"), 10),
+		# 🇧🇾 Надбавки Беларусь
+		"byn_markup_0_100": _parse_float(await db.get_setting("byn_markup_0_100", "15"), 15),
+		"byn_markup_101_449": _parse_float(await db.get_setting("byn_markup_101_449", "11"), 11),
+		"byn_markup_450_699": _parse_float(await db.get_setting("byn_markup_450_699", "9"), 9),
+		"byn_markup_700_999": _parse_float(await db.get_setting("byn_markup_700_999", "8"), 8),
+		"byn_markup_1000_1499": _parse_float(await db.get_setting("byn_markup_1000_1499", "7"), 7),
+		"byn_markup_1500_1999": _parse_float(await db.get_setting("byn_markup_1500_1999", "6"), 6),
+		"byn_markup_2000_plus": _parse_float(await db.get_setting("byn_markup_2000_plus", "5"), 5),
+		# 🇷🇺 Надбавки Россия
+		"rub_markup_0_30": _parse_float(await db.get_setting("rub_markup_0_30", "18"), 18),
+		"rub_markup_31_50": _parse_float(await db.get_setting("rub_markup_31_50", "16"), 16),
+		"rub_markup_51_70": _parse_float(await db.get_setting("rub_markup_51_70", "15"), 15),
+		"rub_markup_71_100": _parse_float(await db.get_setting("rub_markup_71_100", "14"), 14),
+		"rub_markup_101_449": _parse_float(await db.get_setting("rub_markup_101_449", "12"), 12),
+		"rub_markup_450_699": _parse_float(await db.get_setting("rub_markup_450_699", "10"), 10),
+		"rub_markup_700_999": _parse_float(await db.get_setting("rub_markup_700_999", "8"), 8),
+		"rub_markup_1000_1999": _parse_float(await db.get_setting("rub_markup_1000_1999", "7"), 7),
+		"rub_markup_2000_plus": _parse_float(await db.get_setting("rub_markup_2000_plus", "5"), 5),
+		# Общие настройки
 		"buy_min_usd": _parse_float(await db.get_setting("buy_min_usd", "15"), 15),
+		"buy_max_usd": _parse_float(await db.get_setting("buy_max_usd", "7000"), 7000),
 		"buy_extra_fee_usd_low": _parse_float(await db.get_setting("buy_extra_fee_usd_low", "50"), 50),
 		"buy_extra_fee_usd_mid": _parse_float(await db.get_setting("buy_extra_fee_usd_mid", "67"), 67),
 		"buy_extra_fee_low_byn": _parse_float(await db.get_setting("buy_extra_fee_low_byn", "10"), 10),
@@ -2321,14 +2342,26 @@ async def settings_buy_calc(cb: CallbackQuery):
 	await safe_edit_text(
 		cb.message,
 		"🧮 Настройки расчета покупки:\n\n"
-		f"📉 $0-100: {settings['buy_markup_percent_small']}%\n"
-		f"📈 $101-449: {settings['buy_markup_percent_101_449']}%\n"
-		f"📈 $450-699: {settings['buy_markup_percent_450_699']}%\n"
-		f"📈 $700-999: {settings['buy_markup_percent_700_999']}%\n"
-		f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%\n"
-		f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%\n"
-		f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%\n"
+		"🇧🇾 <b>Беларусь:</b>\n"
+		f"🇧🇾 $0-100: {settings['byn_markup_0_100']}%\n"
+		f"🇧🇾 $101-449: {settings['byn_markup_101_449']}%\n"
+		f"🇧🇾 $450-699: {settings['byn_markup_450_699']}%\n"
+		f"🇧🇾 $700-999: {settings['byn_markup_700_999']}%\n"
+		f"🇧🇾 $1000-1499: {settings['byn_markup_1000_1499']}%\n"
+		f"🇧🇾 $1500-1999: {settings['byn_markup_1500_1999']}%\n"
+		f"🇧🇾 $2000+: {settings['byn_markup_2000_plus']}%\n\n"
+		"🇷🇺 <b>Россия:</b>\n"
+		f"🇷🇺 $0-30: {settings['rub_markup_0_30']}%\n"
+		f"🇷🇺 $31-50: {settings['rub_markup_31_50']}%\n"
+		f"🇷🇺 $51-70: {settings['rub_markup_51_70']}%\n"
+		f"🇷🇺 $71-100: {settings['rub_markup_71_100']}%\n"
+		f"🇷🇺 $101-449: {settings['rub_markup_101_449']}%\n"
+		f"🇷🇺 $450-699: {settings['rub_markup_450_699']}%\n"
+		f"🇷🇺 $700-999: {settings['rub_markup_700_999']}%\n"
+		f"🇷🇺 $1000-1999: {settings['rub_markup_1000_1999']}%\n"
+		f"🇷🇺 $2000+: {settings['rub_markup_2000_plus']}%\n\n"
 		f"✅ Мин. сумма сделки: {settings['buy_min_usd']}$\n"
+		f"🛑 Макс. сумма сделки: {settings['buy_max_usd']}$\n"
 		f"💵 Порог 1: &lt; {settings['buy_extra_fee_usd_low']}$\n"
 		f"💵 Порог 2: &lt; {settings['buy_extra_fee_usd_mid']}$\n"
 		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
@@ -2392,21 +2425,34 @@ async def settings_buy_calc_save(message: Message, state: FSMContext):
 	settings = await _get_buy_calc_settings(db)
 	await message.answer(
 		"🧮 Настройки расчета покупки:\n\n"
-		f"📉 $0-100: {settings['buy_markup_percent_small']}%\n"
-		f"📈 $101-449: {settings['buy_markup_percent_101_449']}%\n"
-		f"📈 $450-699: {settings['buy_markup_percent_450_699']}%\n"
-		f"📈 $700-999: {settings['buy_markup_percent_700_999']}%\n"
-		f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%\n"
-		f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%\n"
-		f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%\n"
+		"🇧🇾 <b>Беларусь:</b>\n"
+		f"🇧🇾 $0-100: {settings['byn_markup_0_100']}%\n"
+		f"🇧🇾 $101-449: {settings['byn_markup_101_449']}%\n"
+		f"🇧🇾 $450-699: {settings['byn_markup_450_699']}%\n"
+		f"🇧🇾 $700-999: {settings['byn_markup_700_999']}%\n"
+		f"🇧🇾 $1000-1499: {settings['byn_markup_1000_1499']}%\n"
+		f"🇧🇾 $1500-1999: {settings['byn_markup_1500_1999']}%\n"
+		f"🇧🇾 $2000+: {settings['byn_markup_2000_plus']}%\n\n"
+		"🇷🇺 <b>Россия:</b>\n"
+		f"🇷🇺 $0-30: {settings['rub_markup_0_30']}%\n"
+		f"🇷🇺 $31-50: {settings['rub_markup_31_50']}%\n"
+		f"🇷🇺 $51-70: {settings['rub_markup_51_70']}%\n"
+		f"🇷🇺 $71-100: {settings['rub_markup_71_100']}%\n"
+		f"🇷🇺 $101-449: {settings['rub_markup_101_449']}%\n"
+		f"🇷🇺 $450-699: {settings['rub_markup_450_699']}%\n"
+		f"🇷🇺 $700-999: {settings['rub_markup_700_999']}%\n"
+		f"🇷🇺 $1000-1999: {settings['rub_markup_1000_1999']}%\n"
+		f"🇷🇺 $2000+: {settings['rub_markup_2000_plus']}%\n\n"
 		f"✅ Мин. сумма сделки: {settings['buy_min_usd']}$\n"
+		f"🛑 Макс. сумма сделки: {settings['buy_max_usd']}$\n"
 		f"💵 Порог 1: &lt; {settings['buy_extra_fee_usd_low']}$\n"
 		f"💵 Порог 2: &lt; {settings['buy_extra_fee_usd_mid']}$\n"
 		f"➕ BYN: +{settings['buy_extra_fee_low_byn']} / +{settings['buy_extra_fee_mid_byn']}\n"
 		f"➕ RUB: +{settings['buy_extra_fee_low_rub']} / +{settings['buy_extra_fee_mid_rub']}\n"
 		f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}\n"
-		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (обновляется автоматически)\n"
-		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (обновляется автоматически)\n\n"
+		f"💱 USD→BYN: {settings['buy_usd_to_byn_rate']} (авто)\n"
+		f"💱 USD→RUB: {settings['buy_usd_to_rub_rate']} (авто)\n"
+		f"🪙 Обновление курсов крипты: каждые {settings['crypto_rates_update_interval']} мин\n\n"
 		"Выберите параметр для редактирования:",
 		reply_markup=buy_calc_settings_kb(settings),
 	)
@@ -2563,6 +2609,57 @@ async def settings_mempool_save(message: Message, state: FSMContext):
 		"Выберите параметр для редактирования:",
 		reply_markup=mempool_settings_kb(check_interval, max_attempts, initial_delay)
 	)
+
+
+@admin_router.callback_query(F.data == "settings:deal_time_limit")
+async def settings_deal_time_limit(cb: CallbackQuery, state: FSMContext):
+	"""Показывает настройку времени на сделку и запрашивает ввод"""
+	db = get_db()
+	time_limit_str = await db.get_setting("deal_time_limit_minutes", "30")
+	try:
+		time_limit = int(float(time_limit_str)) if time_limit_str else 30
+	except (ValueError, TypeError):
+		time_limit = 30
+	
+	await state.set_state(DealTimeLimitEditStates.waiting_value)
+	await safe_edit_text(
+		cb.message,
+		f"⏱ Время на сделку\n\n"
+		f"После выдачи реквизитов пользователю даётся указанное время на оплату.\n"
+		f"За 10 минут до окончания пользователь получит уведомление.\n"
+		f"По истечении времени сделка автоматически отменяется.\n\n"
+		f"⏳ Текущее значение: <b>{time_limit} мин</b>\n\n"
+		f"Введите новое значение (в минутах):",
+		reply_markup=simple_back_kb("admin:settings")
+	)
+	await cb.answer()
+
+
+@admin_router.message(DealTimeLimitEditStates.waiting_value)
+async def settings_deal_time_limit_save(message: Message, state: FSMContext):
+	"""Сохраняет новое время на сделку"""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	
+	value_str = message.text.strip().replace(",", ".")
+	try:
+		value = int(float(value_str))
+		if value < 5:
+			await message.answer("❌ Минимальное время — 5 минут. Введите число:")
+			return
+		if value > 1440:
+			await message.answer("❌ Максимальное время — 1440 минут (24 часа). Введите число:")
+			return
+	except ValueError:
+		await message.answer("❌ Неверный формат. Введите целое число (например: 30):")
+		return
+	
+	db = get_db()
+	await db.set_setting("deal_time_limit_minutes", str(value))
+	await state.clear()
+	await message.answer(f"✅ Время на сделку обновлено: {value} мин")
 
 
 @admin_router.callback_query(F.data == "settings:currency_rates")
@@ -4422,6 +4519,10 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 	except Exception as e:
 		logger.warning(f"⚠️ Ошибка обновления сообщения пользователя для deal_id={deal_id}: {e}")
 	await db.update_buy_deal_fields(deal_id, status="await_payment")
+	# Запускаем таймер на сделку после назначения реквизитов
+	from app.main import start_deal_timer, cancel_deal_timer
+	import asyncio
+	asyncio.create_task(start_deal_timer(bot, deal_id))
 	from app.main import update_buy_deal_alert, _build_deal_chat_lines, _build_user_deal_with_requisites_chat_text
 	try:
 		# Удаляем старое уведомление о реквизитах, если было
@@ -4683,7 +4784,7 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 	was_admin_amount_set = bool(deal.get("admin_amount_set", 0))
 	
 	# Если это крупная сделка и сумма была установлена админом впервые (было False, стало True)
-	# и есть реквизиты, отправляем уведомление
+	# и есть реквизиты, отправляем уведомление и запускаем таймер
 	if is_large_order and not was_admin_amount_set and requisites_text:
 		try:
 			notice = await bot.send_message(
@@ -4694,6 +4795,10 @@ async def deal_alert_amount_save(message: Message, state: FSMContext, bot: Bot):
 			logger.info(f"✅ Уведомление о реквизитах отправлено пользователю {deal['user_tg_id']} для deal_id={deal_id}")
 		except Exception as e:
 			logger.warning(f"⚠️ Ошибка отправки уведомления о реквизитах пользователю {deal['user_tg_id']}: {e}")
+		# Запускаем таймер на сделку
+		from app.main import start_deal_timer
+		import asyncio
+		asyncio.create_task(start_deal_timer(bot, deal_id))
 	
 	from app.main import delete_user_message
 	await delete_user_message(message)
@@ -4948,6 +5053,9 @@ async def deal_alert_cancel(cb: CallbackQuery, bot: Bot):
 	if not deal:
 		await cb.answer("Сделка не найдена", show_alert=True)
 		return
+	# Отменяем таймер сделки
+	from app.main import cancel_deal_timer
+	cancel_deal_timer(deal_id)
 	await db.update_buy_deal_fields(deal_id, status="cancelled")
 	# Обновляем сообщение пользователя
 	try:
@@ -4991,6 +5099,10 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	except (ValueError, IndexError):
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
+	
+	# Отменяем таймер сделки
+	from app.main import cancel_deal_timer
+	cancel_deal_timer(deal_id)
 	
 	# Валидация deal_id
 	from app.validators import validate_deal_id
@@ -6364,7 +6476,7 @@ async def add_data_enter_card_cash(message: Message, state: FSMContext):
 			db = get_db()
 			group = await db.get_card_group_by_id(card_data["group_id"])
 			if group:
-				currency = group.get("currency", "BYN")
+				currency = group.get("currency") or "BYN"
 			logger.info(
 				f"💱 Определена валюта карты: card_id={card_data.get('card_id')}, "
 				f"card_name={card_data.get('card_name')}, group_id={card_data.get('group_id')}, "
@@ -7386,84 +7498,101 @@ async def add_data_confirm(cb: CallbackQuery, state: FSMContext, bot: Bot):
 			
 			# Профит за сегодня и средний профит (только для режима /add)
 			if mode == "add":
-					try:
-						# Определяем текущий день недели
-						today = datetime.now()
-						weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+				try:
+					# Определяем текущий день недели
+					today = datetime.now()
+					weekday = today.weekday()  # 0 = Monday, 6 = Sunday
+					
+					day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+					day_name = day_names[weekday]
+					
+					# Собираем все адреса ячеек для профитов для batch чтения
+					profit_cells_to_read = {}  # {cell_address: day_name}
+					
+					# Получаем ячейку профита за текущий день
+					profit_cell_key = f"profit_{day_name}"
+					profit_cell = await db.get_google_sheets_setting(profit_cell_key)
+					if profit_cell:
+						profit_cells_to_read[profit_cell] = day_name
+					
+					logger.info(f"📊 Профит за день: day_name={day_name}, weekday={weekday}, today_cell_key={profit_cell_key}, today_cell={profit_cell}")
+					
+					# Собираем адреса ячеек для среднего профита (если не понедельник)
+					if weekday != 0:  # 0 = понедельник
+						profit_days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+						# Берем только дни с понедельника до текущего дня включительно
+						profit_days = profit_days_all[:weekday + 1]
 						
-						day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-						day_name = day_names[weekday]
+						for day in profit_days:
+							day_cell_key = f"profit_{day}"
+							day_cell = await db.get_google_sheets_setting(day_cell_key)
+							if day_cell and day_cell not in profit_cells_to_read:
+								profit_cells_to_read[day_cell] = day
+					
+					logger.info(f"📊 Все ячейки профитов: {profit_cells_to_read}")
+					
+					# Читаем все профиты одним batch запросом
+					if profit_cells_to_read:
+						from app.google_sheets import read_profits_batch
+						cell_addresses = list(profit_cells_to_read.keys())
+						profits_data = await read_profits_batch(
+							settings.google_sheet_id,
+							settings.google_credentials_path,
+							cell_addresses,
+							settings.google_sheet_name
+						)
 						
-						# Собираем все адреса ячеек для профитов для batch чтения
-						profit_cells_to_read = {}  # {cell_address: day_name}
+						logger.info(f"📊 Прочитанные профиты: {profits_data}")
 						
-						# Получаем ячейку профита за текущий день
-						profit_cell_key = f"profit_{day_name}"
-						profit_cell = await db.get_google_sheets_setting(profit_cell_key)
-						if profit_cell:
-							profit_cells_to_read[profit_cell] = day_name
+						# Обрабатываем профит за сегодня
+						today_cell = None
+						for cell, day in profit_cells_to_read.items():
+							if day == day_name:
+								today_cell = cell
+								break
 						
-						# Собираем адреса ячеек для среднего профита (если не понедельник)
-						if weekday != 0:  # 0 = понедельник
-							profit_days_all = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-							# Берем только дни с понедельника до текущего дня включительно
-							profit_days = profit_days_all[:weekday + 1]
-							
-							for day in profit_days:
-								profit_cell_key = f"profit_{day}"
-								profit_cell = await db.get_google_sheets_setting(profit_cell_key)
-								if profit_cell and profit_cell not in profit_cells_to_read:
-									profit_cells_to_read[profit_cell] = day
+						logger.info(f"📊 Today cell: {today_cell}, in profits_data: {today_cell in profits_data if today_cell else 'N/A'}")
 						
-						# Читаем все профиты одним batch запросом
-						if profit_cells_to_read:
-							from app.google_sheets import read_profits_batch
-							cell_addresses = list(profit_cells_to_read.keys())
-							profits_data = await read_profits_batch(
-								settings.google_sheet_id,
-								settings.google_credentials_path,
-								cell_addresses,
-								settings.google_sheet_name
-							)
-							
-							# Обрабатываем профит за сегодня
-							if day_name in profit_cells_to_read.values():
-								# Находим ячейку для сегодняшнего дня
-								today_cell = None
-								for cell, day in profit_cells_to_read.items():
-									if day == day_name:
-										today_cell = cell
-										break
-								
-								if today_cell and today_cell in profits_data:
-									profit_today = profits_data[today_cell]
-									if profit_today:
+						if today_cell and today_cell in profits_data:
+							profit_today = profits_data[today_cell]
+							logger.info(f"📊 profit_today={profit_today!r}, type={type(profit_today).__name__}, bool={bool(profit_today)}")
+							if profit_today is not None and str(profit_today).strip():
+								try:
+									profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
+									formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
+									profit_section_lines.append(f"  📈 Профит за сегодня: <code>{formatted_profit} USD</code>")
+									logger.info(f"📊 ✅ Добавлен профит за сегодня: {formatted_profit} USD")
+								except (ValueError, AttributeError) as e:
+									profit_section_lines.append(f"  📈 Профит за сегодня: <code>{profit_today} USD</code>")
+									logger.info(f"📊 ✅ Добавлен профит за сегодня (raw): {profit_today} USD, ошибка парсинга: {e}")
+							else:
+								logger.warning(f"📊 ⚠️ profit_today пустой или None: {profit_today!r}")
+						elif today_cell:
+							logger.warning(f"📊 ⚠️ today_cell={today_cell} не найден в profits_data. Ключи: {list(profits_data.keys())}")
+						else:
+							logger.warning(f"📊 ⚠️ today_cell не найден для day_name={day_name}. profit_cells_to_read values: {list(profit_cells_to_read.values())}")
+						
+						# Обрабатываем средний профит (если не понедельник)
+						if weekday != 0:
+							profit_values = []
+							for cell_address, day in profit_cells_to_read.items():
+								if cell_address in profits_data:
+									pv = profits_data[cell_address]
+									if pv is not None and str(pv).strip():
 										try:
-											profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
-											formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
-											profit_section_lines.append(f"  📈 Профит за сегодня: <code>{formatted_profit} USD</code>")
+											value = float(str(pv).replace(",", ".").replace(" ", ""))
+											profit_values.append(value)
 										except (ValueError, AttributeError):
-											profit_section_lines.append(f"  📈 Профит за сегодня: <code>{profit_today} USD</code>")
+											pass
 							
-							# Обрабатываем средний профит (если не понедельник)
-							if weekday != 0:
-								profit_values = []
-								for cell_address, day in profit_cells_to_read.items():
-									if cell_address in profits_data:
-										profit_value = profits_data[cell_address]
-										if profit_value:
-											try:
-												value = float(str(profit_value).replace(",", ".").replace(" ", ""))
-												profit_values.append(value)
-											except (ValueError, AttributeError):
-												pass
-								
-								if profit_values:
-									avg_profit = sum(profit_values) / len(profit_values)
-									formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
-									profit_section_lines.append(f"  📊 Средний профит в день: <code>{formatted_avg} USD</code>")
-					except Exception as e:
-						logger.warning(f"Ошибка получения профита за сегодня и среднего профита: {e}")
+							if profit_values:
+								avg_profit = sum(profit_values) / len(profit_values)
+								formatted_avg = f"{int(round(avg_profit)):,}".replace(",", " ")
+								profit_section_lines.append(f"  📊 Средний профит в день: <code>{formatted_avg} USD</code>")
+					else:
+						logger.warning(f"📊 ⚠️ profit_cells_to_read пуст — настройки profit_* не заданы в БД")
+				except Exception as e:
+					logger.warning(f"Ошибка получения профита за сегодня и среднего профита: {e}", exc_info=True)
 			
 			# Добавляем раздел с профитом в отчет, если есть данные
 			if profit_section_lines:
@@ -7526,7 +7655,7 @@ async def admin_cards(cb: CallbackQuery):
 	await cb.answer()
 
 
-@admin_router.callback_query(F.data.startswith("cards:group:"))
+@admin_router.callback_query(F.data.startswith("cards:group:") & ~F.data.startswith("cards:group_currency:"))
 async def cards_group_view(cb: CallbackQuery):
 	"""Показывает карты выбранной группы или карты вне групп"""
 	db = get_db()
@@ -7536,16 +7665,17 @@ async def cards_group_view(cb: CallbackQuery):
 	if group_id:
 		# Получаем карты из группы
 		cards = await db.get_cards_by_group(group_id)
-		group = await db.get_card_group(group_id)
+		group = await db.get_card_group_by_id(group_id)
 		group_name = group.get("name", "Группа") if group else "Группа"
-		text = f"Карты группы '{group_name}':" if cards else f"В группе '{group_name}' нет карт."
+		group_currency = group.get("currency", "BYN") if group else "BYN"
+		text = f"Карты группы '{group_name}':\n💱 Валюта: {group_currency}" if cards else f"В группе '{group_name}' нет карт.\n💱 Валюта: {group_currency}"
 		
 		# Преобразуем формат карт из (id, name, details) в (id, name)
 		cards_list = [(c[0], c[1]) for c in cards]
 		
 		logger.debug(f"Show cards for group_id={group_id}, count={len(cards_list)}")
 		
-		await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards", group_id=group_id))
+		await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards", group_id=group_id, show_currency_btn=True))
 	else:
 		# Получаем карты без группы
 		cards = await db.get_cards_without_group()
@@ -7559,6 +7689,35 @@ async def cards_group_view(cb: CallbackQuery):
 		await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards"))
 	
 	await cb.answer()
+
+
+@admin_router.callback_query(F.data.startswith("cards:group_currency:"))
+async def cards_group_currency_toggle(cb: CallbackQuery):
+	"""Переключает валюту группы между BYN и RUB"""
+	db = get_db()
+	group_id = int(cb.data.split(":")[-1])
+	
+	group = await db.get_card_group_by_id(group_id)
+	if not group:
+		await cb.answer("Группа не найдена", show_alert=True)
+		return
+	
+	# Переключаем валюту
+	current_currency = group.get("currency", "BYN")
+	new_currency = "RUB" if current_currency == "BYN" else "BYN"
+	
+	await db.update_card_group_currency(group_id, new_currency)
+	logger.info(f"💱 Валюта группы '{group['name']}' (id={group_id}) изменена: {current_currency} → {new_currency}")
+	
+	# Обновляем отображение
+	cards = await db.get_cards_by_group(group_id)
+	group_name = group.get("name", "Группа")
+	text = f"Карты группы '{group_name}':\n💱 Валюта: {new_currency}" if cards else f"В группе '{group_name}' нет карт.\n💱 Валюта: {new_currency}"
+	
+	cards_list = [(c[0], c[1]) for c in cards]
+	
+	await cb.message.edit_text(text, reply_markup=cards_list_kb(cards_list, back_to="admin:cards", group_id=group_id, show_currency_btn=True))
+	await cb.answer(f"✅ Валюта группы изменена на {new_currency}")
 
 
 @admin_router.callback_query(F.data.startswith("cards:delete_group:"))
@@ -9302,33 +9461,31 @@ async def _update_crypto_values_in_stats(
 				)
 				
 				# Обрабатываем профит за сегодня
-				if day_name in profit_cells_to_read.values():
-					# Находим ячейку для сегодняшнего дня
-					today_cell = None
-					for cell, day in profit_cells_to_read.items():
-						if day == day_name:
-							today_cell = cell
-							break
-					
-					if today_cell and today_cell in profits_data:
-						profit_today = profits_data[today_cell]
-						if profit_today:
-							try:
-								profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
-								formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
-								profit_lines.append(f"<code>📈 Профит за сегодня: {formatted_profit} USD</code>")
-							except (ValueError, AttributeError):
-								profit_lines.append(f"<code>📈 Профит за сегодня: {profit_today} USD</code>")
+				today_cell = None
+				for cell, day in profit_cells_to_read.items():
+					if day == day_name:
+						today_cell = cell
+						break
+				
+				if today_cell and today_cell in profits_data:
+					profit_today = profits_data[today_cell]
+					if profit_today is not None and str(profit_today).strip():
+						try:
+							profit_value = float(str(profit_today).replace(",", ".").replace(" ", ""))
+							formatted_profit = f"{int(round(profit_value)):,}".replace(",", " ")
+							profit_lines.append(f"<code>📈 Профит за сегодня: {formatted_profit} USD</code>")
+						except (ValueError, AttributeError):
+							profit_lines.append(f"<code>📈 Профит за сегодня: {profit_today} USD</code>")
 				
 				# Обрабатываем средний профит (если не понедельник)
 				if weekday != 0:
 					profit_values = []
 					for cell_address, day in profit_cells_to_read.items():
 						if cell_address in profits_data:
-							profit_value = profits_data[cell_address]
-							if profit_value:
+							pv = profits_data[cell_address]
+							if pv is not None and str(pv).strip():
 								try:
-									value = float(str(profit_value).replace(",", ".").replace(" ", ""))
+									value = float(str(pv).replace(",", ".").replace(" ", ""))
 									profit_values.append(value)
 								except (ValueError, AttributeError):
 									pass

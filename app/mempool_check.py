@@ -3,6 +3,8 @@ import aiohttp
 import logging
 from typing import Optional
 
+from app.http_session import get_session
+
 logger = logging.getLogger("app.mempool_check")
 
 
@@ -24,8 +26,8 @@ async def check_btc_transaction(wallet_address: str) -> tuple[bool, Optional[str
 	api_url = f"https://mempool.space/api/address/{wallet_address}"
 	
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+		session = get_session()
+		async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
 				if response.status == 200:
 					data = await response.json()
 					chain_stats = data.get("chain_stats", {})

@@ -14,6 +14,8 @@ except ImportError:
 	aiohttp = None
 	BeautifulSoup = None
 
+from app.http_session import get_session
+
 logger = logging.getLogger("app.currency_rates")
 
 # Счетчики неудачных попыток
@@ -53,8 +55,8 @@ async def get_usd_to_byn_rate(bot=None) -> Optional[float]:
 	url = "https://myfin.by/currency/minsk?utm_source=myfin&utm_medium=organic&utm_campaign=menu&working=0"
 	
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+		session = get_session()
+		async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
 				if response.status != 200:
 					logger.warning(f"⚠️ Не удалось получить курс BYN: HTTP {response.status}")
 					_failure_count_byn += 1
@@ -155,8 +157,8 @@ async def get_usd_to_rub_rate(bot=None) -> Optional[float]:
 		headers = {
 			'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 		}
-		async with aiohttp.ClientSession() as session:
-			async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+		session = get_session()
+		async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
 				if response.status != 200:
 					logger.warning(f"⚠️ Не удалось получить курс RUB: HTTP {response.status}")
 					_failure_count_rub += 1

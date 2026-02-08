@@ -117,15 +117,16 @@ def buy_deal_paid_kb() -> InlineKeyboardMarkup:
 
 
 def buy_deal_paid_reply_kb(deal_id: int, show_how_pay: bool = False) -> InlineKeyboardMarkup:
-	"""Inline-клавиатура оплаты + написать."""
+	"""Inline-клавиатура оплаты + отмена + написать."""
 	kb = InlineKeyboardBuilder()
-	kb.button(text="ОПЛАТИЛ", callback_data="deal:paid")
+	kb.button(text="✅ОПЛАТИЛ✅", callback_data="deal:paid")
+	kb.button(text="❌ОТМЕНИТЬ СДЕЛКУ❌", callback_data=f"deal:cancel:{deal_id}")
 	kb.button(text="💬 Написать", callback_data=f"deal:user:reply:{deal_id}")
 	if show_how_pay:
 		kb.button(text="❓ Как платить", callback_data=f"deal:user:how_pay:{deal_id}")
-		kb.adjust(1, 1, 1)
+		kb.adjust(1, 1, 2)
 	else:
-		kb.adjust(1, 1)
+		kb.adjust(1, 1, 1)
 	return kb.as_markup()
 
 
@@ -199,6 +200,7 @@ def admin_settings_kb(one_card_for_all_enabled: bool = False, notify_on_deposit_
 	notify_text = "✅ Оповещать о зачислении" if notify_on_deposit_enabled else "❌ Оповещать о зачислении"
 	kb.button(text=notify_text, callback_data="settings:notify_on_deposit")
 	kb.button(text="🔍 Мемпул", callback_data="settings:mempool")
+	kb.button(text="⏱ Время на сделку", callback_data="settings:deal_time_limit")
 	# Кнопка выключения бота: зеленая галочка если выключен, красный крест если включен
 	bot_toggle_text = "✅ Выключить бота" if bot_disabled else "❌ Выключить бота"
 	kb.button(text=bot_toggle_text, callback_data="settings:bot_toggle")
@@ -275,7 +277,7 @@ def cards_groups_kb(groups: List[Dict], back_to: str = "admin:back") -> InlineKe
 	return kb.as_markup()
 
 
-def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: str = "admin:cards", group_id: Optional[int] = None, card_groups: Optional[Dict[int, str]] = None) -> InlineKeyboardMarkup:
+def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: str = "admin:cards", group_id: Optional[int] = None, card_groups: Optional[Dict[int, str]] = None, show_currency_btn: bool = False) -> InlineKeyboardMarkup:
 	"""
 	Создает клавиатуру для списка карт.
 	
@@ -300,8 +302,10 @@ def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: 
 	if with_add:
 		kb.button(text="➕ Добавить карту", callback_data="card:add")
 	
-	# Если это список карт группы, показываем кнопку "Удалить группу"
+	# Если это список карт группы, показываем кнопки управления группой
 	if group_id is not None:
+		if show_currency_btn:
+			kb.button(text="💱 Изменить валюту", callback_data=f"cards:group_currency:{group_id}")
 		kb.button(text="🗑️ Удалить группу", callback_data=f"cards:delete_group:{group_id}")
 	
 	kb.button(text="⬅️ Назад", callback_data=back_to)
@@ -311,6 +315,8 @@ def cards_list_kb(cards: List[Tuple[int, str]], with_add: bool = True, back_to: 
 	additional_buttons = 1  # Назад (всегда есть)
 	if group_id is not None:
 		additional_buttons += 1  # Удалить группу
+		if show_currency_btn:
+			additional_buttons += 1  # Изменить валюту
 	if with_add:
 		additional_buttons += 1  # Добавить карту
 	
@@ -1323,20 +1329,32 @@ def markup_percents_settings_kb(percent_small: float, percent_large: float) -> I
 def buy_calc_settings_kb(settings: dict) -> InlineKeyboardMarkup:
 	"""Клавиатура для настройки расчета покупки"""
 	kb = InlineKeyboardBuilder()
-	kb.button(text=f"📉 $0-100: {settings['buy_markup_percent_small']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_small")
-	kb.button(text=f"📈 $101-449: {settings['buy_markup_percent_101_449']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_101_449")
-	kb.button(text=f"📈 $450-699: {settings['buy_markup_percent_450_699']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_450_699")
-	kb.button(text=f"📈 $700-999: {settings['buy_markup_percent_700_999']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_700_999")
-	kb.button(text=f"📈 $1000-1499: {settings['buy_markup_percent_1000_1499']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_1000_1499")
-	kb.button(text=f"📈 $1500-1999: {settings['buy_markup_percent_1500_1999']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_1500_1999")
-	kb.button(text=f"📈 $2000+: {settings['buy_markup_percent_2000_plus']}%", callback_data="settings:buy_calc:edit:buy_markup_percent_2000_plus")
+	# 🇧🇾 Беларусь
+	kb.button(text=f"🇧🇾 $0-100: {settings['byn_markup_0_100']}%", callback_data="settings:buy_calc:edit:byn_markup_0_100")
+	kb.button(text=f"🇧🇾 $101-449: {settings['byn_markup_101_449']}%", callback_data="settings:buy_calc:edit:byn_markup_101_449")
+	kb.button(text=f"🇧🇾 $450-699: {settings['byn_markup_450_699']}%", callback_data="settings:buy_calc:edit:byn_markup_450_699")
+	kb.button(text=f"🇧🇾 $700-999: {settings['byn_markup_700_999']}%", callback_data="settings:buy_calc:edit:byn_markup_700_999")
+	kb.button(text=f"🇧🇾 $1000-1499: {settings['byn_markup_1000_1499']}%", callback_data="settings:buy_calc:edit:byn_markup_1000_1499")
+	kb.button(text=f"🇧🇾 $1500-1999: {settings['byn_markup_1500_1999']}%", callback_data="settings:buy_calc:edit:byn_markup_1500_1999")
+	kb.button(text=f"🇧🇾 $2000+: {settings['byn_markup_2000_plus']}%", callback_data="settings:buy_calc:edit:byn_markup_2000_plus")
+	# 🇷🇺 Россия
+	kb.button(text=f"🇷🇺 $0-30: {settings['rub_markup_0_30']}%", callback_data="settings:buy_calc:edit:rub_markup_0_30")
+	kb.button(text=f"🇷🇺 $31-50: {settings['rub_markup_31_50']}%", callback_data="settings:buy_calc:edit:rub_markup_31_50")
+	kb.button(text=f"🇷🇺 $51-70: {settings['rub_markup_51_70']}%", callback_data="settings:buy_calc:edit:rub_markup_51_70")
+	kb.button(text=f"🇷🇺 $71-100: {settings['rub_markup_71_100']}%", callback_data="settings:buy_calc:edit:rub_markup_71_100")
+	kb.button(text=f"🇷🇺 $101-449: {settings['rub_markup_101_449']}%", callback_data="settings:buy_calc:edit:rub_markup_101_449")
+	kb.button(text=f"🇷🇺 $450-699: {settings['rub_markup_450_699']}%", callback_data="settings:buy_calc:edit:rub_markup_450_699")
+	kb.button(text=f"🇷🇺 $700-999: {settings['rub_markup_700_999']}%", callback_data="settings:buy_calc:edit:rub_markup_700_999")
+	kb.button(text=f"🇷🇺 $1000-1999: {settings['rub_markup_1000_1999']}%", callback_data="settings:buy_calc:edit:rub_markup_1000_1999")
+	kb.button(text=f"🇷🇺 $2000+: {settings['rub_markup_2000_plus']}%", callback_data="settings:buy_calc:edit:rub_markup_2000_plus")
+	# Общие настройки
 	kb.button(text=f"✅ Мин $: {settings['buy_min_usd']}", callback_data="settings:buy_calc:edit:buy_min_usd")
+	kb.button(text=f"🛑 Макс $: {settings['buy_max_usd']}", callback_data="settings:buy_calc:edit:buy_max_usd")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +BYN {settings['buy_extra_fee_low_byn']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_byn")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +BYN {settings['buy_extra_fee_mid_byn']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_byn")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_low']}: +RUB {settings['buy_extra_fee_low_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_low_rub")
 	kb.button(text=f"💵 $< {settings['buy_extra_fee_usd_mid']}: +RUB {settings['buy_extra_fee_mid_rub']}", callback_data="settings:buy_calc:edit:buy_extra_fee_mid_rub")
 	kb.button(text=f"🚨 Алерт от $: {settings['buy_alert_usd_threshold']}", callback_data="settings:buy_calc:edit:buy_alert_usd_threshold")
-	# Интервал обновления курсов криптовалют
 	crypto_interval = settings.get('crypto_rates_update_interval', 5)
 	kb.button(text=f"🪙 Обновление курсов: {crypto_interval} мин", callback_data="settings:buy_calc:edit:crypto_rates_update_interval")
 	kb.button(text="⬅️ Назад", callback_data="admin:settings")

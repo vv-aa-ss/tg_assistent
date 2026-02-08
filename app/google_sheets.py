@@ -11,6 +11,7 @@ from google.oauth2.service_account import Credentials
 import aiohttp
 
 from app.di import get_db
+from app.http_session import get_session
 
 logger = logging.getLogger("app.google_sheets")
 
@@ -57,8 +58,8 @@ def _get_worksheet(spreadsheet: gspread.Spreadsheet, sheet_name: Optional[str] =
 async def _get_btc_from_binance() -> Optional[float]:
 	"""Получает курс BTC/USDT с Binance API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -75,8 +76,8 @@ async def _get_btc_from_binance() -> Optional[float]:
 async def _get_btc_from_coinbase() -> Optional[float]:
 	"""Получает курс BTC/USD с Coinbase API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coinbase.com/v2/exchange-rates?currency=BTC",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -93,8 +94,8 @@ async def _get_btc_from_coinbase() -> Optional[float]:
 async def _get_btc_from_coingecko() -> Optional[float]:
 	"""Получает курс BTC/USD с CoinGecko API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -295,8 +296,8 @@ async def get_btc_price_usd() -> Optional[float]:
 async def _get_ltc_from_binance() -> Optional[float]:
 	"""Получает курс LTC/USDT с Binance API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.binance.com/api/v3/ticker/price?symbol=LTCUSDT",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -313,8 +314,8 @@ async def _get_ltc_from_binance() -> Optional[float]:
 async def _get_ltc_from_coinbase() -> Optional[float]:
 	"""Получает курс LTC/USD с Coinbase API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coinbase.com/v2/exchange-rates?currency=LTC",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -331,8 +332,8 @@ async def _get_ltc_from_coinbase() -> Optional[float]:
 async def _get_ltc_from_coingecko() -> Optional[float]:
 	"""Получает курс LTC/USD с CoinGecko API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -370,8 +371,8 @@ async def get_ltc_price_usd() -> Optional[float]:
 async def _get_xmr_from_binance() -> Optional[float]:
 	"""Получает курс XMR/USDT с Binance API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.binance.com/api/v3/ticker/price?symbol=XMRUSDT",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -388,8 +389,8 @@ async def _get_xmr_from_binance() -> Optional[float]:
 async def _get_xmr_from_coinbase() -> Optional[float]:
 	"""Получает курс XMR/USD с Coinbase API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coinbase.com/v2/exchange-rates?currency=XMR",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -406,8 +407,8 @@ async def _get_xmr_from_coinbase() -> Optional[float]:
 async def _get_xmr_from_coingecko() -> Optional[float]:
 	"""Получает курс XMR/USD с CoinGecko API"""
 	try:
-		async with aiohttp.ClientSession() as session:
-			async with session.get(
+		session = get_session()
+		async with session.get(
 				"https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=usd",
 				timeout=aiohttp.ClientTimeout(total=5)
 			) as response:
@@ -2852,7 +2853,7 @@ def _read_profits_batch_sync(
 		worksheet = _get_worksheet(spreadsheet, sheet_name)
 		
 		# Читаем все значения одним batch запросом
-		logger.info(f"Начинаем batch чтение профитов. Всего ячеек: {len(cell_addresses)}")
+		logger.info(f"🔍 Batch чтение профитов из {len(cell_addresses)} ячеек")
 		
 		try:
 			# Используем batch_get для чтения всех ячеек за один запрос
@@ -2884,6 +2885,8 @@ def _read_profits_batch_sync(
 				except (IndexError, TypeError) as e:
 					logger.warning(f"Ошибка обработки ячейки {cell_address}: {e}")
 					result[cell_address] = None
+			
+			logger.info(f"✅ Batch чтение профитов завершено: прочитано {len([v for v in result.values() if v])} значений из {len(cell_addresses)} ячеек")
 		except Exception as e:
 			logger.exception(f"Ошибка batch чтения профитов: {e}")
 			# В случае ошибки batch чтения, помечаем все как None
@@ -3116,94 +3119,6 @@ async def read_profit(
 		credentials_path,
 		row,
 		profit_column,
-		sheet_name
-	)
-
-
-def _read_profits_batch_sync(
-	sheet_id: str,
-	credentials_path: str,
-	cell_addresses: List[str],
-	sheet_name: Optional[str] = None
-) -> Dict[str, Optional[str]]:
-	"""
-	Синхронная функция для чтения профитов из нескольких ячеек за один запрос.
-	
-	Args:
-		sheet_id: ID Google Sheets таблицы
-		credentials_path: Путь к файлу с учетными данными
-		cell_addresses: Список адресов ячеек (например, ["BC123", "BC124", "BC125"])
-	
-	Returns:
-		Словарь {адрес_ячейки: значение}
-	"""
-	try:
-		client = _get_google_sheets_client(credentials_path)
-		if not client:
-			logger.error("Не удалось создать клиент Google Sheets")
-			return {}
-		
-		spreadsheet = client.open_by_key(sheet_id)
-		worksheet = _get_worksheet(spreadsheet, sheet_name)
-		
-		logger.info(f"🔍 Batch чтение профитов из {len(cell_addresses)} ячеек")
-		
-		# Используем batch_get для чтения нескольких ячеек за один запрос
-		values = worksheet.batch_get(cell_addresses)
-		
-		result = {}
-		for i, cell_address in enumerate(cell_addresses):
-			try:
-				# values[i] - это список строк для данной ячейки (обычно одна строка)
-				# values[i][0] - первая строка
-				# values[i][0][0] - первое значение в строке
-				if i < len(values) and values[i] and len(values[i]) > 0:
-					row = values[i][0]
-					if row and len(row) > 0:
-						value = str(row[0]).strip()
-						result[cell_address] = value
-						logger.debug(f"✅ Прочитан профит из {cell_address}: '{value}'")
-					else:
-						result[cell_address] = None
-						logger.debug(f"⚠️ Ячейка {cell_address} пустая")
-				else:
-					result[cell_address] = None
-					logger.debug(f"⚠️ Ячейка {cell_address} не найдена в ответе")
-			except (IndexError, TypeError) as e:
-				logger.warning(f"⚠️ Ошибка обработки ячейки {cell_address}: {e}")
-				result[cell_address] = None
-		
-		logger.info(f"✅ Batch чтение профитов завершено: прочитано {len([v for v in result.values() if v])} значений из {len(cell_addresses)} ячеек")
-		return result
-	except Exception as e:
-		logger.exception(f"❌ Ошибка batch чтения профитов: {e}")
-		return {}
-
-
-async def read_profits_batch(
-	sheet_id: str,
-	credentials_path: str,
-	cell_addresses: List[str],
-	sheet_name: Optional[str] = None
-) -> Dict[str, Optional[str]]:
-	"""
-	Читает профиты из нескольких ячеек за один запрос.
-	
-	Args:
-		sheet_id: ID Google Sheets таблицы
-		credentials_path: Путь к файлу с учетными данными
-		cell_addresses: Список адресов ячеек (например, ["BC123", "BC124", "BC125"])
-	
-	Returns:
-		Словарь {адрес_ячейки: значение}
-	"""
-	loop = asyncio.get_event_loop()
-	return await loop.run_in_executor(
-		None,
-		_read_profits_batch_sync,
-		sheet_id,
-		credentials_path,
-		cell_addresses,
 		sheet_name
 	)
 

@@ -372,6 +372,20 @@ class Database:
 			await self._db.execute("ALTER TABLE card_groups ADD COLUMN currency TEXT DEFAULT 'BYN'")
 			_logger.debug("Added currency column to card_groups table")
 		
+		# Миграция: автоматически исправляем currency для существующих групп
+		# у которых currency=NULL или осталась дефолтная 'BYN', но название указывает на Россию
+		cur = await self._db.execute("SELECT id, name, currency FROM card_groups")
+		for row in await cur.fetchall():
+			grp_id, grp_name, grp_currency = row[0], row[1], row[2]
+			detected = self._detect_group_currency(grp_name)
+			if detected != (grp_currency or "BYN"):
+				await self._db.execute(
+					"UPDATE card_groups SET currency = ? WHERE id = ?",
+					(detected, grp_id)
+				)
+				_logger.info(f"Миграция: группа '{grp_name}' (id={grp_id}): currency {grp_currency!r} → {detected!r}")
+		await self._db.commit()
+		
 		# Добавляем поле group_id в таблицу cards, если его нет
 		cur = await self._db.execute("PRAGMA table_info(cards)")
 		cols = [r[1] for r in await cur.fetchall()]
@@ -1615,6 +1629,20 @@ class Database:
 		await self._db.commit()
 		_logger.debug(f"Cash column deleted: cash_name='{cash_name}'")
 
+	@staticmethod
+	def _detect_group_currency(name: str) -> str:
+		"""Определяет валюту группы по её названию.
+		
+		Если в названии есть признаки России — возвращает 'RUB',
+		иначе — 'BYN' (Беларусь по умолчанию).
+		"""
+		name_lower = name.lower()
+		rub_keywords = ("рашка", "россия", "рф", "рос", "rub", "rus", "₽")
+		for kw in rub_keywords:
+			if kw in name_lower:
+				return "RUB"
+		return "BYN"
+
 	async def add_card_group(self, name: str) -> int:
 		"""
 		Создает новую группу карт.
@@ -1626,13 +1654,24 @@ class Database:
 			ID созданной группы
 		"""
 		assert self._db
+		currency = self._detect_group_currency(name)
 		cur = await self._db.execute(
-			"INSERT INTO card_groups(name) VALUES(?)",
-			(name,)
+			"INSERT INTO card_groups(name, currency) VALUES(?, ?)",
+			(name, currency)
 		)
 		await self._db.commit()
-		_logger.debug(f"Card group added: id={cur.lastrowid} name={name!r}")
+		_logger.debug(f"Card group added: id={cur.lastrowid} name={name!r} currency={currency}")
 		return cur.lastrowid
+
+	async def update_card_group_currency(self, group_id: int, currency: str) -> None:
+		"""Обновляет валюту группы карт."""
+		assert self._db
+		await self._db.execute(
+			"UPDATE card_groups SET currency = ? WHERE id = ?",
+			(currency, group_id)
+		)
+		await self._db.commit()
+		_logger.debug(f"Card group currency updated: group_id={group_id} currency={currency}")
 
 	async def list_card_groups(self) -> List[Dict[str, Any]]:
 		"""
@@ -1672,22 +1711,18 @@ class Database:
 		)
 		row = await cur.fetchone()
 		if row:
+			name = row[1]
+			currency = row[3] if len(row) > 3 and row[3] else None
+			# Если валюта не задана — определяем по названию группы
+			if not currency:
+				currency = self._detect_group_currency(name)
 			return {
 				"id": row[0],
-				"name": row[1],
+				"name": name,
 				"created_at": row[2],
-				"currency": row[3] if len(row) > 3 and row[3] else "BYN"
+				"currency": currency
 			}
 		return None
-		rows = await cur.fetchall()
-		return [
-			{
-				"id": row[0],
-				"name": row[1],
-				"created_at": row[2],
-			}
-			for row in rows
-		]
 
 	async def get_card_group(self, group_id: int) -> Optional[Dict[str, Any]]:
 		"""
@@ -2137,6 +2172,10 @@ class Database:
 			if 'buy_min_usd' not in existing_keys:
 				await self._db.execute(
 					"INSERT INTO settings(key, value) VALUES('buy_min_usd', '15')"
+				)
+			if 'buy_max_usd' not in existing_keys:
+				await self._db.execute(
+					"INSERT INTO settings(key, value) VALUES('buy_max_usd', '7000')"
 				)
 			if 'buy_extra_fee_usd_low' not in existing_keys:
 				await self._db.execute(
@@ -2625,6 +2664,11 @@ class Database:
 					"ALTER TABLE buy_deals ADD COLUMN admin_amount_set INTEGER NOT NULL DEFAULT 0"
 				)
 				_logger.debug("Added column admin_amount_set to buy_deals table")
+			if "amount_usd" not in columns:
+				await self._db.execute(
+					"ALTER TABLE buy_deals ADD COLUMN amount_usd REAL"
+				)
+				_logger.debug("Added column amount_usd to buy_deals table")
 
 	async def _ensure_buy_deal_messages_table(self) -> None:
 		"""Создает таблицу для хранения сообщений по сделке (покупка)"""
@@ -2739,7 +2783,7 @@ class Database:
 			       crypto_type, crypto_display, amount, amount_currency,
 			       currency_symbol, total_usd, wallet_address, admin_amount_set, status, user_message_id,
 			       admin_message_id, order_id, proof_photo_file_id,
-			       proof_document_file_id, requisites_notice_message_id, created_at, updated_at
+			       proof_document_file_id, requisites_notice_message_id, created_at, updated_at, amount_usd
 			FROM buy_deals WHERE id = ?
 			""",
 			(deal_id,)
@@ -2770,6 +2814,7 @@ class Database:
 			"requisites_notice_message_id": row[19],
 			"created_at": row[20],
 			"updated_at": row[21],
+			"amount_usd": row[22] if len(row) > 22 else None,
 		}
 
 	async def get_active_buy_deal_by_user(self, user_tg_id: int) -> Optional[int]:
@@ -2779,7 +2824,7 @@ class Database:
 			"""
 			SELECT id FROM buy_deals
 			WHERE user_tg_id = ?
-			AND status NOT IN ('completed', 'cancelled')
+			AND status NOT IN ('completed', 'cancelled', 'cancelled_by_user', 'cancelled_timeout')
 			ORDER BY created_at DESC
 			LIMIT 1
 			""",
@@ -3776,7 +3821,7 @@ class Database:
 		cur = await self._db.execute(
 			"""
 			SELECT id, user_tg_id, status FROM buy_deals
-			WHERE status NOT IN ('completed', 'cancelled')
+			WHERE status NOT IN ('completed', 'cancelled', 'cancelled_by_user', 'cancelled_timeout')
 			ORDER BY created_at DESC
 			"""
 		)

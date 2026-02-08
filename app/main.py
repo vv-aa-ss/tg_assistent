@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 import re
 import time
@@ -12,7 +13,7 @@ from html import escape
 from aiogram.types import Message, ReplyKeyboardRemove, CallbackQuery, ForceReply, FSInputFile, InputMediaPhoto
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import CommandStart, StateFilter, Command
-from aiogram.fsm.storage.memory import MemoryStorage
+from app.fsm_storage import SQLiteStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.client.default import DefaultBotProperties
@@ -40,6 +41,10 @@ buy_deal_alerts: dict[int, dict[int, int]] = {}
 # Глобальный словарь для хранения message_id уведомлений о получении скриншота
 # Формат: {deal_id: {admin_id: message_id}}
 proof_notification_ids: dict[int, dict[int, int]] = {}
+
+# Глобальный словарь для хранения таймеров сделок (отмена по таймауту)
+# Формат: {deal_id: asyncio.Task}
+deal_timers: dict[int, asyncio.Task] = {}
 
 # Лимиты для глобальных словарей (защита от переполнения памяти)
 MAX_LARGE_ORDER_ALERTS = 1000  # Максимум 1000 активных крупных заявок
@@ -715,6 +720,8 @@ async def _build_deal_message(
 	requisites_text: str | None = None,
 	wallet_address: str | None = None,
 	show_empty_amount: bool = False,
+	amount_usd: float | None = None,
+	usd_to_currency_rate: float | None = None,
 ) -> str:
 	header = "Я помогу😊...."
 	if not country_code:
@@ -728,7 +735,14 @@ async def _build_deal_message(
 	if crypto_code:
 		lines.append(f"🤑{crypto_code}")
 	if amount is not None:
-		lines.append(f"💴{_format_crypto_amount(amount)}")
+		if amount_usd is not None and country_code == "RUB" and usd_to_currency_rate:
+			rub_equiv = int(round(amount_usd * usd_to_currency_rate))
+			usd_suffix = f" ({int(round(amount_usd))} $🟰{rub_equiv}RUB)"
+		elif amount_usd is not None:
+			usd_suffix = f" ({int(round(amount_usd))} $)"
+		else:
+			usd_suffix = ""
+		lines.append(f"💴{_format_crypto_amount(amount)}{usd_suffix}")
 	if amount_currency is not None and currency_symbol:
 		lines.append(f"❗️💵{int(amount_currency)} {currency_symbol}")
 	elif show_empty_amount and currency_symbol:
@@ -758,13 +772,22 @@ async def _build_deal_base_lines(
 	amount_currency: float | None,
 	currency_symbol: str,
 	wallet_address: str | None = None,
+	amount_usd: float | None = None,
+	usd_to_currency_rate: float | None = None,
 ) -> list[str]:
+	if amount_usd is not None and country_code == "RUB" and usd_to_currency_rate:
+		rub_equiv = int(round(amount_usd * usd_to_currency_rate))
+		usd_suffix = f" ({int(round(amount_usd))} $🟰{rub_equiv}RUB)"
+	elif amount_usd is not None:
+		usd_suffix = f" ({int(round(amount_usd))} $)"
+	else:
+		usd_suffix = ""
 	lines = [
 		"⬇️Сделка⬇️",
 		"➖➖➖➖➖➖",
 		_deal_country_label(country_code),
 		f"🤑{crypto_code}",
-		f"💴{_format_crypto_amount(amount)}",
+		f"💴{_format_crypto_amount(amount)}{usd_suffix}",
 	]
 	if amount_currency is not None:
 		lines.append(f"💵{int(amount_currency)} {currency_symbol}")
@@ -788,6 +811,7 @@ async def _build_user_deal_admin_message_text(deal: dict, admin_text: str) -> st
 		deal.get("amount_currency", 0),
 		deal.get("currency_symbol", "Br"),
 		deal.get("wallet_address"),
+		amount_usd=deal.get("amount_usd"),
 	)
 	lines.extend(base_lines)
 	lines.append("💬Чат:")
@@ -803,6 +827,7 @@ async def _build_user_deal_chat_text(deal: dict, chat_lines: list[str]) -> str:
 		deal.get("amount_currency", 0),
 		deal.get("currency_symbol", "Br"),
 		deal.get("wallet_address"),
+		amount_usd=deal.get("amount_usd"),
 	)
 	lines.append("💬Чат:")
 	lines.extend(chat_lines)
@@ -902,6 +927,7 @@ async def _build_user_deal_with_requisites_chat_text(
 		amount_currency,
 		deal.get("currency_symbol", "Br"),
 		deal.get("wallet_address"),
+		amount_usd=deal.get("amount_usd"),
 	)
 	if show_requisites:
 		lines.append(requisites_text if requisites_text.strip() else "Реквизитов нет, ожидайте сообщение администратора")
@@ -925,6 +951,7 @@ async def _build_user_deal_completed_text(deal: dict) -> str:
 		deal.get("amount_currency", 0),
 		deal.get("currency_symbol", "Br"),
 		deal.get("wallet_address"),
+		amount_usd=deal.get("amount_usd"),
 	)
 	lines.append("💹Сделка завершена")
 	return "\n".join(lines)
@@ -980,7 +1007,150 @@ def _deal_status_label(status: str | None) -> str:
 		return "⛑⛑⛑Статус: Оплачено⛑⛑⛑"
 	if status == "completed":
 		return "💹💹💹Статус: Завершено💹💹💹"
+	if status == "cancelled_by_user":
+		return "❌❌❌Статус: Отменено пользователем❌❌❌"
+	if status == "cancelled_timeout":
+		return "⏰⏰⏰Статус: Время вышло⏰⏰⏰"
 	return ""
+
+
+async def _auto_delete_message(bot: Bot, chat_id: int, message_id: int, delay: int = 15) -> None:
+	"""Удаляет сообщение через указанное время (секунд)."""
+	try:
+		await asyncio.sleep(delay)
+		await bot.delete_message(chat_id=chat_id, message_id=message_id)
+	except Exception:
+		pass
+
+
+async def _deal_timer_task(bot: Bot, deal_id: int, time_limit_minutes: int) -> None:
+	"""Фоновая задача таймера сделки: уведомление за 10 мин и автоотмена."""
+	logger_main = logging.getLogger("app.main")
+	try:
+		warn_minutes = 10
+		if time_limit_minutes > warn_minutes:
+			# Ждём до момента предупреждения
+			await asyncio.sleep((time_limit_minutes - warn_minutes) * 60)
+			# Проверяем, что сделка ещё активна
+			from app.di import get_db
+			db_local = get_db()
+			deal = await db_local.get_buy_deal_by_id(deal_id)
+			if not deal or deal.get("status") not in ("await_payment", "await_proof"):
+				deal_timers.pop(deal_id, None)
+				return
+			# Отправляем предупреждение пользователю
+			try:
+				warn_msg = await bot.send_message(
+					chat_id=deal["user_tg_id"],
+					text=f"⚠️ До отмены сделки осталось {warn_minutes} минут! Оплатите и нажмите «ОПЛАТИЛ»."
+				)
+				# Удаляем уведомление через 20 секунд
+				async def _delete_warning():
+					await asyncio.sleep(20)
+					try:
+						await bot.delete_message(chat_id=deal["user_tg_id"], message_id=warn_msg.message_id)
+					except Exception:
+						pass
+				asyncio.create_task(_delete_warning())
+			except Exception as e:
+				logger_main.warning(f"⚠️ Не удалось отправить предупреждение по таймеру deal_id={deal_id}: {e}")
+			# Ждём оставшиеся 10 минут
+			await asyncio.sleep(warn_minutes * 60)
+		else:
+			# Если таймер <= 10 минут — просто ждём всё время
+			await asyncio.sleep(time_limit_minutes * 60)
+
+		# Проверяем, что сделка ещё активна
+		from app.di import get_db
+		db_local = get_db()
+		deal = await db_local.get_buy_deal_by_id(deal_id)
+		if not deal or deal.get("status") not in ("await_payment", "await_proof"):
+			deal_timers.pop(deal_id, None)
+			return
+
+		# Отменяем сделку по таймауту
+		logger_main.info(f"⏰ Сделка deal_id={deal_id} отменена по таймауту ({time_limit_minutes} мин)")
+		await db_local.update_buy_deal_fields(deal_id, status="cancelled_timeout")
+
+		# Обновляем сообщение пользователя
+		try:
+			if deal.get("user_message_id"):
+				await bot.edit_message_text(
+					chat_id=deal["user_tg_id"],
+					message_id=deal["user_message_id"],
+					text="⏰ Время на оплату истекло. Сделка отменена.",
+					reply_markup=None
+				)
+		except Exception:
+			pass
+
+		# Обновляем сообщение админа — убираем кнопки, показываем статус
+		admin_ids = get_admin_ids()
+		message_ids = buy_deal_alerts.get(deal_id, {})
+		if message_ids:
+			deal_updated = await db_local.get_buy_deal_by_id(deal_id)
+			financial_lines = await _get_admin_user_financial_lines(db_local, deal.get("user_tg_id"))
+			requisites_label = await _get_deal_requisites_label(
+				db_local,
+				deal.get("user_tg_id"),
+				deal.get("country_code")
+			)
+			msgs = await db_local.get_buy_deal_messages(deal_id)
+			chat_lines = _build_deal_chat_lines(msgs, deal.get("user_name", "Пользователь"))
+			alert_text = await _build_admin_open_deal_text(
+				deal_updated, requisites_label, chat_lines, financial_lines, db_local
+			)
+			for admin_id, message_id in message_ids.items():
+				try:
+					await bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode=ParseMode.HTML,
+						reply_markup=None
+					)
+				except Exception:
+					pass
+
+		deal_timers.pop(deal_id, None)
+
+	except asyncio.CancelledError:
+		logger_main.info(f"⏰ Таймер сделки deal_id={deal_id} отменён")
+		deal_timers.pop(deal_id, None)
+	except Exception as e:
+		logger_main.exception(f"❌ Ошибка в таймере сделки deal_id={deal_id}: {e}")
+		deal_timers.pop(deal_id, None)
+
+
+async def start_deal_timer(bot: Bot, deal_id: int) -> None:
+	"""Запускает таймер для сделки. Отменяет предыдущий, если был."""
+	from app.di import get_db
+	db_local = get_db()
+	time_limit_str = await db_local.get_setting("deal_time_limit_minutes", "30")
+	try:
+		time_limit = int(float(time_limit_str)) if time_limit_str else 30
+	except (ValueError, TypeError):
+		time_limit = 30
+
+	if time_limit <= 0:
+		return
+
+	# Отменяем предыдущий таймер, если был
+	cancel_deal_timer(deal_id)
+
+	logger_main = logging.getLogger("app.main")
+	logger_main.info(f"⏱ Запущен таймер для deal_id={deal_id}: {time_limit} мин")
+	task = asyncio.create_task(_deal_timer_task(bot, deal_id, time_limit))
+	deal_timers[deal_id] = task
+
+
+def cancel_deal_timer(deal_id: int) -> None:
+	"""Отменяет таймер сделки, если он активен."""
+	task = deal_timers.pop(deal_id, None)
+	if task and not task.done():
+		task.cancel()
+		logger_main = logging.getLogger("app.main")
+		logger_main.info(f"⏱ Таймер deal_id={deal_id} отменён")
 
 
 async def _get_btc_rate_text() -> str:
@@ -1093,7 +1263,7 @@ async def _build_admin_open_deal_text(
 		"➖➖➖➖➖➖➖➖➖➖➖",  # Разделитель после долга
 		f"🪙Крипта: {crypto_label}",
 		f"💴Сумма: {int(amount_currency)} {currency_symbol}" if amount_currency is not None else None,
-		f"🤑{deal.get('crypto_type', '')}={crypto_amount}",
+		f"🤑{deal.get('crypto_type', '')}={crypto_amount}({int(round(deal.get('amount_usd', 0)))}$)" if deal.get('amount_usd') else f"🤑{deal.get('crypto_type', '')}={crypto_amount}",
 		f"👛<code>{escape(wallet_address)}</code>" if wallet_address else None,
 		rates_text,  # Добавляем курсы
 		profit_text if profit_text else None,  # Добавляем профит
@@ -1188,76 +1358,93 @@ async def _get_requisites_label_by_card_id(db, card_id: int) -> str:
 	return card_name or "Реквизиты не привязаны"
 
 
+NO_REQUISITES_WARNING = (
+	"❗️❗️❗️❗️⬇️⬇️⬇️⬇️❗️❗️❗️❗️\n"
+	"⚠️ У ПОЛЬЗОВАТЕЛЯ НЕТ РЕКВИЗИТОВ ⚠️\n"
+	"❗️❗️❗️❗️⬆️⬆️⬆️⬆️❗️❗️❗️❗️"
+)
+
+
+async def _find_matching_card_for_country(db, user_cards: list, country_code: str | None) -> dict | None:
+	"""Находит первую карту пользователя, группа которой соответствует выбранной стране.
+	
+	Для RUB — ищет карты из групп с currency='RUB' (группы с именем типа 'РАШКА').
+	Для BYN — ищет карты из групп с currency='BYN' (все остальные группы).
+	Если country_code не задан — возвращает первую карту.
+	"""
+	if not user_cards:
+		return None
+	if not country_code:
+		return user_cards[0]
+	
+	for card in user_cards:
+		card_id = card["card_id"]
+		card_info = await db.get_card_by_id(card_id)
+		if not card_info:
+			continue
+		if card_info.get("group_id"):
+			group = await db.get_card_group_by_id(card_info["group_id"])
+			if group and group.get("currency") == country_code:
+				return card
+		elif not card_info.get("group_id") and country_code == "BYN":
+			# Карта без группы считается белорусской по умолчанию
+			return card
+	return None
+
+
 async def _get_deal_requisites_text(db, user_tg_id: int, country_code: str | None = None) -> str:
 	import logging
 	_logger = logging.getLogger("app.main")
+
+	# 1. Проверяем глобальную карту для выбранной страны сделки
+	global_card_id = await _get_global_card_id_for_country(db, country_code)
+	if global_card_id:
+		_logger.info(f"✅ _get_deal_requisites_text: используем глобальную карту для {country_code}: card_id={global_card_id}")
+		return await _get_requisites_text_by_card_id(db, global_card_id)
+
+	# 2. Получаем карты пользователя
 	user_cards = await db.get_cards_for_user_tg(user_tg_id)
 	if not user_cards:
-		# Нет карт у пользователя — проверяем глобальную карту по стране сделки (fallback)
-		global_card_id = await _get_global_card_id_for_country(db, country_code)
-		if global_card_id:
-			_logger.info(f"🔍 _get_deal_requisites_text: нет карт у user {user_tg_id}, используем глобальную карту для {country_code}: card_id={global_card_id}")
-			return await _get_requisites_text_by_card_id(db, global_card_id)
+		_logger.info(f"🔍 _get_deal_requisites_text: нет карт у user {user_tg_id}")
 		return ""
 
-	# Определяем валюту (страну) первой карты пользователя по её группе
-	first_card = user_cards[0]
-	card_id = first_card["card_id"]
-	card_info = await db.get_card_by_id(card_id)
-	user_card_currency = None
-	if card_info and card_info.get("group_id"):
-		group = await db.get_card_group_by_id(card_info["group_id"])
-		if group:
-			user_card_currency = group.get("currency")  # "BYN" or "RUB"
+	# 3. Фильтруем карты по стране (ищем карту из группы, соответствующей country_code)
+	matching_card = await _find_matching_card_for_country(db, user_cards, country_code)
+	if not matching_card:
+		_logger.info(f"⚠️ _get_deal_requisites_text: у user {user_tg_id} нет карт для страны {country_code}")
+		return ""
 
-	_logger.info(f"🔍 _get_deal_requisites_text: user {user_tg_id}, первая карта card_id={card_id}, валюта группы={user_card_currency}")
-
-	# Проверяем глобальную карту для валюты карты пользователя (а не для страны сделки!)
-	if user_card_currency:
-		global_card_id = await _get_global_card_id_for_country(db, user_card_currency)
-		if global_card_id:
-			_logger.info(f"✅ _get_deal_requisites_text: используем глобальную карту для {user_card_currency}: card_id={global_card_id}")
-			return await _get_requisites_text_by_card_id(db, global_card_id)
-
-	# Глобальная карта не установлена для валюты карт пользователя — используем первую карту
-	_logger.info(f"✅ _get_deal_requisites_text: глобальная карта для {user_card_currency} не установлена, используем карту пользователя card_id={card_id}")
+	card_id = matching_card["card_id"]
+	_logger.info(f"✅ _get_deal_requisites_text: используем карту пользователя card_id={card_id} для страны {country_code}")
 	return await _get_requisites_text_by_card_id(db, card_id)
 
 
 async def _get_deal_requisites_label(db, user_tg_id: int, country_code: str | None = None) -> str:
+	# 1. Проверяем глобальную карту для выбранной страны сделки
+	global_card_id = await _get_global_card_id_for_country(db, country_code)
+	if global_card_id:
+		return await _get_requisites_label_by_card_id(db, global_card_id)
+
+	# 2. Получаем карты пользователя
 	user_cards = await db.get_cards_for_user_tg(user_tg_id)
 	if not user_cards:
-		# Нет карт — проверяем глобальную карту по стране сделки (fallback)
-		global_card_id = await _get_global_card_id_for_country(db, country_code)
-		if global_card_id:
-			return await _get_requisites_label_by_card_id(db, global_card_id)
-		return "Реквизиты не привязаны"
+		return NO_REQUISITES_WARNING
 
-	# Определяем валюту первой карты пользователя
-	first_card = user_cards[0]
-	card_id = first_card["card_id"]
+	# 3. Фильтруем карты по стране
+	matching_card = await _find_matching_card_for_country(db, user_cards, country_code)
+	if not matching_card:
+		return NO_REQUISITES_WARNING
+
+	card_id = matching_card["card_id"]
 	card_info = await db.get_card_by_id(card_id)
-	user_card_currency = None
-	if card_info and card_info.get("group_id"):
-		group = await db.get_card_group_by_id(card_info["group_id"])
-		if group:
-			user_card_currency = group.get("currency")
-
-	# Проверяем глобальную карту для валюты карты пользователя
-	if user_card_currency:
-		global_card_id = await _get_global_card_id_for_country(db, user_card_currency)
-		if global_card_id:
-			return await _get_requisites_label_by_card_id(db, global_card_id)
-
-	# Глобальная карта не установлена — используем карту пользователя
-	card_name = (card_info.get("name") if card_info else None) or first_card.get("card_name") or first_card.get("name") or ""
+	card_name = (card_info.get("name") if card_info else None) or matching_card.get("card_name") or matching_card.get("name") or ""
 	group_name = ""
 	if card_info and card_info.get("group_id"):
 		group = await db.get_card_group_by_id(card_info["group_id"])
 		group_name = group.get("name") if group else ""
 	if group_name:
 		return f"{group_name} ({card_name})"
-	return card_name or "Реквизиты не привязаны"
+	return card_name or NO_REQUISITES_WARNING
 
 
 
@@ -1612,7 +1799,10 @@ async def main() -> None:
 	logger.debug("Database connected and dependencies set")
 
 	bot = Bot(token=settings.telegram_bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-	dp = Dispatcher(storage=MemoryStorage())
+	# SQLiteStorage сохраняет FSM-состояния в БД — они переживают перезапуск бота
+	fsm_db_path = os.path.join(os.path.dirname(settings.database_path), "fsm_storage.db")
+	fsm_storage = SQLiteStorage(db_path=fsm_db_path)
+	dp = Dispatcher(storage=fsm_storage)
 	
 	# Инициализируем глобальные словари
 	global large_order_alerts, buy_deal_alerts
@@ -1867,6 +2057,18 @@ async def main() -> None:
 			user_username = message.from_user.username or ""
 			active_deal_id = await db_local.get_active_buy_deal_by_user(message.from_user.id)
 			if active_deal_id:
+				# Проверяем, отправлена ли сделка админу
+				active_deal = await db_local.get_buy_deal_by_id(active_deal_id)
+				active_status = active_deal.get("status") if active_deal else None
+				if active_status in ("await_payment", "await_requisites", "await_proof", "await_admin"):
+					# Сделка активна — запрещаем создание новой
+					warn = await message.answer(
+						"⚠️ У вас уже есть активная сделка. "
+						"Завершите или отмените её, прежде чем создавать новую."
+					)
+					asyncio.create_task(_auto_delete_message(message.bot, message.chat.id, warn.message_id, 15))
+					return
+				# Черновая/промежуточная сделка — отменяем
 				await db_local.update_buy_deal_fields(active_deal_id, status="cancelled")
 			deal_id = await db_local.create_buy_deal(
 				user_tg_id=message.from_user.id,
@@ -2079,34 +2281,62 @@ async def main() -> None:
 		except (ValueError, TypeError):
 			min_usd = 15.0
 		if amount_usd < min_usd:
+			min_crypto = min_usd / crypto_price_usd
+			min_crypto_str = f"{min_crypto:.6f}".rstrip('0').rstrip('.')
 			error_message = await message.answer(
 				f"❌ Минимальная сумма сделки {min_usd}$.\n"
-				f"Введите сумму больше {min_usd}$:"
+				f"Введите сумму больше {min_crypto_str} {crypto_type}:"
 			)
 			# Сохраняем ID сообщения об ошибке для последующего удаления
 			await state.update_data(min_amount_error_message_id=error_message.message_id)
 			return
-		if amount_usd <= 100:
-			markup_percent_key = "buy_markup_percent_small"
-			default_markup = 15
-		elif amount_usd <= 449:
-			markup_percent_key = "buy_markup_percent_101_449"
-			default_markup = 11
-		elif amount_usd <= 699:
-			markup_percent_key = "buy_markup_percent_450_699"
-			default_markup = 9
-		elif amount_usd <= 999:
-			markup_percent_key = "buy_markup_percent_700_999"
-			default_markup = 8
-		elif amount_usd <= 1499:
-			markup_percent_key = "buy_markup_percent_1000_1499"
-			default_markup = 7
-		elif amount_usd <= 1999:
-			markup_percent_key = "buy_markup_percent_1500_1999"
-			default_markup = 6
-		else:
-			markup_percent_key = "buy_markup_percent_2000_plus"
-			default_markup = 5
+		max_usd_str = await db_local.get_setting("buy_max_usd", "7000")
+		try:
+			max_usd = float(max_usd_str) if max_usd_str else 7000.0
+		except (ValueError, TypeError):
+			max_usd = 7000.0
+		if amount_usd > max_usd:
+			error_message = await message.answer(
+				f"❌ Максимальная сумма сделки {max_usd}$.\n"
+				f"Введите сумму меньше {max_usd}$:"
+			)
+			await state.update_data(min_amount_error_message_id=error_message.message_id)
+			return
+		# Определяем надбавку в зависимости от страны и суммы
+		if selected_country == "BYN":
+			if amount_usd <= 100:
+				markup_percent_key, default_markup = "byn_markup_0_100", 15
+			elif amount_usd <= 449:
+				markup_percent_key, default_markup = "byn_markup_101_449", 11
+			elif amount_usd <= 699:
+				markup_percent_key, default_markup = "byn_markup_450_699", 9
+			elif amount_usd <= 999:
+				markup_percent_key, default_markup = "byn_markup_700_999", 8
+			elif amount_usd <= 1499:
+				markup_percent_key, default_markup = "byn_markup_1000_1499", 7
+			elif amount_usd <= 1999:
+				markup_percent_key, default_markup = "byn_markup_1500_1999", 6
+			else:
+				markup_percent_key, default_markup = "byn_markup_2000_plus", 5
+		else:  # RUB
+			if amount_usd <= 30:
+				markup_percent_key, default_markup = "rub_markup_0_30", 18
+			elif amount_usd <= 50:
+				markup_percent_key, default_markup = "rub_markup_31_50", 16
+			elif amount_usd <= 70:
+				markup_percent_key, default_markup = "rub_markup_51_70", 15
+			elif amount_usd <= 100:
+				markup_percent_key, default_markup = "rub_markup_71_100", 14
+			elif amount_usd <= 449:
+				markup_percent_key, default_markup = "rub_markup_101_449", 12
+			elif amount_usd <= 699:
+				markup_percent_key, default_markup = "rub_markup_450_699", 10
+			elif amount_usd <= 999:
+				markup_percent_key, default_markup = "rub_markup_700_999", 8
+			elif amount_usd <= 1999:
+				markup_percent_key, default_markup = "rub_markup_1000_1999", 7
+			else:
+				markup_percent_key, default_markup = "rub_markup_2000_plus", 5
 		markup_percent_str = await db_local.get_setting(markup_percent_key, str(default_markup))
 		try:
 			markup_percent = float(markup_percent_str) if markup_percent_str else default_markup
@@ -2157,9 +2387,12 @@ async def main() -> None:
 		elif total_usd < extra_fee_usd_mid:
 			extra_fee_currency = fee_mid
 		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
+		# Округляем сумму вверх до ближайших 50 (например 8512 → 8550, 9580 → 9600)
+		amount_currency = math.ceil(amount_currency / 50) * 50
 		await state.update_data(
 			amount=amount,
 			amount_currency=amount_currency,
+			amount_usd=amount_usd,
 			crypto_type=crypto_type,
 			crypto_symbol=crypto_symbol,
 			crypto_price_usd=crypto_price_usd,
@@ -2180,6 +2413,7 @@ async def main() -> None:
 					deal_id,
 					amount=amount,
 					amount_currency=amount_currency,
+					amount_usd=amount_usd,
 					currency_symbol=currency_symbol,
 					total_usd=total_usd,
 					status="await_wallet"
@@ -2193,7 +2427,9 @@ async def main() -> None:
 				amount_currency=None,
 				currency_symbol=currency_symbol,
 				prompt="Введи адрес кошелька⬇️⬇️⬇️ :",
-				show_empty_amount=True
+				show_empty_amount=True,
+				amount_usd=amount_usd,
+				usd_to_currency_rate=usd_to_currency_rate
 			)
 			await _send_or_edit_deal_message(
 				bot=message.bot,
@@ -2243,6 +2479,7 @@ async def main() -> None:
 				deal_id,
 				amount=amount,
 				amount_currency=amount_currency,
+				amount_usd=amount_usd,
 				currency_symbol=currency_symbol,
 				total_usd=total_usd,
 				status="await_confirmation"
@@ -2254,7 +2491,9 @@ async def main() -> None:
 			amount=amount,
 			amount_currency=amount_currency,
 			currency_symbol=currency_symbol,
-			prompt="Согласен ❔❔❔:"
+			prompt="Согласен ❔❔❔:",
+			amount_usd=amount_usd,
+			usd_to_currency_rate=usd_to_currency_rate
 		)
 		await _send_or_edit_deal_message(
 			bot=message.bot,
@@ -2336,6 +2575,8 @@ async def main() -> None:
 		amount_currency = data.get("amount_currency", 0)
 		currency_symbol = data.get("currency_symbol", "Br")
 		deal_id = data.get("deal_id")
+		amount_usd = data.get("amount_usd")
+		usd_to_currency_rate = data.get("usd_to_currency_rate")
 		# После согласия спрашиваем адрес кошелька
 		await state.set_state(DealStates.waiting_wallet_address)
 		message_text = await _build_deal_message(
@@ -2344,7 +2585,9 @@ async def main() -> None:
 			amount=amount,
 			amount_currency=amount_currency,
 			currency_symbol=currency_symbol,
-			prompt="Введи адрес кошелька⬇️⬇️⬇️ :"
+			prompt="Введи адрес кошелька⬇️⬇️⬇️ :",
+			amount_usd=amount_usd,
+			usd_to_currency_rate=usd_to_currency_rate
 		)
 		await _send_or_edit_deal_message(
 			bot=cb.bot,
@@ -2369,6 +2612,9 @@ async def main() -> None:
 			return
 		data = await state.get_data()
 		deal_id = data.get("deal_id")
+		# Отменяем таймер сделки при нажатии ОПЛАТИЛ
+		if deal_id:
+			cancel_deal_timer(deal_id)
 		amount_currency = data.get("amount_currency")
 		# Если в состоянии нет данных (могло быть очищено при переписке), берем активную сделку из БД
 		if not deal_id or amount_currency is None:
@@ -2450,6 +2696,156 @@ async def main() -> None:
 		)
 		await state.update_data(proof_request_message_id=message_id)
 		await cb.answer()
+
+	@dp.callback_query(F.data.startswith("deal:cancel:") & ~F.data.startswith("deal:cancel:confirm:") & ~F.data.startswith("deal:cancel:no:"))
+	async def on_deal_cancel_request(cb: CallbackQuery, state: FSMContext):
+		"""Пользователь нажал 'ОТМЕНИТЬ СДЕЛКУ' — запрашиваем подтверждение."""
+		if not cb.from_user:
+			return
+		try:
+			deal_id = int(cb.data.split(":")[2])
+		except (ValueError, IndexError):
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		kb = InlineKeyboardBuilder()
+		kb.button(text="✅ Да, отменить", callback_data=f"deal:cancel:confirm:{deal_id}")
+		kb.button(text="⬅️ Нет, вернуться", callback_data=f"deal:cancel:no:{deal_id}")
+		kb.adjust(1, 1)
+		await cb.message.edit_text(
+			"❓ Вы уверены, что хотите отменить сделку?",
+			reply_markup=kb.as_markup()
+		)
+		await cb.answer()
+
+	@dp.callback_query(F.data.startswith("deal:cancel:no:"))
+	async def on_deal_cancel_no(cb: CallbackQuery, state: FSMContext):
+		"""Пользователь отказался от отмены — возвращаем исходное сообщение."""
+		if not cb.from_user:
+			return
+		try:
+			deal_id = int(cb.data.split(":")[3])
+		except (ValueError, IndexError):
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		from app.di import get_db
+		db_local = get_db()
+		deal = await db_local.get_buy_deal_by_id(deal_id)
+		if not deal:
+			await cb.answer("Сделка не найдена.", show_alert=True)
+			return
+		# Восстанавливаем сообщение сделки
+		data = await state.get_data()
+		selected_country = data.get("selected_country") or deal.get("country_code", "BYN")
+		crypto_type = data.get("crypto_type") or deal.get("crypto_type", "")
+		amount = data.get("amount") or deal.get("amount", 0)
+		amount_currency = data.get("amount_currency") or deal.get("amount_currency", 0)
+		currency_symbol = data.get("currency_symbol") or deal.get("currency_symbol", "Br")
+		wallet_address = data.get("wallet_address") or deal.get("wallet_address")
+		amount_usd = data.get("amount_usd") or deal.get("amount_usd")
+		usd_to_currency_rate = data.get("usd_to_currency_rate")
+		requisites_text = await _get_deal_requisites_text(
+			db_local,
+			cb.from_user.id,
+			selected_country
+		)
+		messages = await db_local.get_buy_deal_messages(deal_id)
+		chat_lines = _build_deal_chat_lines(messages, cb.from_user.full_name or "Пользователь")
+		message_text = await _build_user_deal_with_requisites_chat_text(
+			deal=deal,
+			requisites_text=requisites_text,
+			chat_lines=chat_lines,
+		)
+		try:
+			await cb.message.edit_text(
+				message_text,
+				parse_mode=ParseMode.HTML,
+				reply_markup=buy_deal_paid_reply_kb(deal_id, show_how_pay=True)
+			)
+		except Exception:
+			pass
+		await cb.answer()
+
+	@dp.callback_query(F.data.startswith("deal:cancel:confirm:"))
+	async def on_deal_cancel_confirm(cb: CallbackQuery, state: FSMContext):
+		"""Пользователь подтвердил отмену сделки."""
+		if not cb.from_user:
+			return
+		try:
+			deal_id = int(cb.data.split(":")[3])
+		except (ValueError, IndexError):
+			await cb.answer("Ошибка данных", show_alert=True)
+			return
+		from app.di import get_db
+		db_local = get_db()
+		deal = await db_local.get_buy_deal_by_id(deal_id)
+		if not deal:
+			await cb.answer("Сделка не найдена.", show_alert=True)
+			return
+		# Отменяем таймер сделки
+		cancel_deal_timer(deal_id)
+		# Обновляем статус сделки
+		await db_local.update_buy_deal_fields(deal_id, status="cancelled_by_user")
+		# Обновляем сообщение пользователя
+		try:
+			await cb.message.edit_text(
+				"❌ Сделка отменена.",
+				reply_markup=None
+			)
+		except Exception:
+			pass
+		# Обновляем сообщение админа — убираем кнопки, показываем статус
+		admin_ids = get_admin_ids()
+		message_ids = buy_deal_alerts.get(deal_id, {})
+		if message_ids:
+			# Обновляем текст алерта с новым статусом
+			financial_lines = await _get_admin_user_financial_lines(db_local, deal.get("user_tg_id"))
+			requisites_label = await _get_deal_requisites_label(
+				db_local,
+				deal.get("user_tg_id"),
+				deal.get("country_code")
+			)
+			deal_updated = await db_local.get_buy_deal_by_id(deal_id)
+			msgs = await db_local.get_buy_deal_messages(deal_id)
+			chat_lines = _build_deal_chat_lines(msgs, deal.get("user_name", "Пользователь"))
+			alert_text = await _build_admin_open_deal_text(
+				deal_updated, requisites_label, chat_lines, financial_lines, db_local
+			)
+			for admin_id, message_id in message_ids.items():
+				try:
+					await cb.bot.edit_message_text(
+						chat_id=admin_id,
+						message_id=message_id,
+						text=alert_text,
+						parse_mode=ParseMode.HTML,
+						reply_markup=None
+					)
+				except Exception:
+					pass
+		else:
+			# Если нет алерта — пробуем обновить admin_message_id из сделки
+			admin_message_id = deal.get("admin_message_id")
+			if admin_message_id:
+				for admin_id in admin_ids:
+					try:
+						await cb.bot.edit_message_reply_markup(
+							chat_id=admin_id,
+							message_id=admin_message_id,
+							reply_markup=None
+						)
+					except Exception:
+						pass
+		# Уведомляем админов об отмене сделки
+		user_label = deal.get("user_name") or deal.get("user_username") or str(deal.get("user_tg_id", ""))
+		cancel_notice_text = f"❌ Сделка #{deal_id} отменена пользователем ({user_label})"
+		for admin_id in admin_ids:
+			try:
+				notice = await cb.bot.send_message(chat_id=admin_id, text=cancel_notice_text)
+				asyncio.create_task(_auto_delete_message(cb.bot, admin_id, notice.message_id, 20))
+			except Exception:
+				pass
+		# Очищаем состояние пользователя
+		await state.clear()
+		await cb.answer("Сделка отменена")
 
 	@dp.message(DealStates.waiting_payment, F.photo | F.document)
 	async def on_deal_payment_proof_while_waiting_payment(message: Message, state: FSMContext):
@@ -2752,6 +3148,8 @@ async def main() -> None:
 		amount_currency = data.get("amount_currency", 0)
 		currency_symbol = data.get("currency_symbol", "Br")
 		deal_id = data.get("deal_id")
+		amount_usd = data.get("amount_usd")
+		usd_to_currency_rate = data.get("usd_to_currency_rate")
 		if is_large_deal:
 			if deal_id:
 				await db_local.update_buy_deal_fields(
@@ -2768,7 +3166,9 @@ async def main() -> None:
 				prompt="❗️Ожидай сообщение от администратора",
 				requisites_text=None,
 				wallet_address=wallet_address,
-				show_empty_amount=True
+				show_empty_amount=True,
+				amount_usd=amount_usd,
+				usd_to_currency_rate=usd_to_currency_rate
 			)
 			await _send_or_edit_deal_message(
 				bot=message.bot,
@@ -2802,7 +3202,9 @@ async def main() -> None:
 			currency_symbol=currency_symbol,
 			prompt=None,
 			requisites_text=requisites_text,
-			wallet_address=wallet_address
+			wallet_address=wallet_address,
+			amount_usd=amount_usd,
+			usd_to_currency_rate=usd_to_currency_rate
 		)
 		if requisites_text:
 			await state.set_state(DealStates.waiting_payment)
@@ -2813,6 +3215,9 @@ async def main() -> None:
 				text=message_text,
 				reply_markup=buy_deal_paid_reply_kb(deal_id, show_how_pay=True)
 			)
+			# Запускаем таймер на сделку
+			if deal_id:
+				await start_deal_timer(message.bot, deal_id)
 			# Проверяем настройку оповещений и отправляем оповещение, если нужно
 			if deal_id:
 				notification_type = await db_local.get_setting("deal_notification_type", "after_proof")
@@ -2843,7 +3248,8 @@ async def main() -> None:
 							chat_lines = _build_deal_chat_lines(deal_messages, message.from_user.full_name or "Пользователь")
 							deal = await db_local.get_buy_deal_by_id(deal_id)
 							if deal:
-								alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db_local)
+								# Отправляем уведомление БЕЗ курсов/профита (мгновенно)
+								alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db=None)
 								reply_markup = deal_alert_admin_kb(deal_id)
 								
 								# Защита от переполнения памяти
@@ -2866,6 +3272,8 @@ async def main() -> None:
 										logger_main.info(f"✅ on_deal_wallet_address_entered: оповещение отправлено админу {admin_id}, message_id={sent.message_id}")
 									except Exception as e:
 										logger_main.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
+								# Подгружаем курсы/профит в фоне и обновляем сообщение
+								asyncio.create_task(update_buy_deal_alert(message.bot, deal_id))
 					else:
 						# Обновляем существующее оповещение
 						logger_main.info(f"🔔 on_deal_wallet_address_entered: обновляем существующее оповещение для deal_id={deal_id}")
@@ -2902,32 +3310,22 @@ async def main() -> None:
 					deal = await db_local.get_buy_deal_by_id(deal_id)
 					if deal:
 						financial_lines = await _get_admin_user_financial_lines(db_local, message.from_user.id)
-						requisites_text_check = await _get_deal_requisites_text(
+						requisites_label = await _get_deal_requisites_label(
 							db_local,
 							message.from_user.id,
 							selected_country
 						)
-						# Проверяем, есть ли реквизиты
-						if not requisites_text_check or not requisites_text_check.strip():
-							# Реквизитов нет - добавляем заметную пометку
-							requisites_label = "❗️❗️❗️❗️⬇️⬇️⬇️⬇️❗️❗️❗️❗️\n⚠️ У ПОЛЬЗОВАТЕЛЯ НЕТ РЕКВИЗИТОВ ⚠️\n❗️❗️❗️❗️⬆️⬆️⬆️⬆️❗️❗️❗️❗️"
-						else:
-							# Реквизиты есть - получаем обычный label
-							requisites_label = await _get_deal_requisites_label(
-								db_local,
-								message.from_user.id,
-								selected_country
-							)
 						
 						messages = await db_local.get_buy_deal_messages(deal_id)
 						chat_lines = _build_deal_chat_lines(messages, message.from_user.full_name or "Пользователь")
 						
+						# Отправляем уведомление БЕЗ курсов/профита (мгновенно)
 						alert_text = await _build_admin_open_deal_text(
 							deal,
 							requisites_label,
 							chat_lines,
 							financial_lines,
-							db_local
+							db=None
 						)
 						
 						# Защита от переполнения памяти
@@ -2954,6 +3352,8 @@ async def main() -> None:
 							except Exception as e:
 								logger_main = logging.getLogger("app.main")
 								logger_main.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
+						# Подгружаем курсы/профит в фоне и обновляем сообщение
+						asyncio.create_task(update_buy_deal_alert(message.bot, deal_id))
 
 	@dp.callback_query(F.data.startswith("deal:user:delete:"))
 	async def on_deal_user_delete(cb: CallbackQuery):
@@ -3670,38 +4070,69 @@ async def main() -> None:
 		except (ValueError, TypeError):
 			min_usd = 15.0
 		if amount_usd < min_usd:
+			min_crypto = min_usd / crypto_price_usd
+			min_crypto_str = f"{min_crypto:.6f}".rstrip('0').rstrip('.')
 			error_message = await send_and_save_message(
 				message,
 				f"❌ Минимальная сумма сделки {min_usd}$.\n"
-				f"Введите сумму больше {min_usd}$:",
+				f"Введите сумму больше {min_crypto_str} {crypto_type}:",
 				state=state
 			)
 			# Сохраняем ID сообщения об ошибке для последующего удаления
 			await state.update_data(min_amount_error_message_id=error_message.message_id)
 			return
 		
-		# Определяем процент наценки в зависимости от суммы заказа
-		if amount_usd <= 100:
-			markup_percent_key = "buy_markup_percent_small"
-			default_markup = 20
-		elif amount_usd <= 449:
-			markup_percent_key = "buy_markup_percent_101_449"
-			default_markup = 15
-		elif amount_usd <= 699:
-			markup_percent_key = "buy_markup_percent_450_699"
-			default_markup = 14
-		elif amount_usd <= 999:
-			markup_percent_key = "buy_markup_percent_700_999"
-			default_markup = 13
-		elif amount_usd <= 1499:
-			markup_percent_key = "buy_markup_percent_1000_1499"
-			default_markup = 12
-		elif amount_usd <= 1999:
-			markup_percent_key = "buy_markup_percent_1500_1999"
-			default_markup = 11
-		else:
-			markup_percent_key = "buy_markup_percent_2000_plus"
-			default_markup = 10
+		# Проверяем максимальную сумму сделки
+		max_usd_str = await db_local.get_setting("buy_max_usd", "7000")
+		try:
+			max_usd = float(max_usd_str) if max_usd_str else 7000.0
+		except (ValueError, TypeError):
+			max_usd = 7000.0
+		if amount_usd > max_usd:
+			error_message = await send_and_save_message(
+				message,
+				f"❌ Максимальная сумма сделки {max_usd}$.\n"
+				f"Введите сумму меньше {max_usd}$:",
+				state=state
+			)
+			await state.update_data(min_amount_error_message_id=error_message.message_id)
+			return
+		
+		# Определяем процент наценки в зависимости от страны и суммы заказа
+		if selected_country == "BYN":
+			if amount_usd <= 100:
+				markup_percent_key, default_markup = "byn_markup_0_100", 15
+			elif amount_usd <= 449:
+				markup_percent_key, default_markup = "byn_markup_101_449", 11
+			elif amount_usd <= 699:
+				markup_percent_key, default_markup = "byn_markup_450_699", 9
+			elif amount_usd <= 999:
+				markup_percent_key, default_markup = "byn_markup_700_999", 8
+			elif amount_usd <= 1499:
+				markup_percent_key, default_markup = "byn_markup_1000_1499", 7
+			elif amount_usd <= 1999:
+				markup_percent_key, default_markup = "byn_markup_1500_1999", 6
+			else:
+				markup_percent_key, default_markup = "byn_markup_2000_plus", 5
+		else:  # RUB
+			if amount_usd <= 30:
+				markup_percent_key, default_markup = "rub_markup_0_30", 18
+			elif amount_usd <= 50:
+				markup_percent_key, default_markup = "rub_markup_31_50", 16
+			elif amount_usd <= 70:
+				markup_percent_key, default_markup = "rub_markup_51_70", 15
+			elif amount_usd <= 100:
+				markup_percent_key, default_markup = "rub_markup_71_100", 14
+			elif amount_usd <= 449:
+				markup_percent_key, default_markup = "rub_markup_101_449", 12
+			elif amount_usd <= 699:
+				markup_percent_key, default_markup = "rub_markup_450_699", 10
+			elif amount_usd <= 999:
+				markup_percent_key, default_markup = "rub_markup_700_999", 8
+			elif amount_usd <= 1999:
+				markup_percent_key, default_markup = "rub_markup_1000_1999", 7
+			else:
+				markup_percent_key, default_markup = "rub_markup_2000_plus", 5
 		
 		# Получаем процент наценки из БД
 		markup_percent_str = await db_local.get_setting(markup_percent_key, str(default_markup))
@@ -3716,8 +4147,8 @@ async def main() -> None:
 		# Рассчитываем итоговую сумму в USD после наценки
 		total_usd = crypto_price_with_markup * amount
 		
-		# Сохраняем total_usd в состоянии для проверки крупной сделки
-		await state.update_data(total_usd=total_usd)
+		# Сохраняем total_usd и amount_usd в состоянии для проверки крупной сделки
+		await state.update_data(total_usd=total_usd, amount_usd=amount_usd)
 		
 		# Алерт админу при больших суммах (после ввода суммы)
 		try:
@@ -3853,6 +4284,8 @@ async def main() -> None:
 		
 		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты + доп. комиссия
 		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
+		# Округляем сумму вверх до ближайших 50 (например 8512 → 8550, 9580 → 9600)
+		amount_currency = math.ceil(amount_currency / 50) * 50
 		
 		# Логируем расчет для отладки
 		logger = logging.getLogger("app.main")
@@ -3873,6 +4306,7 @@ async def main() -> None:
 		await state.update_data(
 			amount=amount,
 			amount_currency=amount_currency,
+			amount_usd=amount_usd,
 			crypto_type=crypto_type,
 			crypto_symbol=crypto_symbol,
 			crypto_price_usd=crypto_price_usd,
@@ -4422,39 +4856,25 @@ async def main() -> None:
 			else:  # RUB
 				final_amount += 1000
 		
-		# Получаем реквизиты пользователя
-		user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
-		requisites_text = ""
+		# Получаем реквизиты пользователя с учётом выбранной страны
+		requisites_text = await _get_deal_requisites_text(db_local, message.from_user.id, selected_country)
 		pay_card_info = ""
 		
+		# Получаем label карты для отображения
+		user_cards = await db_local.get_cards_for_user_tg(message.from_user.id)
 		if user_cards:
-			# Берем первую карту пользователя
-			card = user_cards[0]
-			card_id = card["card_id"]
-			card_info = await db_local.get_card_by_id(card_id)
-			card_name = (card_info.get("name") if card_info else None) or card.get("card_name") or card.get("name") or ""
-			group_name = ""
-			if card_info and card_info.get("group_id"):
-				group = await db_local.get_card_group_by_id(card_info["group_id"])
-				group_name = group.get("name") if group else ""
-			if card_name:
-				label = f"{group_name} ({card_name})" if group_name else card_name
-				pay_card_info = f"\n💳 Карта для оплаты: {label}"
-			
-			# Получаем реквизиты из таблицы card_requisites
-			requisites = await db_local.list_card_requisites(card_id)
-			
-			# Формируем текст реквизитов
-			requisites_list = []
-			for req in requisites:
-				requisites_list.append(req["requisite_text"])
-			
-			# Добавляем user_message, если есть
-			if card.get("user_message") and card["user_message"].strip():
-				requisites_list.append(card["user_message"])
-			
-			if requisites_list:
-				requisites_text = "\n".join(requisites_list)
+			matching_card = await _find_matching_card_for_country(db_local, user_cards, selected_country)
+			if matching_card:
+				card_id = matching_card["card_id"]
+				card_info = await db_local.get_card_by_id(card_id)
+				card_name = (card_info.get("name") if card_info else None) or matching_card.get("card_name") or matching_card.get("name") or ""
+				group_name = ""
+				if card_info and card_info.get("group_id"):
+					group = await db_local.get_card_group_by_id(card_info["group_id"])
+					group_name = group.get("name") if group else ""
+				if card_name:
+					label = f"{group_name} ({card_name})" if group_name else card_name
+					pay_card_info = f"\n💳 Карта для оплаты: {label}"
 		
 		# Форматируем суммы для отображения
 		if amount < 1:
@@ -5623,6 +6043,15 @@ async def main() -> None:
 		user_username = message.from_user.username or ""
 		active_deal_id = await db_local.get_active_buy_deal_by_user(message.from_user.id)
 		if active_deal_id:
+			active_deal = await db_local.get_buy_deal_by_id(active_deal_id)
+			active_status = active_deal.get("status") if active_deal else None
+			if active_status in ("await_payment", "await_requisites", "await_proof", "await_admin"):
+				warn = await message.answer(
+					"⚠️ У вас уже есть активная сделка. "
+					"Завершите или отмените её, прежде чем создавать новую."
+				)
+				asyncio.create_task(_auto_delete_message(message.bot, message.chat.id, warn.message_id, 15))
+				return
 			await db_local.update_buy_deal_fields(active_deal_id, status="cancelled")
 		deal_id = await db_local.create_buy_deal(
 			user_tg_id=message.from_user.id,
@@ -7776,6 +8205,9 @@ async def main() -> None:
 		await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 	finally:
 		logger.debug("Shutting down, closing DB")
+		# Закрываем глобальную HTTP-сессию
+		from app.http_session import close_session
+		await close_session()
 		await db.close()
 
 
