@@ -704,7 +704,9 @@ def _deal_country_label(country_code: str) -> str:
 	return "🇷🇺Россия"
 
 
-def _format_crypto_amount(amount: float) -> str:
+def _format_crypto_amount(amount: float | None) -> str:
+	if amount is None:
+		amount = 0
 	if amount < 1:
 		return f"{amount:.8f}".rstrip('0').rstrip('.')
 	return f"{amount:.2f}".rstrip('0').rstrip('.')
@@ -1087,6 +1089,18 @@ async def _deal_timer_task(bot: Bot, deal_id: int, time_limit_minutes: int) -> N
 		# Обновляем сообщение админа — убираем кнопки, показываем статус
 		admin_ids = get_admin_ids()
 		message_ids = buy_deal_alerts.get(deal_id, {})
+		# Если в памяти пусто — пробуем восстановить из БД
+		if not message_ids:
+			try:
+				alerts = await db_local.get_deal_alerts(alert_type="buy_deal")
+				for alert in alerts:
+					if alert["deal_id"] == deal_id:
+						buy_deal_alerts.setdefault(deal_id, {})[alert["admin_id"]] = alert["message_id"]
+				message_ids = buy_deal_alerts.get(deal_id, {})
+				if message_ids:
+					logger_main.info(f"📥 Восстановлены deal alerts из БД для deal_id={deal_id}: {message_ids}")
+			except Exception as e:
+				logger_main.warning(f"⚠️ Ошибка восстановления deal alerts из БД: {e}")
 		if message_ids:
 			deal_updated = await db_local.get_buy_deal_by_id(deal_id)
 			financial_lines = await _get_admin_user_financial_lines(db_local, deal.get("user_tg_id"))
@@ -1111,6 +1125,8 @@ async def _deal_timer_task(bot: Bot, deal_id: int, time_limit_minutes: int) -> N
 					)
 				except Exception:
 					pass
+		else:
+			logger_main.warning(f"⚠️ Нет message_ids для обновления admin сообщения при таймауте deal_id={deal_id}")
 
 		deal_timers.pop(deal_id, None)
 
@@ -1371,6 +1387,7 @@ async def _find_matching_card_for_country(db, user_cards: list, country_code: st
 	Для RUB — ищет карты из групп с currency='RUB' (группы с именем типа 'РАШКА').
 	Для BYN — ищет карты из групп с currency='BYN' (все остальные группы).
 	Если country_code не задан — возвращает первую карту.
+	Если ни одна карта не подошла по стране — возвращает первую карту (fallback).
 	"""
 	if not user_cards:
 		return None
@@ -1389,7 +1406,13 @@ async def _find_matching_card_for_country(db, user_cards: list, country_code: st
 		elif not card_info.get("group_id") and country_code == "BYN":
 			# Карта без группы считается белорусской по умолчанию
 			return card
-	return None
+	# Ни одна карта не подошла по стране — возвращаем первую (админ привязал вручную)
+	import logging
+	logging.getLogger("app.main").info(
+		f"⚠️ _find_matching_card_for_country: нет карты для {country_code}, "
+		f"используем первую карту пользователя (card_id={user_cards[0].get('card_id')})"
+	)
+	return user_cards[0]
 
 
 async def _get_deal_requisites_text(db, user_tg_id: int, country_code: str | None = None) -> str:
@@ -1558,33 +1581,20 @@ async def update_buy_deal_alert(bot: Bot, deal_id: int) -> None:
 	logger_main.info(f"🧪 update_buy_deal_alert: alert_text_len={len(alert_text)}")
 	message_ids = buy_deal_alerts.get(deal_id, {})
 	logger_main.info(f"🧪 update_buy_deal_alert: buy_deal_alerts_ids={message_ids}")
+	# Если в памяти пусто — пробуем восстановить из БД
 	if not message_ids:
-		from app.di import get_admin_ids
-		from app.keyboards import deal_alert_admin_kb, deal_alert_admin_completed_kb
-		admin_ids = get_admin_ids()
-		if not admin_ids:
-			return
-		# Защита от переполнения памяти
-		limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
-		buy_deal_alerts[deal_id] = {}
-		for admin_id in admin_ids:
-			reply_markup = (
-				deal_alert_admin_completed_kb(deal_id)
-				if deal.get("status") == "completed"
-				else deal_alert_admin_kb(deal_id)
-			)
-			try:
-				sent = await bot.send_message(
-					chat_id=admin_id,
-					text=alert_text,
-					parse_mode="HTML",
-					reply_markup=reply_markup
-				)
-				buy_deal_alerts[deal_id][admin_id] = sent.message_id
-				# Сохраняем в БД для восстановления после перезапуска
-				await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
-			except Exception:
-				pass
+		try:
+			alerts = await db_local.get_deal_alerts(alert_type="buy_deal")
+			for alert in alerts:
+				if alert["deal_id"] == deal_id:
+					buy_deal_alerts.setdefault(deal_id, {})[alert["admin_id"]] = alert["message_id"]
+			message_ids = buy_deal_alerts.get(deal_id, {})
+			if message_ids:
+				logger_main.info(f"📥 update_buy_deal_alert: восстановлены из БД для deal_id={deal_id}: {message_ids}")
+		except Exception as e:
+			logger_main.warning(f"⚠️ update_buy_deal_alert: ошибка восстановления из БД: {e}")
+	if not message_ids:
+		logger_main.warning(f"⚠️ update_buy_deal_alert: нет message_ids для deal_id={deal_id}, пропускаем обновление")
 		return
 	from app.keyboards import deal_alert_admin_kb, deal_alert_admin_completed_kb
 	for admin_id, message_id in message_ids.items():
@@ -1845,6 +1855,7 @@ async def main() -> None:
 		BotCommand(command="stat_k", description="Баланс крипты"),
 		BotCommand(command="stat_u", description="Статистика пользователей"),
 		BotCommand(command="cons", description="Расходы"),
+		BotCommand(command="active_s", description="Активные сделки"),
 		BotCommand(command="start", description="Меню"),
 	]
 
@@ -2024,12 +2035,22 @@ async def main() -> None:
 					if admin_chat_ids:
 						for admin_chat_id in admin_chat_ids:
 							try:
-								await message.bot.send_message(
+								sent_access = await message.bot.send_message(
 									chat_id=admin_chat_id,
 									text=admin_message_text,
 									parse_mode=ParseMode.HTML,
 									reply_markup=user_access_request_kb(user_id)
 								)
+								# Отдельное короткое уведомление (push) как reply
+								try:
+									notif = await message.bot.send_message(
+										chat_id=admin_chat_id,
+										text="🔔 Новый запрос на доступ!",
+										reply_to_message_id=sent_access.message_id
+									)
+									asyncio.create_task(_auto_delete_message(message.bot, admin_chat_id, notif.message_id, 15))
+								except Exception:
+									pass
 								logger_main.info(f"✅ Уведомление о запросе доступа отправлено админу {admin_chat_id}")
 							except Exception as e:
 								logger_main.error(f"❌ Ошибка отправки уведомления админу {admin_chat_id}: {e}", exc_info=True)
@@ -2768,6 +2789,7 @@ async def main() -> None:
 	@dp.callback_query(F.data.startswith("deal:cancel:confirm:"))
 	async def on_deal_cancel_confirm(cb: CallbackQuery, state: FSMContext):
 		"""Пользователь подтвердил отмену сделки."""
+		logger_main = logging.getLogger("app.main")
 		if not cb.from_user:
 			return
 		try:
@@ -2796,6 +2818,18 @@ async def main() -> None:
 		# Обновляем сообщение админа — убираем кнопки, показываем статус
 		admin_ids = get_admin_ids()
 		message_ids = buy_deal_alerts.get(deal_id, {})
+		# Если в памяти пусто — пробуем восстановить из БД
+		if not message_ids:
+			try:
+				alerts = await db_local.get_deal_alerts(alert_type="buy_deal")
+				for alert in alerts:
+					if alert["deal_id"] == deal_id:
+						buy_deal_alerts.setdefault(deal_id, {})[alert["admin_id"]] = alert["message_id"]
+				message_ids = buy_deal_alerts.get(deal_id, {})
+				if message_ids:
+					logger_main.info(f"📥 Восстановлены deal alerts из БД для deal_id={deal_id}: {message_ids}")
+			except Exception as e:
+				logger_main.warning(f"⚠️ Ошибка восстановления deal alerts из БД: {e}")
 		if message_ids:
 			# Обновляем текст алерта с новым статусом
 			financial_lines = await _get_admin_user_financial_lines(db_local, deal.get("user_tg_id"))
@@ -2823,6 +2857,7 @@ async def main() -> None:
 					pass
 		else:
 			# Если нет алерта — пробуем обновить admin_message_id из сделки
+			logger_main.warning(f"⚠️ Нет message_ids для обновления admin сообщения при отмене deal_id={deal_id}")
 			admin_message_id = deal.get("admin_message_id")
 			if admin_message_id:
 				for admin_id in admin_ids:
@@ -3269,6 +3304,17 @@ async def main() -> None:
 										# Сохраняем в БД для восстановления после перезапуска
 										from app.main import save_deal_alert_to_db
 										await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
+										# Отдельное короткое уведомление (push) как reply к сделке
+										try:
+											notif = await message.bot.send_message(
+												chat_id=admin_id,
+												text=f"🔔 Новая сделка #{deal_id}!",
+												reply_to_message_id=sent.message_id
+											)
+											asyncio.create_task(_auto_delete_message(message.bot, admin_id, notif.message_id, 15))
+											logger_main.info(f"🔔 Push-уведомление отправлено админу {admin_id}, notif_id={notif.message_id}")
+										except Exception as notif_err:
+											logger_main.warning(f"⚠️ Не удалось отправить push-уведомление админу {admin_id}: {notif_err}")
 										logger_main.info(f"✅ on_deal_wallet_address_entered: оповещение отправлено админу {admin_id}, message_id={sent.message_id}")
 									except Exception as e:
 										logger_main.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
@@ -3335,6 +3381,7 @@ async def main() -> None:
 							buy_deal_alerts[deal_id] = {}
 						
 						reply_markup = deal_alert_admin_kb(deal_id)
+						logger_main = logging.getLogger("app.main")
 						
 						for admin_id in admin_ids:
 							try:
@@ -3347,10 +3394,19 @@ async def main() -> None:
 								buy_deal_alerts[deal_id][admin_id] = sent.message_id
 								# Сохраняем в БД для восстановления после перезапуска
 								await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
-								logger_main = logging.getLogger("app.main")
+								# Отдельное короткое уведомление (push) как reply к сделке
+								try:
+									notif = await message.bot.send_message(
+										chat_id=admin_id,
+										text=f"🔔 Новая сделка #{deal_id} (без реквизитов)!",
+										reply_to_message_id=sent.message_id
+									)
+									asyncio.create_task(_auto_delete_message(message.bot, admin_id, notif.message_id, 15))
+									logger_main.info(f"🔔 Push-уведомление отправлено админу {admin_id}, notif_id={notif.message_id}")
+								except Exception as notif_err:
+									logger_main.warning(f"⚠️ Не удалось отправить push-уведомление админу {admin_id}: {notif_err}")
 								logger_main.info(f"✅ Оповещение о сделке без реквизитов отправлено админу {admin_id}, deal_id={deal_id}, message_id={sent.message_id}")
 							except Exception as e:
-								logger_main = logging.getLogger("app.main")
 								logger_main.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
 						# Подгружаем курсы/профит в фоне и обновляем сообщение
 						asyncio.create_task(update_buy_deal_alert(message.bot, deal_id))
@@ -3695,46 +3751,49 @@ async def main() -> None:
 				text="⚠️ Произошла ошибка при отправке заявки администраторам. Пожалуйста, свяжитесь с поддержкой."
 			)
 		else:
+			logger_main = logging.getLogger("app.main")
 			for admin_id in admin_ids:
 				try:
-					# Обновляем/создаем сообщение сделки у админа с добавлением скрина
 					if deal_id:
-						alert_text = await build_admin_open_deal_text_with_chat(
-							db_local, deal_id
-						)
-						caption = alert_text
+						# Для сделок: заменяем текстовое сообщение сделки на фото со скриншотом + текст сделки в caption
+						old_msg_id = buy_deal_alerts.get(deal_id, {}).get(admin_id)
+						# Формируем текст сделки для caption
+						alert_text = await build_admin_open_deal_text_with_chat(db_local, deal_id)
+						# Telegram caption ограничен 1024 символами
+						if len(alert_text) > 1024:
+							alert_text = alert_text[:1020] + "..."
 						from app.keyboards import deal_alert_admin_kb
+						reply_markup = deal_alert_admin_kb(deal_id)
+						sent_alert = None
 						if proof_photo_file_id:
 							sent_alert = await message.bot.send_photo(
 								chat_id=admin_id,
 								photo=proof_photo_file_id,
-								caption=caption,
+								caption=alert_text,
 								parse_mode="HTML",
-								reply_markup=deal_alert_admin_kb(deal_id)
+								reply_markup=reply_markup
 							)
 						elif proof_document_file_id:
 							sent_alert = await message.bot.send_document(
 								chat_id=admin_id,
 								document=proof_document_file_id,
-								caption=caption,
+								caption=alert_text,
 								parse_mode="HTML",
-								reply_markup=deal_alert_admin_kb(deal_id)
+								reply_markup=reply_markup
 							)
-						else:
-							sent_alert = None
 						if sent_alert:
-							# Если уже было сообщение сделки — удаляем старое
-							if deal_id in buy_deal_alerts and admin_id in buy_deal_alerts[deal_id]:
+							# Обновляем buy_deal_alerts и БД на новый message_id
+							buy_deal_alerts.setdefault(deal_id, {})[admin_id] = sent_alert.message_id
+							await save_deal_alert_to_db(deal_id, admin_id, sent_alert.message_id)
+							logger_main.info(f"✅ Скриншот + сделка отправлены админу {admin_id} одним сообщением, new_msg_id={sent_alert.message_id}, old_msg_id={old_msg_id}")
+							# Удаляем старое текстовое сообщение сделки
+							if old_msg_id:
 								try:
-									await message.bot.delete_message(
-										chat_id=admin_id,
-										message_id=buy_deal_alerts[deal_id][admin_id]
-									)
+									await message.bot.delete_message(chat_id=admin_id, message_id=old_msg_id)
 								except Exception:
 									pass
-							buy_deal_alerts.setdefault(deal_id, {})[admin_id] = sent_alert.message_id
-
-					if not deal_id:
+					else:
+						# Для обычных заявок (без deal_id): отправляем как раньше
 						if proof_photo_file_id:
 							proof_msg = await message.bot.send_photo(
 								chat_id=admin_id,
@@ -3761,47 +3820,24 @@ async def main() -> None:
 						await db_local.update_order_admin_message_id(order_id, proof_msg.message_id)
 				except Exception as e:
 					logger_main.error(f"❌ Ошибка отправки заявки #{order_number} админу {admin_id}: {e}", exc_info=True)
-		# Отправляем уведомление админу о получении скриншота (как ответ на сообщение сделки)
+		
+		# Для сделок: отправляем push-уведомление о скриншоте
 		logger_main = logging.getLogger("app.main")
 		if deal_id:
-			admin_ids = get_admin_ids()
-			if admin_ids:
-				# Получаем message_id сообщения сделки для каждого админа
-				for admin_id in admin_ids:
-					try:
-						deal_alert_message_id = None
-						if deal_id in buy_deal_alerts and admin_id in buy_deal_alerts[deal_id]:
-							deal_alert_message_id = buy_deal_alerts[deal_id][admin_id]
-						
-						if deal_alert_message_id:
-							# Отправляем уведомление как ответ на сообщение сделки
-							notification_text = "🔔 Получен скриншот оплаты"
-							notification_msg = await message.bot.send_message(
-								chat_id=admin_id,
-								text=notification_text,
-								reply_to_message_id=deal_alert_message_id
-							)
-							# Сохраняем message_id уведомления для последующего удаления
-							proof_notification_ids.setdefault(deal_id, {})[admin_id] = notification_msg.message_id
-							logger_main.info(f"✅ Уведомление о скриншоте отправлено админу {admin_id} как ответ на сообщение сделки (message_id={deal_alert_message_id}, notification_id={notification_msg.message_id})")
-						else:
-							logger_main.warning(f"⚠️ Не найден message_id сообщения сделки для админа {admin_id}, deal_id={deal_id}")
-					except Exception as e:
-						logger_main.warning(f"⚠️ Ошибка отправки уведомления админу {admin_id}: {e}")
-		
-		# Проверяем настройку оповещений и отправляем оповещение, если нужно
-		if deal_id:
-			notification_type = await db_local.get_setting("deal_notification_type", "after_proof")
-			logger_main.info(f"🔔 on_payment_proof_received: notification_type={notification_type}, deal_id={deal_id}")
-			if notification_type == "after_proof":
-				# Отправляем оповещение админам после отправки скриншота
-				logger_main.info(f"🔔 on_payment_proof_received: отправляем оповещение после скриншота")
-				await update_buy_deal_alert(message.bot, deal_id)
-			else:
-				# Если настройка "after_requisites", оповещение уже было отправлено после выдачи реквизитов
-				# Просто обновляем существующее оповещение (если есть)
-				logger_main.info(f"🔔 on_payment_proof_received: настройка не 'after_proof', обновляем существующее оповещение")
-				await update_buy_deal_alert(message.bot, deal_id)
+			for admin_id in admin_ids:
+				try:
+					deal_alert_msg_id = buy_deal_alerts.get(deal_id, {}).get(admin_id)
+					if deal_alert_msg_id:
+						notif = await message.bot.send_message(
+							chat_id=admin_id,
+							text=f"🔔 Получен скриншот оплаты (сделка #{deal_id})",
+							reply_to_message_id=deal_alert_msg_id
+						)
+						proof_notification_ids.setdefault(deal_id, {})[admin_id] = notif.message_id
+						asyncio.create_task(_auto_delete_message(message.bot, admin_id, notif.message_id, 15))
+						logger_main.info(f"✅ Push-уведомление о скриншоте отправлено админу {admin_id}, deal_id={deal_id}")
+				except Exception as e:
+					logger_main.warning(f"⚠️ Ошибка push-уведомления админу {admin_id}: {e}")
 		await state.clear()
 
 	@dp.message(F.text == "⬅️ Назад")

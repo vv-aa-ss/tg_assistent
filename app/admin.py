@@ -1255,6 +1255,64 @@ async def cmd_admin(message: Message, state: FSMContext):
 	await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
 
 
+@admin_router.message(Command("active_s"))
+async def cmd_active_deals(message: Message, bot: Bot):
+	"""Показать список активных сделок с полной информацией и кнопками."""
+	admin_ids = get_admin_ids()
+	admin_usernames = get_admin_usernames()
+	if not is_admin(message.from_user.id, message.from_user.username, admin_ids, admin_usernames):
+		return
+	db = get_db()
+	active_deals = await db.get_active_buy_deals()
+	if not active_deals:
+		await message.answer("📭 Активных сделок нет.")
+		return
+	from app.main import (
+		_build_admin_open_deal_text,
+		_get_admin_user_financial_lines,
+		_get_deal_requisites_label,
+		_build_deal_chat_lines,
+		buy_deal_alerts,
+		save_deal_alert_to_db,
+	)
+	from app.keyboards import deal_alert_admin_kb
+	count = 0
+	for deal_brief in active_deals:
+		deal = await db.get_buy_deal_by_id(deal_brief["id"])
+		if not deal:
+			continue
+		deal_id = deal["id"]
+		user_tg_id = deal.get("user_tg_id")
+		country_code = deal.get("country_code")
+		financial_lines = await _get_admin_user_financial_lines(db, user_tg_id)
+		requisites_label = await _get_deal_requisites_label(db, user_tg_id, country_code)
+		messages = await db.get_buy_deal_messages(deal_id)
+		chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
+		alert_text = await _build_admin_open_deal_text(
+			deal, requisites_label, chat_lines, financial_lines, db
+		)
+		reply_markup = deal_alert_admin_kb(deal_id)
+		try:
+			sent = await bot.send_message(
+				chat_id=message.chat.id,
+				text=alert_text,
+				parse_mode="HTML",
+				reply_markup=reply_markup,
+			)
+			# Обновляем buy_deal_alerts, чтобы кнопки работали
+			if deal_id not in buy_deal_alerts:
+				buy_deal_alerts[deal_id] = {}
+			buy_deal_alerts[deal_id][message.from_user.id] = sent.message_id
+			await save_deal_alert_to_db(deal_id, message.from_user.id, sent.message_id)
+			count += 1
+		except Exception as e:
+			logger.warning(f"⚠️ /active_s: ошибка отправки сделки {deal_id}: {e}")
+	if count == 0:
+		await message.answer("📭 Не удалось загрузить активные сделки.")
+	else:
+		await message.answer(f"📋 Показано сделок: {count}")
+
+
 @admin_router.message(Command("user_add"))
 async def cmd_user_add(message: Message):
 	"""Добавить доступ пользователю по tg_id или @username."""
@@ -2254,11 +2312,11 @@ def _deal_groups_kb(groups: List[Dict[str, Any]], deal_id: int, include_ungroupe
 	return kb
 
 
-def _deal_cards_kb(cards: List[Tuple[int, str]], deal_id: int, back_to_group: int) -> InlineKeyboardBuilder:
+def _deal_cards_kb(cards: List[Tuple[int, str]], deal_id: int, back_to_group: int = 0) -> InlineKeyboardBuilder:
 	kb = InlineKeyboardBuilder()
 	for card_id, card_name in cards:
 		kb.button(text=f"💳 {card_name}", callback_data=f"dealalert:card:{deal_id}:{card_id}")
-	kb.button(text="⬅️ Назад", callback_data=f"dealalert:group:{deal_id}:{back_to_group}")
+	kb.button(text="⬅️ Назад", callback_data=f"dealalert:requisites:{deal_id}")
 	kb.adjust(1)
 	return kb
 
@@ -4396,7 +4454,14 @@ async def deal_alert_requisites_back(cb: CallbackQuery):
 	except (ValueError, IndexError):
 		await cb.answer("Ошибка данных", show_alert=True)
 		return
-	from app.main import update_buy_deal_alert, _build_deal_chat_lines, _build_user_deal_with_requisites_chat_text
+	from app.main import update_buy_deal_alert, buy_deal_alerts, save_deal_alert_to_db
+	# Гарантируем, что buy_deal_alerts содержит message_id текущего сообщения
+	admin_id = cb.from_user.id if cb.from_user else None
+	if admin_id and cb.message:
+		if deal_id not in buy_deal_alerts:
+			buy_deal_alerts[deal_id] = {}
+		buy_deal_alerts[deal_id][admin_id] = cb.message.message_id
+		await save_deal_alert_to_db(deal_id, admin_id, cb.message.message_id)
 	await update_buy_deal_alert(cb.bot, deal_id)
 	await cb.answer()
 
@@ -4549,69 +4614,28 @@ async def deal_alert_requisites_select(cb: CallbackQuery, state: FSMContext, bot
 		logger.warning(f"⚠️ Ошибка отправки временного уведомления пользователю {user_tg_id}: {e}")
 	
 	# Обновляем сообщение админа после выбора реквизитов
+	# Гарантируем, что buy_deal_alerts содержит message_id текущего сообщения админа
+	from app.main import buy_deal_alerts, save_deal_alert_to_db
+	admin_id = cb.from_user.id if cb.from_user else None
+	if admin_id and cb.message:
+		if deal_id not in buy_deal_alerts:
+			buy_deal_alerts[deal_id] = {}
+		buy_deal_alerts[deal_id][admin_id] = cb.message.message_id
+		await save_deal_alert_to_db(deal_id, admin_id, cb.message.message_id)
+		logger.info(f"📌 deal_alert_requisites_select: сохранён message_id={cb.message.message_id} в buy_deal_alerts для deal_id={deal_id}, admin_id={admin_id}")
 	try:
 		await update_buy_deal_alert(bot, deal_id)
 		logger.info(f"✅ Сообщение админа обновлено после выбора реквизитов для deal_id={deal_id}")
 	except Exception as e:
 		logger.warning(f"⚠️ Ошибка обновления сообщения админа для deal_id={deal_id}: {e}")
 	
-	# Проверяем настройку оповещений и отправляем оповещение, если нужно
+	# Проверяем настройку оповещений и обновляем существующее оповещение
 	notification_type = await db.get_setting("deal_notification_type", "after_proof")
 	logger.info(f"🔔 deal_alert_requisites_select: notification_type={notification_type}, deal_id={deal_id}")
 	
-	if notification_type == "after_requisites":
-		# Отправляем полное оповещение админам после выдачи реквизитов
-		from app.main import buy_deal_alerts, _build_admin_open_deal_text, _get_admin_user_financial_lines, _get_deal_requisites_label, _build_deal_chat_lines
-		from app.keyboards import deal_alert_admin_kb
-		from app.di import get_admin_ids
-		
-		# Проверяем, есть ли уже оповещение
-		message_ids = buy_deal_alerts.get(deal_id, {})
-		logger.info(f"🔔 deal_alert_requisites_select: buy_deal_alerts[{deal_id}]={message_ids}")
-		
-		if not message_ids:
-			# Если оповещения еще нет, создаем его
-			admin_ids = get_admin_ids()
-			logger.info(f"🔔 deal_alert_requisites_select: создаем новое оповещение для deal_id={deal_id}, admin_ids={admin_ids}")
-			if admin_ids:
-				financial_lines = await _get_admin_user_financial_lines(db, user_tg_id)
-				requisites_label = await _get_deal_requisites_label(
-					db,
-					user_tg_id,
-					deal.get("country_code")
-				)
-				chat_lines = _build_deal_chat_lines(messages, deal.get("user_name", "Пользователь"))
-				alert_text = await _build_admin_open_deal_text(deal, requisites_label, chat_lines, financial_lines, db)
-				reply_markup = deal_alert_admin_kb(deal_id)
-				
-				# Защита от переполнения памяти
-				from app.main import limit_dict_size, MAX_BUY_DEAL_ALERTS
-				limit_dict_size(buy_deal_alerts, MAX_BUY_DEAL_ALERTS, "buy_deal_alerts")
-				buy_deal_alerts[deal_id] = {}
-				
-				for admin_id in admin_ids:
-					try:
-						sent = await bot.send_message(
-							chat_id=admin_id,
-							text=alert_text,
-							parse_mode="HTML",
-							reply_markup=reply_markup
-						)
-						buy_deal_alerts[deal_id][admin_id] = sent.message_id
-						# Сохраняем в БД для восстановления после перезапуска
-						from app.main import save_deal_alert_to_db
-						await save_deal_alert_to_db(deal_id, admin_id, sent.message_id)
-						logger.info(f"✅ deal_alert_requisites_select: оповещение отправлено админу {admin_id}, message_id={sent.message_id}")
-					except Exception as e:
-						logger.warning(f"⚠️ Ошибка отправки оповещения админу {admin_id}: {e}")
-		else:
-			# Обновляем существующее оповещение
-			logger.info(f"🔔 deal_alert_requisites_select: обновляем существующее оповещение для deal_id={deal_id}")
-			await update_buy_deal_alert(bot, deal_id)
-	else:
-		# Обновляем существующее оповещение (если есть)
-		logger.info(f"🔔 deal_alert_requisites_select: настройка не 'after_requisites', просто обновляем оповещение")
-		await update_buy_deal_alert(bot, deal_id)
+	# Всегда обновляем существующее сообщение (buy_deal_alerts уже гарантированно заполнен выше)
+	logger.info(f"🔔 deal_alert_requisites_select: обновляем существующее оповещение для deal_id={deal_id}")
+	await update_buy_deal_alert(bot, deal_id)
 	
 	await cb.answer("Реквизиты отправлены пользователю ✅")
 
@@ -5067,26 +5091,43 @@ async def deal_alert_cancel(cb: CallbackQuery, bot: Bot):
 			)
 	except Exception:
 		pass
-	# Обновляем алерт админа
+	# Обновляем сообщение, на котором админ нажал кнопку (cb.message)
+	cancel_text = "❌ Сделка отменена администратором."
+	try:
+		await cb.message.edit_text(text=cancel_text, reply_markup=None)
+	except Exception:
+		try:
+			await cb.message.edit_caption(caption=cancel_text, reply_markup=None)
+		except Exception:
+			try:
+				await cb.message.delete()
+				await bot.send_message(chat_id=cb.from_user.id, text=cancel_text)
+			except Exception:
+				pass
+	# Обновляем сообщения у остальных админов (если есть)
 	from app.main import buy_deal_alerts
 	message_ids = buy_deal_alerts.get(deal_id, {})
+	current_admin_id = cb.from_user.id
 	for admin_id, message_id in message_ids.items():
+		if admin_id == current_admin_id:
+			continue  # уже обновили через cb.message
 		try:
+			await bot.edit_message_text(
+				chat_id=admin_id,
+				message_id=message_id,
+				text=cancel_text,
+				reply_markup=None
+			)
+		except Exception:
 			try:
-				await bot.edit_message_text(
+				await bot.edit_message_caption(
 					chat_id=admin_id,
 					message_id=message_id,
-					text="❌ Сделка отменена администратором.",
+					caption=cancel_text,
 					reply_markup=None
 				)
 			except Exception:
-				await bot.delete_message(chat_id=admin_id, message_id=message_id)
-				await bot.send_message(
-					chat_id=admin_id,
-					text="❌ Сделка отменена администратором."
-				)
-		except Exception:
-			pass
+				pass
 	buy_deal_alerts.pop(deal_id, None)
 	await cb.answer("Сделка отменена")
 
@@ -5195,57 +5236,74 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 		from app.main import buy_deal_alerts, build_admin_open_deal_text_with_chat
 		from app.keyboards import deal_alert_admin_completed_kb
 		
-		message_ids = buy_deal_alerts.get(deal_id, {})
+		# Формируем текст
+		alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
+		if profit_line:
+			alert_text = f"{alert_text}\n{profit_line}"
+		completed_kb = deal_alert_admin_completed_kb(deal_id)
 		
-		# Если message_ids пустые, пытаемся получить из БД
+		# 1) Обновляем сообщение, на котором админ нажал кнопку (cb.message) — всегда доступно
+		current_admin_id = cb.from_user.id
+		cb_updated = False
+		try:
+			await cb.message.edit_text(
+				text=alert_text,
+				parse_mode="HTML",
+				reply_markup=completed_kb
+			)
+			cb_updated = True
+			logger.info(f"✅ Первое обновление (edit_text) cb.message для админа {current_admin_id}, deal_id={deal_id}")
+		except Exception:
+			try:
+				caption_text = alert_text[:1024] if len(alert_text) > 1024 else alert_text
+				await cb.message.edit_caption(
+					caption=caption_text,
+					parse_mode="HTML",
+					reply_markup=completed_kb
+				)
+				cb_updated = True
+				logger.info(f"✅ Первое обновление (edit_caption) cb.message для админа {current_admin_id}, deal_id={deal_id}")
+			except Exception as e2:
+				logger.warning(f"⚠️ Не удалось обновить cb.message для админа {current_admin_id}, deal_id={deal_id}: {e2}")
+		
+		# Обновляем buy_deal_alerts на актуальный message_id из cb.message
+		if cb.message:
+			buy_deal_alerts.setdefault(deal_id, {})[current_admin_id] = cb.message.message_id
+		
+		# 2) Обновляем сообщения у остальных админов
+		message_ids = buy_deal_alerts.get(deal_id, {})
 		if not message_ids:
-			admin_ids = get_admin_ids()
 			alerts = await db.get_deal_alerts(alert_type="buy_deal")
 			for alert in alerts:
-				if alert["deal_id"] == deal_id and alert["admin_id"] in admin_ids:
-					if deal_id not in buy_deal_alerts:
-						buy_deal_alerts[deal_id] = {}
-					buy_deal_alerts[deal_id][alert["admin_id"]] = alert["message_id"]
+				if alert["deal_id"] == deal_id:
+					buy_deal_alerts.setdefault(deal_id, {})[alert["admin_id"]] = alert["message_id"]
 			message_ids = buy_deal_alerts.get(deal_id, {})
 		
-		# Если все еще пустые, используем message_id из callback query
-		if not message_ids and cb.message and cb.from_user:
-			admin_id = cb.from_user.id
-			message_id = cb.message.message_id
-			if deal_id not in buy_deal_alerts:
-				buy_deal_alerts[deal_id] = {}
-			buy_deal_alerts[deal_id][admin_id] = message_id
-			message_ids = {admin_id: message_id}
-			logger.info(f"✅ Использован message_id из callback query для deal_id={deal_id}, admin_id={admin_id}, message_id={message_id}")
-		
-		if message_ids:
-			# Первое обновление - только с быстрым профитом, без отчета Google Sheets
-			alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
-			if profit_line:
-				alert_text = f"{alert_text}\n{profit_line}"
-			
-			for admin_id, message_id in message_ids.items():
+		for admin_id, message_id in message_ids.items():
+			if admin_id == current_admin_id:
+				continue  # уже обновили через cb.message
+			try:
+				await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text=alert_text,
+					parse_mode="HTML",
+					reply_markup=completed_kb
+				)
+				logger.info(f"✅ Первое обновление сделки для другого админа {admin_id}, deal_id={deal_id}")
+			except Exception:
 				try:
-					await bot.edit_message_text(
+					caption_text = alert_text[:1024] if len(alert_text) > 1024 else alert_text
+					await bot.edit_message_caption(
 						chat_id=admin_id,
 						message_id=message_id,
-						text=alert_text,
+						caption=caption_text,
 						parse_mode="HTML",
-						reply_markup=deal_alert_admin_completed_kb(deal_id)
+						reply_markup=completed_kb
 					)
-					logger.info(f"✅ Первое обновление сообщения сделки (с быстрым профитом) для админа {admin_id}, deal_id={deal_id}")
-				except Exception as e:
-					try:
-						await bot.edit_message_caption(
-							chat_id=admin_id,
-							message_id=message_id,
-							caption=alert_text,
-							parse_mode="HTML",
-							reply_markup=deal_alert_admin_completed_kb(deal_id)
-						)
-						logger.info(f"✅ Первое обновление сообщения сделки (caption, с быстрым профитом) для админа {admin_id}, deal_id={deal_id}")
-					except Exception as e2:
-						logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}: {e2}")
+					logger.info(f"✅ Первое обновление сделки (caption) для другого админа {admin_id}, deal_id={deal_id}")
+				except Exception as e2:
+					logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}, message_id={message_id}: {e2}")
 	except Exception as e:
 		logger.error(f"❌ Ошибка при первом обновлении сообщения сделки для deal_id={deal_id}: {e}", exc_info=True)
 	
@@ -5510,61 +5568,69 @@ async def deal_alert_complete(cb: CallbackQuery, bot: Bot):
 	try:
 		from app.main import buy_deal_alerts, build_admin_open_deal_text_with_chat
 		from app.keyboards import deal_alert_admin_completed_kb
-		# get_admin_ids уже импортирован глобально, используем его
 		
+		alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
+		if profit_line:
+			alert_text = f"{alert_text}\n{profit_line}"
+		if google_sheet_report:
+			alert_text = f"{alert_text}\n{google_sheet_report}"
+		completed_kb = deal_alert_admin_completed_kb(deal_id)
+		
+		# 1) Обновляем cb.message напрямую (текущий админ)
+		current_admin_id = cb.from_user.id
+		try:
+			await cb.message.edit_text(
+				text=alert_text,
+				parse_mode="HTML",
+				reply_markup=completed_kb
+			)
+			logger.info(f"✅ Второе обновление (edit_text) cb.message для админа {current_admin_id}, deal_id={deal_id}")
+		except Exception:
+			try:
+				caption_text = alert_text[:1024] if len(alert_text) > 1024 else alert_text
+				await cb.message.edit_caption(
+					caption=caption_text,
+					parse_mode="HTML",
+					reply_markup=completed_kb
+				)
+				logger.info(f"✅ Второе обновление (edit_caption) cb.message для админа {current_admin_id}, deal_id={deal_id}")
+			except Exception as e2:
+				logger.warning(f"⚠️ Не удалось второе обновление cb.message для админа {current_admin_id}, deal_id={deal_id}: {e2}")
+		
+		# 2) Обновляем сообщения остальных админов
 		message_ids = buy_deal_alerts.get(deal_id, {})
-		
-		# Если message_ids пустые, пытаемся получить из БД
 		if not message_ids:
-			admin_ids = get_admin_ids()
 			alerts = await db.get_deal_alerts(alert_type="buy_deal")
 			for alert in alerts:
-				if alert["deal_id"] == deal_id and alert["admin_id"] in admin_ids:
-					if deal_id not in buy_deal_alerts:
-						buy_deal_alerts[deal_id] = {}
-					buy_deal_alerts[deal_id][alert["admin_id"]] = alert["message_id"]
+				if alert["deal_id"] == deal_id:
+					buy_deal_alerts.setdefault(deal_id, {})[alert["admin_id"]] = alert["message_id"]
 			message_ids = buy_deal_alerts.get(deal_id, {})
 		
-		# Если все еще пустые, используем message_id из callback query (сообщение, на котором нажата кнопка)
-		if not message_ids and cb.message and cb.from_user:
-			admin_id = cb.from_user.id
-			message_id = cb.message.message_id
-			if deal_id not in buy_deal_alerts:
-				buy_deal_alerts[deal_id] = {}
-			buy_deal_alerts[deal_id][admin_id] = message_id
-			message_ids = {admin_id: message_id}
-			logger.info(f"✅ Использован message_id из callback query для deal_id={deal_id}, admin_id={admin_id}, message_id={message_id}")
-		
-		if message_ids:
-			alert_text = await build_admin_open_deal_text_with_chat(db, deal_id)
-			if profit_line:
-				alert_text = f"{alert_text}\n{profit_line}"
-			# Добавляем отчет о записи в Google Sheets
-			if google_sheet_report:
-				alert_text = f"{alert_text}\n{google_sheet_report}"
-			
-			for admin_id, message_id in message_ids.items():
+		for admin_id, message_id in message_ids.items():
+			if admin_id == current_admin_id:
+				continue
+			try:
+				await bot.edit_message_text(
+					chat_id=admin_id,
+					message_id=message_id,
+					text=alert_text,
+					parse_mode="HTML",
+					reply_markup=completed_kb
+				)
+				logger.info(f"✅ Второе обновление сделки для другого админа {admin_id}, deal_id={deal_id}")
+			except Exception:
 				try:
-					await bot.edit_message_text(
+					caption_text = alert_text[:1024] if len(alert_text) > 1024 else alert_text
+					await bot.edit_message_caption(
 						chat_id=admin_id,
 						message_id=message_id,
-						text=alert_text,
+						caption=caption_text,
 						parse_mode="HTML",
-						reply_markup=deal_alert_admin_completed_kb(deal_id)
+						reply_markup=completed_kb
 					)
-					logger.info(f"✅ Сообщение сделки обновлено для админа {admin_id}, deal_id={deal_id}, message_id={message_id}")
-				except Exception as e:
-					try:
-						await bot.edit_message_caption(
-							chat_id=admin_id,
-							message_id=message_id,
-							caption=alert_text,
-							parse_mode="HTML",
-							reply_markup=deal_alert_admin_completed_kb(deal_id)
-						)
-						logger.info(f"✅ Сообщение сделки обновлено (caption) для админа {admin_id}, deal_id={deal_id}, message_id={message_id}")
-					except Exception as e2:
-						logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}, message_id={message_id}: {e2}")
+					logger.info(f"✅ Второе обновление сделки (caption) для другого админа {admin_id}, deal_id={deal_id}")
+				except Exception as e2:
+					logger.warning(f"⚠️ Не удалось обновить сообщение сделки для админа {admin_id}, deal_id={deal_id}, message_id={message_id}: {e2}")
 		else:
 			logger.warning(f"⚠️ Не найдены message_ids для обновления сделки deal_id={deal_id}")
 	except Exception as e:
