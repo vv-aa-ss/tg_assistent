@@ -856,6 +856,21 @@ async def _notify_user_new_message(bot: Bot, chat_id: int) -> None:
 		pass
 
 
+async def _notify_admins_new_deal_message(bot: Bot, deal_id: int, user_name: str = "пользователя") -> None:
+	"""Отправляет push-уведомление всем админам о новом сообщении от пользователя в сделке."""
+	from app.di import get_admin_ids
+	admin_ids = get_admin_ids()
+	for admin_id in admin_ids:
+		try:
+			notif = await bot.send_message(
+				chat_id=admin_id,
+				text=f"🔔 Новое сообщение от {user_name} в сделке #{deal_id}"
+			)
+			asyncio.create_task(_auto_delete_message(bot, admin_id, notif.message_id, 3))
+		except Exception:
+			pass
+
+
 async def _notify_admins_deal_paid(bot: Bot, deal: dict) -> None:
 	return
 
@@ -1384,10 +1399,10 @@ NO_REQUISITES_WARNING = (
 async def _find_matching_card_for_country(db, user_cards: list, country_code: str | None) -> dict | None:
 	"""Находит первую карту пользователя, группа которой соответствует выбранной стране.
 	
-	Для RUB — ищет карты из групп с currency='RUB' (группы с именем типа 'РАШКА').
-	Для BYN — ищет карты из групп с currency='BYN' (все остальные группы).
+	Для RUB — ищет карты из групп с currency='RUB'.
+	Для BYN — ищет карты из групп с currency='BYN'.
 	Если country_code не задан — возвращает первую карту.
-	Если ни одна карта не подошла по стране — возвращает первую карту (fallback).
+	Если ни одна карта не подошла по стране — возвращает None (реквизитов для этой страны нет).
 	"""
 	if not user_cards:
 		return None
@@ -1406,13 +1421,13 @@ async def _find_matching_card_for_country(db, user_cards: list, country_code: st
 		elif not card_info.get("group_id") and country_code == "BYN":
 			# Карта без группы считается белорусской по умолчанию
 			return card
-	# Ни одна карта не подошла по стране — возвращаем первую (админ привязал вручную)
+	# Ни одна карта не подошла по стране — реквизитов для этой страны нет
 	import logging
 	logging.getLogger("app.main").info(
-		f"⚠️ _find_matching_card_for_country: нет карты для {country_code}, "
-		f"используем первую карту пользователя (card_id={user_cards[0].get('card_id')})"
+		f"⚠️ _find_matching_card_for_country: нет карты для {country_code} у пользователя "
+		f"(всего карт: {len(user_cards)}, но ни одна не соответствует стране)"
 	)
-	return user_cards[0]
+	return None
 
 
 async def _get_deal_requisites_text(db, user_tg_id: int, country_code: str | None = None) -> str:
@@ -3568,6 +3583,12 @@ async def main() -> None:
 			logger_main.info(f"✅ on_deal_user_reply_send: update_buy_deal_alert completed for deal_id={deal_id}")
 		except Exception as e:
 			logger_main.error(f"❌ on_deal_user_reply_send: error in update_buy_deal_alert: {type(e).__name__}: {e}", exc_info=True)
+		# Отправляем push-уведомление админам о новом сообщении от пользователя
+		try:
+			user_name = deal.get("user_name") or deal.get("user_username") or "пользователя"
+			await _notify_admins_new_deal_message(message.bot, deal_id, user_name)
+		except Exception:
+			pass
 		prompt_id = data.get("deal_reply_prompt_id")
 		if prompt_id:
 			try:
@@ -7021,7 +7042,18 @@ async def main() -> None:
 								logger_main.info(f"✅ on_user_reply_to_question: сообщение успешно обновлено для админа {admin_id}")
 							except Exception as e:
 								logger_main.error(f"❌ Не удалось обновить сообщение о крупной заявке для админа {admin_id}: {e}", exc_info=True)
-					
+					# Отправляем push-уведомление админам о новом сообщении
+					user_name_display = question.get("user_name") or question.get("user_username") or "пользователя"
+					for admin_id in message_ids.keys():
+						try:
+							notif = await message.bot.send_message(
+								chat_id=admin_id,
+								text=f"🔔 Новое сообщение от {user_name_display}"
+							)
+							asyncio.create_task(_auto_delete_message(message.bot, admin_id, notif.message_id, 3))
+						except Exception:
+							pass
+				
 					# Удаляем сообщение пользователя
 					await delete_user_message(message)
 					logger_main.info(f"✅ on_user_reply_to_question: обработка завершена, возвращаемся")
@@ -7069,6 +7101,18 @@ async def main() -> None:
 					reply_markup=question_reply_kb(question_id)
 				)
 				logger_main.info(f"✅ Ответ пользователя {user_tg_id} по вопросу {question_id} отправлен админу")
+				
+				# Отправляем push-уведомление всем админам
+				user_name_display = question.get("user_name") or question.get("user_username") or "пользователя"
+				for aid in admin_ids:
+					try:
+						notif = await message.bot.send_message(
+							chat_id=aid,
+							text=f"🔔 Новое сообщение от {user_name_display}"
+						)
+						asyncio.create_task(_auto_delete_message(message.bot, aid, notif.message_id, 3))
+					except Exception:
+						pass
 				
 				# Отправляем временное уведомление пользователю
 				notif_msg = await message.bot.send_message(

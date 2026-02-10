@@ -45,6 +45,7 @@ class SQLiteStorage(BaseStorage):
             self._db = await aiosqlite.connect(self._db_path)
             self._db.row_factory = aiosqlite.Row
             await self._db.execute("PRAGMA journal_mode=WAL;")
+            await self._db.execute("PRAGMA busy_timeout=5000;")
             await self._db.execute(_CREATE_TABLE_SQL)
             await self._db.commit()
             logger.info("SQLiteStorage: подключено к %s", self._db_path)

@@ -76,6 +76,7 @@ class Database:
 		os.makedirs(os.path.dirname(self._path), exist_ok=True)
 		self._db = await aiosqlite.connect(self._path)
 		await self._db.execute("PRAGMA journal_mode=WAL;")
+		await self._db.execute("PRAGMA busy_timeout=5000;")
 		await self._db.executescript(SCHEMA_SQL)
 		# migrate: add user_message to cards if missing
 		await self._ensure_cards_user_message()

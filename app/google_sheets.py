@@ -3533,7 +3533,10 @@ def calculate_profit_from_add_data(
 				card_name = card_data.get("card_name", "?")
 				group_name = card_data.get("group_name", "?")
 				
-				if currency == "BYN" and usd_to_byn_rate:
+				if currency == "USD":
+					total_income_usd += value
+					logger.info(f"💱 Карта {card_name} ({group_name}): {value} USD = {value:.2f} USD (без конвертации)")
+				elif currency == "BYN" and usd_to_byn_rate:
 					income = value / usd_to_byn_rate
 					total_income_usd += income
 					logger.info(f"💱 Карта {card_name} ({group_name}): {value} BYN / {usd_to_byn_rate} = {income:.2f} USD")
@@ -3550,7 +3553,10 @@ def calculate_profit_from_add_data(
 			value = cash.get("value", 0.0)
 			currency = cash.get("currency", "RUB")
 			
-			if currency == "BYN" and usd_to_byn_rate:
+			if currency == "USD":
+				total_income_usd += value
+				logger.info(f"💱 Наличные: {value} USD = {value:.2f} USD (без конвертации)")
+			elif currency == "BYN" and usd_to_byn_rate:
 				total_income_usd += value / usd_to_byn_rate
 			elif currency == "RUB" and usd_to_rub_rate:
 				total_income_usd += value / usd_to_rub_rate
