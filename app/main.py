@@ -346,7 +346,7 @@ async def update_large_order_alert(
 			f"🚨 <b>Крупная заявка</b>\n\n"
 			f"Пользователь: {user_name or 'Не указано'} (@{user_username or 'нет'})\n"
 			f"Страна: {country_label}\n"
-			f"Сумма: {int(amount_currency)} {currency_symbol}\n"
+			f"Сумма: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 			f"Крипта: {crypto_display}\n"
 			f"Кол-во: {amount_str} {crypto_display}\n\n"
 			f"📍 <b>Этап:</b> {stage_name}"
@@ -712,6 +712,17 @@ def _format_crypto_amount(amount: float | None) -> str:
 	return f"{amount:.2f}".rstrip('0').rstrip('.')
 
 
+def _format_currency_amount(amount: float | None, currency_symbol: str = "Br") -> str:
+	"""Форматирует сумму в валюте: RUB (₽) — целое число, BYN (Br) / USD ($) — с копейками."""
+	if amount is None:
+		return "0"
+	if currency_symbol == "₽":
+		return str(int(amount))
+	# BYN, USD и другие — показываем 2 знака, убираем лишние нули
+	formatted = f"{amount:.2f}".rstrip('0').rstrip('.')
+	return formatted
+
+
 async def _build_deal_message(
 	country_code: str | None,
 	crypto_code: str | None,
@@ -746,7 +757,7 @@ async def _build_deal_message(
 			usd_suffix = ""
 		lines.append(f"💴{_format_crypto_amount(amount)}{usd_suffix}")
 	if amount_currency is not None and currency_symbol:
-		lines.append(f"❗️💵{int(amount_currency)} {currency_symbol}")
+		lines.append(f"❗️💵{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}")
 	elif show_empty_amount and currency_symbol:
 		lines.append(f"💵согласовывается {currency_symbol}")
 	if wallet_address:
@@ -792,7 +803,7 @@ async def _build_deal_base_lines(
 		f"💴{_format_crypto_amount(amount)}{usd_suffix}",
 	]
 	if amount_currency is not None:
-		lines.append(f"💵{int(amount_currency)} {currency_symbol}")
+		lines.append(f"💵{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}")
 	else:
 		lines.append(f"💵согласовывается {currency_symbol}")
 	if wallet_address:
@@ -856,17 +867,24 @@ async def _notify_user_new_message(bot: Bot, chat_id: int) -> None:
 		pass
 
 
-async def _notify_admins_new_deal_message(bot: Bot, deal_id: int, user_name: str = "пользователя") -> None:
-	"""Отправляет push-уведомление всем админам о новом сообщении от пользователя в сделке."""
+async def _notify_admins_new_deal_message(
+	bot: Bot, deal_id: int, user_name: str = "пользователя", admin_message_ids: dict[int, int] | None = None
+) -> None:
+	"""Отправляет push-уведомление всем админам о новом сообщении от пользователя в сделке.
+	admin_message_ids: {admin_id: message_id} — если задано, уведомление отправляется ответом на сообщение сделки,
+	чтобы по нажатию на уведомление админ переходил к сделке."""
 	from app.di import get_admin_ids
 	admin_ids = get_admin_ids()
 	for admin_id in admin_ids:
 		try:
-			notif = await bot.send_message(
+			reply_to = None
+			if admin_message_ids and admin_id in admin_message_ids:
+				reply_to = admin_message_ids[admin_id]
+			await bot.send_message(
 				chat_id=admin_id,
-				text=f"🔔 Новое сообщение от {user_name} в сделке #{deal_id}"
+				text=f"🔔 Новое сообщение от {user_name} в сделке #{deal_id}",
+				reply_to_message_id=reply_to
 			)
-			asyncio.create_task(_auto_delete_message(bot, admin_id, notif.message_id, 3))
 		except Exception:
 			pass
 
@@ -909,7 +927,7 @@ def _build_user_deal_chat_prompt_text(deal: dict, chat_blocks: list[str], prompt
 		_deal_country_label(deal.get("country_code", "BYN")),
 		f"🤑{deal.get('crypto_type', '')}",
 		f"💴{_format_crypto_amount(deal.get('amount', 0))}",
-		f"💵{int(deal.get('amount_currency', 0))} {deal.get('currency_symbol', 'Br')}",
+		f"💵{_format_currency_amount(deal.get('amount_currency', 0), deal.get('currency_symbol', 'Br'))} {deal.get('currency_symbol', 'Br')}",
 		f"👛<code>{escape(deal.get('wallet_address', ''))}</code>" if deal.get("wallet_address") else "",
 		"➖➖➖➖➖➖",
 		"💬Чат:",
@@ -1285,15 +1303,17 @@ async def _build_admin_open_deal_text(
 			logger_main = logging.getLogger("app.main")
 			logger_main.warning(f"⚠️ Ошибка расчета профита для отображения: {e}")
 	
+	deal_id = deal.get("id")
+	header = f"⬇️Открыта Сделка #{deal_id}⬇️" if deal_id else "⬇️Открыта Сделка⬇️"
 	parts = [
-		"⬇️Открыта Сделка⬇️",
+		header,
 		"〰️〰️〰️〰️〰️",
 		f"👤 {user_name} (@{user_username})",
 		f"🌍 Страна: {_deal_country_label(deal.get('country_code', 'BYN'))}",
 		*(financial_lines or []),
 		"➖➖➖➖➖➖➖➖➖➖➖",  # Разделитель после долга
 		f"🪙Крипта: {crypto_label}",
-		f"💴Сумма: {int(amount_currency)} {currency_symbol}" if amount_currency is not None else None,
+		f"💴Сумма: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}" if amount_currency is not None else None,
 		f"🤑{deal.get('crypto_type', '')}={crypto_amount}({int(round(deal.get('amount_usd', 0)))}$)" if deal.get('amount_usd') else f"🤑{deal.get('crypto_type', '')}={crypto_amount}",
 		f"👛<code>{escape(wallet_address)}</code>" if wallet_address else None,
 		rates_text,  # Добавляем курсы
@@ -1340,7 +1360,7 @@ async def _build_admin_deal_alert_text(
 		*(financial_lines or []),
 		f"🆔 ID: {deal.get('user_tg_id')}",
 		f"Крипта: {crypto_label}",
-		f"Сумма: {int(amount_currency)} {currency_symbol}" if amount_currency is not None else None,
+		f"Сумма: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}" if amount_currency is not None else None,
 		f"👛<code>{escape(wallet_address)}</code>" if wallet_address else None,
 		rates_text,  # Добавляем курсы
 		"➖➖➖➖➖➖➖➖➖➖➖",
@@ -2423,8 +2443,11 @@ async def main() -> None:
 		elif total_usd < extra_fee_usd_mid:
 			extra_fee_currency = fee_mid
 		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
-		# Округляем сумму вверх до ближайших 50 (например 8512 → 8550, 9580 → 9600)
-		amount_currency = math.ceil(amount_currency / 50) * 50
+		# Округляем: RUB — вверх до ближайших 50, BYN — до 2 знаков после запятой
+		if selected_country == "RUB":
+			amount_currency = math.ceil(amount_currency / 50) * 50
+		else:
+			amount_currency = round(amount_currency)
 		await state.update_data(
 			amount=amount,
 			amount_currency=amount_currency,
@@ -2731,6 +2754,15 @@ async def main() -> None:
 			reply_markup=None
 		)
 		await state.update_data(proof_request_message_id=message_id)
+		# Отправляем отдельное уведомление с просьбой прислать скриншот
+		try:
+			proof_hint = await cb.bot.send_message(
+				chat_id=cb.from_user.id,
+				text="📸 Пожалуйста, отправьте скриншот или фото чека об оплате"
+			)
+			asyncio.create_task(_auto_delete_message(cb.bot, cb.from_user.id, proof_hint.message_id, 10))
+		except Exception:
+			pass
 		await cb.answer()
 
 	@dp.callback_query(F.data.startswith("deal:cancel:") & ~F.data.startswith("deal:cancel:confirm:") & ~F.data.startswith("deal:cancel:no:"))
@@ -2967,6 +2999,9 @@ async def main() -> None:
 		# Делегируем обработку скриншота в основной обработчик
 		await on_deal_payment_proof_received(message, state)
 
+	# Ограничение: 1 час после завершения сделки для кнопки "Написать"
+	COMPLETED_DEAL_REPLY_WINDOW_SEC = 3600
+
 	@dp.callback_query(F.data.startswith("deal:user:reply:"))
 	async def on_deal_user_reply_start(cb: CallbackQuery, state: FSMContext):
 		if not cb.from_user:
@@ -2985,6 +3020,13 @@ async def main() -> None:
 		if not deal:
 			await cb.answer("Сделка не найдена", show_alert=True)
 			return
+		# Для завершённых сделок — ограничение 1 час
+		if deal.get("status") == "completed":
+			completed_ts = deal.get("updated_at") or deal.get("created_at") or 0
+			elapsed = int(time.time()) - completed_ts
+			if elapsed > COMPLETED_DEAL_REPLY_WINDOW_SEC:
+				await cb.answer("Время для отправки сообщений истекло (1 час после завершения сделки)", show_alert=True)
+				return
 		try:
 			from app.notifications import notification_ids
 			notification_key = (cb.from_user.id, deal_id, "deal")
@@ -3583,10 +3625,16 @@ async def main() -> None:
 			logger_main.info(f"✅ on_deal_user_reply_send: update_buy_deal_alert completed for deal_id={deal_id}")
 		except Exception as e:
 			logger_main.error(f"❌ on_deal_user_reply_send: error in update_buy_deal_alert: {type(e).__name__}: {e}", exc_info=True)
-		# Отправляем push-уведомление админам о новом сообщении от пользователя
+		# Отправляем push-уведомление админам о новом сообщении от пользователя (ответом на сообщение сделки)
 		try:
 			user_name = deal.get("user_name") or deal.get("user_username") or "пользователя"
-			await _notify_admins_new_deal_message(message.bot, deal_id, user_name)
+			admin_message_ids = buy_deal_alerts.get(deal_id, {})
+			if not admin_message_ids:
+				alerts = await db_local.get_deal_alerts(deal_id=deal_id, alert_type="buy_deal")
+				admin_message_ids = {a["admin_id"]: a["message_id"] for a in alerts}
+			await _notify_admins_new_deal_message(
+				message.bot, deal_id, user_name, admin_message_ids=admin_message_ids or None
+			)
 		except Exception:
 			pass
 		prompt_id = data.get("deal_reply_prompt_id")
@@ -3641,7 +3689,7 @@ async def main() -> None:
 		amount_str = _format_crypto_amount(amount)
 		proof_details = (
 			f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}"
+			f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 		)
 		proof_confirmation_message_id = None
 		order_id = await db_local.create_order(
@@ -3760,7 +3808,7 @@ async def main() -> None:
 			f"Username: @{user_username}\n"
 			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}{large_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}{delivery_info}\n"
+			f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}{delivery_info}\n"
 			f"Адрес кошелька: <code>{wallet_address}</code>{pay_card_info}{total_debt_info}"
 		)
 		admin_ids = get_admin_ids()
@@ -4341,9 +4389,12 @@ async def main() -> None:
 		
 		# Рассчитываем итоговую сумму: (цена_с_наценкой) × количество × курс_валюты + доп. комиссия
 		amount_currency = (total_usd * usd_to_currency_rate) + extra_fee_currency
-		# Округляем сумму вверх до ближайших 50 (например 8512 → 8550, 9580 → 9600)
-		amount_currency = math.ceil(amount_currency / 50) * 50
-		
+		# Округляем: RUB — вверх до ближайших 50, BYN — до 2 знаков после запятой
+		if selected_country == "RUB":
+			amount_currency = math.ceil(amount_currency / 50) * 50
+		else:
+			amount_currency = round(amount_currency)
+
 		# Логируем расчет для отладки
 		logger = logging.getLogger("app.main")
 		logger.info(
@@ -4393,7 +4444,7 @@ async def main() -> None:
 		if is_large_order:
 			payment_text = "ожидайте сообщение администратора"
 		else:
-			payment_text = f"{int(amount_currency)} {currency_symbol}"
+			payment_text = f"{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 		
 		confirmation_text = (
 			f"Вам будет зачислено: {amount_str} {crypto_display}\n"
@@ -4487,11 +4538,11 @@ async def main() -> None:
 		# Для крупных заявок не показываем сумму оплаты
 		if is_large_order:
 			if admin_amount_set and admin_amount_value is not None:
-				payment_text = f"{int(admin_amount_value)} {currency_symbol}"
+				payment_text = f"{_format_currency_amount(admin_amount_value, currency_symbol)} {currency_symbol}"
 			else:
 				payment_text = "ожидайте сообщение администратора"
 		else:
-			payment_text = f"{int(amount_currency)} {currency_symbol}"
+			payment_text = f"{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 		
 		# Показываем уведомление о заказе
 		order_notification = (
@@ -4714,11 +4765,11 @@ async def main() -> None:
 			# Для крупных заявок не показываем сумму оплаты
 			if is_large_order:
 				if admin_amount_set and admin_amount_value is not None:
-					payment_text = f"{int(admin_amount_value)} {currency_symbol}"
+					payment_text = f"{_format_currency_amount(admin_amount_value, currency_symbol)} {currency_symbol}"
 				else:
 					payment_text = "ожидайте сообщение администратора"
 			else:
-				payment_text = f"{int(final_amount)} {currency_symbol}"
+				payment_text = f"{_format_currency_amount(final_amount, currency_symbol)} {currency_symbol}"
 			
 			order_message = (
 				f"☑️Заявка успешно создана.\n"
@@ -4801,7 +4852,7 @@ async def main() -> None:
 						f"👤 {message.from_user.full_name} (@{message.from_user.username or 'нет'})\n"
 						f"🆔 ID: <code>{message.from_user.id}</code>\n"
 						f"Крипта: {crypto_display}\n"
-						f"Сумма: {int(final_amount)} {currency_symbol}"
+						f"Сумма: {_format_currency_amount(final_amount, currency_symbol)} {currency_symbol}"
 					)
 					for admin_id in admin_ids:
 						try:
@@ -4824,7 +4875,7 @@ async def main() -> None:
 			if is_large_order:
 				payment_text = "ожидайте сообщение администратора"
 			else:
-				payment_text = f"{int(amount_currency)} {currency_symbol}"
+				payment_text = f"{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 			
 			order_info = (
 				f"Вам будет зачислено: {amount_str} {crypto_display}\n"
@@ -4956,7 +5007,7 @@ async def main() -> None:
 			f"☑️Заявка успешно создана.\n"
 			f"Вы получаете: {amount_str} {crypto_short}\n"
 			f"{crypto_display} - {crypto_type}-адрес: {wallet_address}\n\n"
-			f"💳Сумма к оплате: {int(final_amount)} {currency_symbol}\n"
+			f"💳Сумма к оплате: {_format_currency_amount(final_amount, currency_symbol)} {currency_symbol}\n"
 			f"Реквизиты для оплаты:\n{pay_card_info}\n\n"
 		)
 		
@@ -5034,7 +5085,7 @@ async def main() -> None:
 					f"👤 {message.from_user.full_name} (@{message.from_user.username or 'нет'})\n"
 					f"🆔 ID: <code>{message.from_user.id}</code>\n"
 					f"Крипта: {crypto_display}\n"
-					f"Сумма: {int(final_amount)} {currency_symbol}"
+					f"Сумма: {_format_currency_amount(final_amount, currency_symbol)} {currency_symbol}"
 				)
 				for admin_id in admin_ids:
 					try:
@@ -5263,7 +5314,7 @@ async def main() -> None:
 			amount_str = f"{amount:.2f}".rstrip('0').rstrip('.')
 		proof_details = (
 			f"\n\nКоличество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 			f"Адрес кошелька: {wallet_address}"
 		)
 		proof_confirmation_message = await message.bot.send_message(
@@ -5394,7 +5445,7 @@ async def main() -> None:
 			f"Username: @{user_username}\n"
 			f"🆔 ID: <code>{user_tg_id}</code>{last_order_info}{large_order_info}\n\n"
 			f"Количество монет: {amount_str} {crypto_display}\n"
-			f"Сумма к оплате: {int(amount_currency)} {currency_symbol}{delivery_info}\n"
+			f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}{delivery_info}\n"
 			f"Адрес кошелька: <code>{wallet_address}</code>{pay_card_info}{total_debt_info}"
 		)
 		
@@ -6359,7 +6410,7 @@ async def main() -> None:
 			f"🆔 ID: <code>{user_tg_id}</code>\n\n"
 			f"💵 Криптовалюта: {crypto_display}\n"
 			f"💸 Сумма: {amount_str} {crypto_display}\n"
-			f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+			f"💰 К получению: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 		)
 		
 		# Отправляем заявку всем админам
@@ -6591,7 +6642,7 @@ async def main() -> None:
 		order_info = (
 			f"💵 Криптовалюта: {crypto_display}\n"
 			f"💸 Сумма: {amount_str} {crypto_display}\n"
-			f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
+			f"💰 К оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 		)
 		
 		# Добавляем историю переписки
@@ -6635,7 +6686,7 @@ async def main() -> None:
 				f"Имя пользователя: {user_name or 'Не указано'}\n"
 				f"Username: @{user_username}\n\n"
 				f"Количество монет: {amount_str} {crypto_display}\n"
-				f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+				f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 				f"Адрес кошелька: <code>{wallet_address}</code>"
 			)
 		
@@ -6983,7 +7034,7 @@ async def main() -> None:
 							alert_text = (
 								f"🚨 <b>Крупная заявка</b>\n\n"
 								f"Пользователь: {user_name} (@{user_username})\n"
-								f"Сумма: {int(amount_currency)} {currency_symbol}\n"
+								f"Сумма: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 								f"Крипта: {crypto_display}\n"
 								f"Кол-во: {amount_str} {crypto_display}\n\n"
 								f"📍 <b>Этап:</b> {stage_name}"
@@ -7001,7 +7052,7 @@ async def main() -> None:
 							alert_text = (
 								f"🚨 <b>Крупная заявка</b>\n\n"
 								f"Пользователь: {user_name} (@{user_username})\n"
-								f"Сумма: {int(state_amount_currency)} {currency_symbol}\n"
+								f"Сумма: {_format_currency_amount(state_amount_currency, currency_symbol)} {currency_symbol}\n"
 								f"Крипта: {crypto_display}\n"
 								f"Кол-во: {amount_str} {crypto_display}\n\n"
 								f"📍 <b>Этап:</b> {stage_name}"
@@ -7268,7 +7319,7 @@ async def main() -> None:
 					f"Имя пользователя: {user_name or 'Не указано'}\n"
 					f"Username: @{user_username}\n\n"
 					f"Количество монет: {amount_str} {crypto_display}\n"
-					f"Сумма к оплате: {int(amount_currency)} {currency_symbol}\n"
+					f"Сумма к оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 					f"Адрес кошелька: <code>{wallet_address}</code>"
 				)
 				
@@ -7347,7 +7398,7 @@ async def main() -> None:
 				order_info = (
 					f"💵 Криптовалюта: {crypto_display}\n"
 					f"💸 Сумма: {amount_str} {crypto_display}\n"
-					f"💰 К оплате: {int(amount_currency)} {currency_symbol}\n"
+					f"💰 К оплате: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}\n"
 				)
 				
 				# Получаем обновленную историю переписки
@@ -7474,7 +7525,7 @@ async def main() -> None:
 					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
 					f"💵 Криптовалюта: {crypto_display}\n"
 					f"💸 Сумма: {amount_str} {crypto_display}\n"
-					f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+					f"💰 К получению: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 				)
 				
 				# Обновляем сообщение админа с историей переписки
@@ -7828,7 +7879,7 @@ async def main() -> None:
 				if is_large_order:
 					payment_text = "ожидайте сообщение администратора"
 				else:
-					payment_text = f"{int(amount_currency)} {currency_symbol}"
+					payment_text = f"{_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 				
 				confirmation_text = (
 					f"Вам будет зачислено: {amount_str} {crypto_display}\n"
@@ -8173,7 +8224,7 @@ async def main() -> None:
 					f"🆔 ID: <code>{user_tg_id}</code>\n\n"
 					f"💵 Криптовалюта: {crypto_display}\n"
 					f"💸 Сумма: {amount_str} {crypto_display}\n"
-					f"💰 К получению: {int(amount_currency)} {currency_symbol}"
+					f"💰 К получению: {_format_currency_amount(amount_currency, currency_symbol)} {currency_symbol}"
 				)
 				
 				admin_history_lines = []
